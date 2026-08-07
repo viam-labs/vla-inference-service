@@ -603,8 +603,21 @@ for the `PolicyBackend` seam even while only one real backend ships.
 
 ## Open questions
 
-- **Install size is unmeasured.** Estimated 3–5 GB on Linux/CUDA. Measure before committing to
-  Jetson deployment; this is the one concern no architecture choice resolves.
+- **Install size — measured on macOS, still unmeasured on Linux/CUDA.** A full
+  `uv sync --extra lerobot` venv on Apple Silicon is **824 MB**, well under the 1 GB estimate.
+  Breakdown: torch 356 MB, cmake 124 MB, cv2 119 MB, transformers 44 MB, sympy 29 MB,
+  viam-sdk 22 MB, numpy 22 MB.
+
+  Linux resolves `torch==2.11.0+cu128` and `torchvision==0.26.0+cu128` from
+  `download.pytorch.org/whl/cu128`, which bundle CUDA runtime libraries the macOS wheels omit,
+  so the Linux figure will be several times larger. Measure on the actual Jetson image before
+  committing to that target — it remains the one concern no architecture choice resolves.
+
+  One easy win if size becomes binding: **cmake is 124 MB of pure runtime waste.** lerobot
+  declares it in core dependencies only because `opencv-python-headless` needs it *to build* on
+  some platforms; nothing imports it at inference time. Excluding it, and swapping
+  `opencv-python-headless` for a lighter decode path if lerobot's usage allows, would cut roughly
+  30% of the non-torch footprint.
 - **Evo-1 checkpoint availability.** SmolVLA has public checkpoints on the Hub; whether a public
   Evo-1 checkpoint exists in LeRobot format for phase 1 is unconfirmed.
 - **Python 3.12+ on target devices.** lerobot `main` requires >= 3.12; confirm the Jetson image can
