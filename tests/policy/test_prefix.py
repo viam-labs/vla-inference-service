@@ -141,3 +141,39 @@ def test_non_contiguous_input_is_handled_on_padding():
     assert out.shape == (6, 2)
     np.testing.assert_array_equal(out[:4], x)
     np.testing.assert_array_equal(out[4:], np.zeros((2, 2), dtype=np.float32))
+
+
+# ---------------------------------------------------------------------------
+# target_steps arrives from protobuf Struct as a double in production
+# (review item 6, standing requirements 4 and 5). A bare int-only slice
+# raises a plain TypeError that walks straight past `except PrefixError`
+# and `except VLAError` -- latent today because Task 8 always passes an
+# already-as_int-parsed value, but not guaranteed for every future caller.
+# ---------------------------------------------------------------------------
+
+
+def test_integral_float_target_steps_is_accepted():
+    x = np.ones((3, 4), dtype=np.float32)
+    out = normalize_prefix_length(x, 8.0)
+    assert out.shape == (8, 4)
+    np.testing.assert_array_equal(out[:3], x)
+
+
+def test_fractional_float_target_steps_raises_prefix_error():
+    x = np.ones((3, 4), dtype=np.float32)
+    with pytest.raises(PrefixError, match="target_steps"):
+        normalize_prefix_length(x, 8.5)
+
+
+def test_bool_target_steps_raises_prefix_error():
+    # True/False are technically ints in Python but are never a legitimate
+    # target_steps value.
+    x = np.ones((3, 4), dtype=np.float32)
+    with pytest.raises(PrefixError, match="target_steps"):
+        normalize_prefix_length(x, True)
+
+
+def test_non_numeric_target_steps_raises_prefix_error():
+    x = np.ones((3, 4), dtype=np.float32)
+    with pytest.raises(PrefixError, match="target_steps"):
+        normalize_prefix_length(x, "8")

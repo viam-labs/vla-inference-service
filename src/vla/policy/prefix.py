@@ -24,30 +24,43 @@ non-aliasing contract.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
-from vla.config_util import VLAError
+from vla.config_util import ConfigError, VLAError, as_int
 
 
 class PrefixError(VLAError, ValueError):
     """Raised when an RTC prefix cannot be normalized."""
 
 
-def normalize_prefix_length(prev_actions: np.ndarray, target_steps: int) -> np.ndarray:
+def normalize_prefix_length(prev_actions: np.ndarray, target_steps: Any) -> np.ndarray:
     if prev_actions.ndim != 2:
         raise PrefixError(f"Expected 2D [T, A] array, got shape={prev_actions.shape}")
-    # A non-positive horizon is a config bug -- execution_horizon is already
-    # validated >= 1 upstream (see PolicyConfig.RTCSettings.parse) -- and a
-    # silent (0, dim) result here would be a much nastier way to discover
-    # that than an immediate error.
-    if target_steps <= 0:
-        raise PrefixError(f"target_steps must be a positive integer, got {target_steps}")
+
+    # target_steps arrives as a protobuf-Struct-shaped value in production
+    # (a double, never a plain int) wherever it is threaded through from
+    # config rather than hardcoded -- as_int accepts an integral float
+    # (8.0), rejects a fractional one (8.5) or a bool, and enforces the
+    # positive-only bound in one place instead of a bare `<= 0` check that
+    # would raise an unhelpful TypeError on a non-numeric or float input.
+    # A non-positive horizon is a config bug -- execution_horizon is
+    # already validated >= 1 upstream (see PolicyConfig.RTCSettings.parse)
+    # -- and a silent (0, dim) result here would be a much nastier way to
+    # discover that than an immediate error. ConfigError is translated to
+    # this module's own PrefixError so callers only ever need `except
+    # PrefixError` (or `except VLAError`) here, never `except ConfigError`.
+    try:
+        target = as_int(target_steps, "target_steps", minimum=1)
+    except ConfigError as exc:
+        raise PrefixError(str(exc)) from exc
 
     steps, action_dim = prev_actions.shape
-    if steps == target_steps:
+    if steps == target:
         return prev_actions.copy()
-    if steps > target_steps:
-        return prev_actions[:target_steps].copy()
-    padded = np.zeros((target_steps, action_dim), dtype=prev_actions.dtype)
+    if steps > target:
+        return prev_actions[:target].copy()
+    padded = np.zeros((target, action_dim), dtype=prev_actions.dtype)
     padded[:steps] = prev_actions
     return padded
