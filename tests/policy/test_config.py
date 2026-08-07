@@ -1,5 +1,15 @@
+import math
+
 import pytest
 from vla.policy.config import PolicyConfig, ConfigError
+
+# Hardcoded, not imported from vla.policy.config: parametrizing off the
+# module's own DEVICES/DTYPES/SCHEDULES tuples would mean a mutant that
+# shrinks one of those tuples shrinks the test's parametrization along with
+# it, so the mutant becomes invisible to the very test meant to catch it.
+EXPECTED_DEVICES = ("auto", "cuda", "mps", "cpu")
+EXPECTED_DTYPES = ("auto", "float32", "bfloat16", "float16")
+EXPECTED_SCHEDULES = ("linear", "exp", "ones", "zeros")
 
 
 def test_local_path_config():
@@ -114,3 +124,117 @@ def test_rejects_boolean_warmup_inferences():
 def test_rejects_boolean_execution_horizon():
     with pytest.raises(ConfigError, match="execution_horizon"):
         PolicyConfig.parse({"model_path": "/m", "rtc": {"execution_horizon": True}})
+
+
+# --- coverage gap: "invalid rejected" was tested, "valid accepted" was not ---
+# A one-character typo that shrinks an enum tuple (e.g. DTYPES to ("auto",))
+# rejects every legitimate value while every existing test stays green,
+# because none of them assert that a real value survives parsing.
+
+
+@pytest.mark.parametrize("device", EXPECTED_DEVICES)
+def test_accepts_every_valid_device(device):
+    cfg = PolicyConfig.parse({"model_path": "/m", "device": device})
+    assert cfg.device == device
+
+
+@pytest.mark.parametrize("dtype", EXPECTED_DTYPES)
+def test_accepts_every_valid_dtype(dtype):
+    cfg = PolicyConfig.parse({"model_path": "/m", "dtype": dtype})
+    assert cfg.dtype == dtype
+
+
+@pytest.mark.parametrize("schedule", EXPECTED_SCHEDULES)
+def test_accepts_every_valid_schedule(schedule):
+    cfg = PolicyConfig.parse({"model_path": "/m", "rtc": {"prefix_attention_schedule": schedule}})
+    assert cfg.rtc.prefix_attention_schedule == schedule
+
+
+def test_rejects_unknown_schedule():
+    with pytest.raises(ConfigError, match="prefix_attention_schedule"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"prefix_attention_schedule": "cosine"}})
+
+
+def test_rejects_zero_execution_horizon():
+    with pytest.raises(ConfigError, match="execution_horizon"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"execution_horizon": 0}})
+
+
+def test_rejects_negative_execution_horizon():
+    with pytest.raises(ConfigError, match="execution_horizon"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"execution_horizon": -1}})
+
+
+def test_default_model_revision_is_main():
+    cfg = PolicyConfig.parse({"model_path": "/m"})
+    assert cfg.model_revision == "main"
+
+
+def test_hf_token_env_passthrough():
+    cfg = PolicyConfig.parse({"model_path": "/m", "hf_token_env": "HF_TOKEN"})
+    assert cfg.hf_token_env == "HF_TOKEN"
+
+
+def test_rejects_boolean_max_guidance_weight():
+    with pytest.raises(ConfigError, match="max_guidance_weight"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"max_guidance_weight": True}})
+
+
+def test_rejects_nan_max_guidance_weight():
+    with pytest.raises(ConfigError, match="max_guidance_weight"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"max_guidance_weight": math.nan}})
+
+
+# --- item 3: `enabled` must reject truthy-but-not-bool values ---
+# bool("false") is True in Python, so a naive cast would silently turn RTC
+# *on* for a very plausible hand-edited config value.
+
+
+def test_rejects_string_enabled():
+    with pytest.raises(ConfigError, match="enabled"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"enabled": "false"}})
+
+
+# --- item 4: `rtc: null` means defaults; any other non-dict must be loud ---
+
+
+def test_rtc_null_uses_defaults():
+    cfg = PolicyConfig.parse({"model_path": "/m", "rtc": None})
+    assert cfg.rtc.enabled is False
+    assert cfg.rtc.execution_horizon == 10
+
+
+def test_rejects_falsy_non_dict_rtc():
+    with pytest.raises(ConfigError, match="rtc"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": False})
+
+
+# --- as_str type-checking now applied to string fields ---
+
+
+def test_rejects_non_string_model_revision():
+    with pytest.raises(ConfigError, match="model_revision"):
+        PolicyConfig.parse({"model_path": "/m", "model_revision": 1.0})
+
+
+def test_rejects_non_string_hf_token_env():
+    with pytest.raises(ConfigError, match="hf_token_env"):
+        PolicyConfig.parse({"model_path": "/m", "hf_token_env": 1.0})
+
+
+# --- maximum= bounds prevent pathological config values ---
+
+
+def test_rejects_excessive_warmup_inferences():
+    with pytest.raises(ConfigError, match="warmup_inferences"):
+        PolicyConfig.parse({"model_path": "/m", "warmup_inferences": 1e30})
+
+
+def test_rejects_excessive_execution_horizon():
+    with pytest.raises(ConfigError, match="execution_horizon"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"execution_horizon": 1e30}})
+
+
+def test_rejects_excessive_max_guidance_weight():
+    with pytest.raises(ConfigError, match="max_guidance_weight"):
+        PolicyConfig.parse({"model_path": "/m", "rtc": {"max_guidance_weight": 1e30}})

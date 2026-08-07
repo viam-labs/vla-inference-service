@@ -5,48 +5,33 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from vla.config_util import ConfigError, as_bool, as_choice, as_float, as_int, as_str
+
+__all__ = ["ConfigError", "RTCSettings", "PolicyConfig", "DEVICES", "DTYPES", "SCHEDULES"]
+
 DEVICES = ("auto", "cuda", "mps", "cpu")
 DTYPES = ("auto", "float32", "bfloat16", "float16")
 SCHEDULES = ("linear", "exp", "ones", "zeros")
 
+# warmup_inferences runs synchronously before the resource starts serving.
+# 100 forward passes is already far more than any real warmup needs; the
+# bound exists to turn a typo like 1e30 into a config-time error instead of
+# a startup that never completes.
+_MAX_WARMUP_INFERENCES = 100
 
-class ConfigError(ValueError):
-    """Raised for invalid module configuration."""
+# execution_horizon is the number of actions RTC re-plans per inference
+# call. lerobot's default is 10; 1000 is a full two orders of magnitude of
+# headroom while still catching an obviously wrong value.
+_MAX_EXECUTION_HORIZON = 1000
 
-
-def _as_int(value: Any, field_name: str) -> int:
-    """Coerce a protobuf-Struct-shaped value to int, strictly.
-
-    Struct stores every number as a double, so production sends 2.0 for an
-    int field while a hand-written test dict sends 2 — both must resolve to
-    the same int. A fractional value like 2.5 is a config typo, not a
-    truncation target, so it is rejected rather than silently floored.
-    Booleans are technically ints in Python but are never a legitimate value
-    here, so they are rejected explicitly.
-    """
-    if isinstance(value, bool):
-        raise ConfigError(f"{field_name} must be an integer, got {value!r}")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if not value.is_integer():
-            raise ConfigError(f"{field_name} must be an integer, got {value!r}")
-        return int(value)
-    raise ConfigError(f"{field_name} must be an integer, got {value!r}")
-
-
-def _as_float(value: Any, field_name: str) -> float:
-    """Coerce a protobuf-Struct-shaped value to float, strictly.
-
-    Booleans are technically numbers in Python but are never a legitimate
-    value here, so they are rejected explicitly rather than silently
-    becoming 0.0/1.0.
-    """
-    if isinstance(value, bool):
-        raise ConfigError(f"{field_name} must be a number, got {value!r}")
-    if isinstance(value, (int, float)):
-        return float(value)
-    raise ConfigError(f"{field_name} must be a number, got {value!r}")
+# max_guidance_weight scales the RTC blending term. lerobot's default is
+# 10.0; 1000 is a generous ceiling (100x default) that still catches a
+# runaway typo. The lower bound is not 0 but a small positive epsilon:
+# the field must be strictly positive (0 disables blending in a way that's
+# meaningfully different from "small guidance"), and as_float's `minimum`
+# is inclusive, so a tiny-but-positive floor is used to express ">0".
+_MIN_GUIDANCE_WEIGHT = 1e-6
+_MAX_GUIDANCE_WEIGHT = 1000.0
 
 
 @dataclass(frozen=True)
@@ -63,19 +48,24 @@ class RTCSettings:
         if not isinstance(raw, dict):
             raise ConfigError(f"rtc must be an object, got {raw!r}")
 
-        schedule = raw.get("prefix_attention_schedule", "linear")
-        if schedule not in SCHEDULES:
-            raise ConfigError(
-                f"rtc.prefix_attention_schedule must be one of {SCHEDULES}, got {schedule!r}"
-            )
-        horizon = _as_int(raw.get("execution_horizon", 10), "rtc.execution_horizon")
-        if horizon <= 0:
-            raise ConfigError(f"rtc.execution_horizon must be positive, got {horizon}")
-        weight = _as_float(raw.get("max_guidance_weight", 10.0), "rtc.max_guidance_weight")
-        if weight <= 0:
-            raise ConfigError(f"rtc.max_guidance_weight must be positive, got {weight}")
+        schedule = as_choice(
+            raw.get("prefix_attention_schedule", "linear"), "rtc.prefix_attention_schedule", SCHEDULES
+        )
+        horizon = as_int(
+            raw.get("execution_horizon", 10),
+            "rtc.execution_horizon",
+            minimum=1,
+            maximum=_MAX_EXECUTION_HORIZON,
+        )
+        weight = as_float(
+            raw.get("max_guidance_weight", 10.0),
+            "rtc.max_guidance_weight",
+            minimum=_MIN_GUIDANCE_WEIGHT,
+            maximum=_MAX_GUIDANCE_WEIGHT,
+        )
+        enabled = as_bool(raw.get("enabled", False), "rtc.enabled")
         return RTCSettings(
-            enabled=bool(raw.get("enabled", False)),
+            enabled=enabled,
             execution_horizon=horizon,
             prefix_attention_schedule=schedule,
             max_guidance_weight=weight,
@@ -103,25 +93,35 @@ class PolicyConfig:
                 f"(got model_path={path!r}, model_hub_id={hub!r})"
             )
 
-        device = raw.get("device", "auto")
-        if device not in DEVICES:
-            raise ConfigError(f"device must be one of {DEVICES}, got {device!r}")
+        device = as_choice(raw.get("device", "auto"), "device", DEVICES)
+        dtype = as_choice(raw.get("dtype", "auto"), "dtype", DTYPES)
 
-        dtype = raw.get("dtype", "auto")
-        if dtype not in DTYPES:
-            raise ConfigError(f"dtype must be one of {DTYPES}, got {dtype!r}")
+        warmup = as_int(
+            raw.get("warmup_inferences", 2),
+            "warmup_inferences",
+            minimum=0,
+            maximum=_MAX_WARMUP_INFERENCES,
+        )
 
-        warmup = _as_int(raw.get("warmup_inferences", 2), "warmup_inferences")
-        if warmup < 0:
-            raise ConfigError(f"warmup_inferences must be >= 0, got {warmup}")
+        model_revision = as_str(raw.get("model_revision", "main"), "model_revision")
+
+        hf_token_env = raw.get("hf_token_env") or None
+        if hf_token_env is not None:
+            hf_token_env = as_str(hf_token_env, "hf_token_env")
+
+        # rtc: null (key present, value None) means "use defaults" — the
+        # correct JSON reading of an explicit null. Any other non-dict
+        # (rtc: false, rtc: "yes", rtc: 0) is a malformed config and must
+        # raise loudly rather than silently falling back to defaults.
+        rtc_raw = raw.get("rtc")
 
         return PolicyConfig(
             model_path=path,
             model_hub_id=hub,
-            model_revision=raw.get("model_revision", "main"),
-            hf_token_env=raw.get("hf_token_env") or None,
+            model_revision=model_revision,
+            hf_token_env=hf_token_env,
             device=device,
             dtype=dtype,
             warmup_inferences=warmup,
-            rtc=RTCSettings.parse(raw.get("rtc", {}) or {}),
+            rtc=RTCSettings.parse({} if rtc_raw is None else rtc_raw),
         )
