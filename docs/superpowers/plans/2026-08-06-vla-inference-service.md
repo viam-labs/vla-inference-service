@@ -61,7 +61,10 @@ src/
       observation.py                   observation assembly + encoding
       scheduler.py                     ChunkScheduler ABC + SequentialScheduler
       service.py                       viam-labs:vla:controller resource
+.github/workflows/
+  differential.yml                     runs the port-vs-upstream test on pinned + main
 tests/
+  __init__.py                          package markers; policy/ and controller/ too
   fakes.py                             fake arm/camera/gripper/servo
   test_wire.py
   test_integration_full_loop.py        real checkpoint + fake robot
@@ -112,6 +115,7 @@ dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "module"
+asyncio_default_test_loop_scope = "module"
 testpaths = ["tests"]
 markers = [
     "integration: requires a real checkpoint and torch (deselect with '-m \"not integration\"')",
@@ -164,7 +168,7 @@ VENV_NAME="${VIAM_MODULE_DATA}/venv"
 PYTHON="$VENV_NAME/bin/python"
 
 echo "Starting module..."
-exec $PYTHON -m vla.main $@
+exec $PYTHON -m vla.main "$@"
 ```
 
 `setup.sh`:
@@ -1296,6 +1300,7 @@ async def test_unknown_command_errors(tmp_path):
 
 async def test_failed_load_surfaces_in_status(tmp_path):
     svc = VLAPolicy("p")
+    svc._backend_factory = FakePolicyBackend   # reconfigure constructs the backend eagerly
     svc.reconfigure(_config({"model_path": str(tmp_path / "absent")}), {})
     await svc.await_ready(expect_failure=True)
     status = await svc.do_command({"command": "status"})
@@ -1401,8 +1406,11 @@ class VLAPolicy(Generic, EasyResource):
         images = {}
         for key in specs.image_feature_keys:
             c, h, w = specs.input_features[key]
-            images[key] = np.zeros((h, w, c), dtype=np.uint8)
-        state = np.zeros(specs.action_dim, dtype=np.float32)
+            images[key] = np.zeros((int(h), int(w), int(c)), dtype=np.uint8)
+        # State dim, not action dim: they coincide on smolvla_base but need not.
+        # Getting it wrong fails warmup, which fails the whole load.
+        state_dim = int(specs.input_features["observation.state"][0])
+        state = np.zeros(state_dim, dtype=np.float32)
         self._backend.predict_chunk(images, state, "warmup", None)
 
     async def await_ready(self, *, expect_failure: bool = False) -> None:
@@ -3712,13 +3720,16 @@ class FakePolicyClient:
         if name == "status":
             return {"state": self.state, "error": ""}
         if name == "specs":
+            # Numbers are floats on purpose. A real call crosses gRPC, and
+            # protobuf Struct stores every number as a double, so the controller
+            # never sees ints here. Returning ints would hide that from tests.
             return {
                 "policy_type": "fake",
-                "action_dim": self.action_dim,
-                "n_action_steps": self.n,
-                "input_features": {"observation.images.top": [3, 224, 224],
-                                   "observation.state": [self.action_dim]},
-                "output_features": {"action": [self.action_dim]},
+                "action_dim": float(self.action_dim),
+                "n_action_steps": float(self.n),
+                "input_features": {"observation.images.top": [3.0, 224.0, 224.0],
+                                   "observation.state": [float(self.action_dim)]},
+                "output_features": {"action": [float(self.action_dim)]},
                 "image_feature_keys": ["observation.images.top"],
                 "supports_rtc": self.supports_rtc,
                 "rtc_enabled": False,
@@ -4004,11 +4015,14 @@ class VLAController(Generic, EasyResource):
     def reconfigure(self, config: ServiceConfig, dependencies) -> None:
         """Rebuild from config. Never auto-resumes motion after a config change."""
         was_running = self._task is not None and not self._task.done()
+        # Capture the arm currently in motion before rebinding _cfg/_deps below,
+        # or the scheduled stop would target the *new* arm.
+        old_arm = self._deps.get(self._cfg.arm) if (was_running and self._cfg) else None
         self._stop_loop_sync()
-        if was_running:
-            # reconfigure is sync, so the arm stop is scheduled rather than awaited.
-            # Cancelling the loop alone would leave the arm executing its last command.
-            asyncio.create_task(self._safe_stop_arm())
+        if old_arm is not None:
+            # reconfigure is sync, so the stop is scheduled rather than awaited.
+            # Cancelling the loop alone leaves the arm executing its last command.
+            asyncio.create_task(self._stop_arm(old_arm))
         self._cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
         self._deps = {self._key(k): v for k, v in dependencies.items()}
         self._specs = None
@@ -4077,12 +4091,19 @@ class VLAController(Generic, EasyResource):
         if self._task and not self._task.done():
             self._task.cancel()
 
-    async def _safe_stop_arm(self) -> None:
+    @staticmethod
+    async def _stop_arm(arm: Any) -> None:
+        if arm is None:
+            return
         try:
-            if self._cfg:
-                await self._resource(self._cfg.arm).stop()
+            await arm.stop()
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("failed to stop arm: %s", exc)
+
+    async def _safe_stop_arm(self) -> None:
+        if not self._cfg:
+            return
+        await self._stop_arm(self._deps.get(self._cfg.arm))
 
     async def _await_policy(self) -> dict[str, Any]:
         cfg = self._cfg
@@ -4159,8 +4180,14 @@ class VLAController(Generic, EasyResource):
                     f"{'1 gripper' if gripper.in_state else 'no gripper'})"
                 )
 
+            # int() is mandatory, not defensive. specs arrives via
+            # GenericClient.do_command -> struct_to_dict, and protobuf Struct
+            # stores every number as a double, so [3, 224, 224] comes back as
+            # [3.0, 224.0, 224.0]. PIL's resize() raises
+            # "TypeError: integer argument expected, got float".
             image_sizes = {
-                key: (specs["input_features"][key][1], specs["input_features"][key][2])
+                key: (int(specs["input_features"][key][1]),
+                      int(specs["input_features"][key][2]))
                 for key in specs["image_feature_keys"]
             }
             missing = set(image_sizes) - set(cfg.cameras)
@@ -4278,7 +4305,7 @@ class VLAController(Generic, EasyResource):
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/controller/test_service.py -v`
-Expected: 16 passed
+Expected: 17 passed
 
 If dependency-key handling differs from the fakes, read how a Python module resolves dependencies in `/Users/nick.hehr/src/viam-python-sdk/src/viam/resource/easy_resource.py` and adjust `_key`.
 
