@@ -1483,7 +1483,7 @@ async def test_infer_returns_both_action_arrays(tmp_path):
     out = await svc.do_command({
         "command": "infer",
         "images": {"observation.images.top": encode_image(img)},
-        "state": [0.0] * 6,
+        "state": encode_vector(np.zeros(6, dtype=np.float32)),
         "task": "pick up the block",
     })
     actions = decode_matrix(out["actions"])
@@ -1501,7 +1501,7 @@ async def test_infer_passes_rtc_kwargs_to_backend(tmp_path):
     await svc.do_command({
         "command": "infer",
         "images": {"observation.images.top": encode_image(img)},
-        "state": [0.0] * 4,
+        "state": encode_vector(np.zeros(4, dtype=np.float32)),
         "task": "t",
         "rtc": {"inference_delay": 2, "prev_chunk_left_over": encode_matrix(prefix)},
     })
@@ -1626,15 +1626,27 @@ class VLAPolicy(Generic, EasyResource):
             self._state = "ready"
             LOGGER.info("policy ready: %s", self._backend.specs)
         except VLAError as exc:
-            # Catch VLAError, not Exception: an AttributeError or TypeError is a
-            # bug in this module and should crash loudly rather than becoming a
-            # status="failed" string that looks like a user configuration error.
+            # Expected failures: bad config, unresolvable checkpoint, malformed
+            # payload. The message is meant for an operator reading `status`.
             if _superseded():
                 LOGGER.info("ignoring failure from superseded load: %s", exc)
                 return
             self._state = "failed"
             self._error = str(exc)
             LOGGER.error("policy load failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            # Everything else — torch OOM, a CUDA error, or a genuine bug in
+            # this module. It must still land in `status`: this runs in a
+            # background task, so letting it propagate would leave state stuck
+            # on "loading" forever with the traceback swallowed by asyncio.
+            # Distinguish it in the message and log the full traceback, so a
+            # bug here is never mistaken for a user configuration error.
+            if _superseded():
+                LOGGER.info("ignoring failure from superseded load: %s", exc)
+                return
+            self._state = "failed"
+            self._error = f"internal error ({type(exc).__name__}): {exc}"
+            LOGGER.exception("policy load failed with an unexpected error")
 
     def _warmup_once(self) -> None:
         """Run one throwaway inference so the first real call is not an outlier."""
