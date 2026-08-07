@@ -1426,3 +1426,120 @@ async def test_dependency_keys_with_name_attribute_are_resolved():
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
     assert status["state"] != "error"
+
+
+# ---------------------------------------------------------------------------
+# mode: "async" -- end to end through the real controller loop (Task 22).
+# ---------------------------------------------------------------------------
+
+
+async def test_async_mode_end_to_end_commands_the_arm_and_reports_mode():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=5)
+    svc = _svc(
+        config=_config(mode="async", fps=50.0, queue_threshold=3),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    await asyncio.sleep(0.2)
+    status = await svc.do_command({"command": "status"})
+    assert status["mode"] == "async"
+    await svc.do_command({"command": "stop"})
+    assert len(arm.moves) >= 1
+    assert policy.infer_calls >= 1
+
+
+async def test_async_mode_starvation_escalates_when_inference_stalls():
+    """The `action is None` branch in `_loop` is only reachable under
+    AsyncScheduler -- this exercises it end to end, not just at the
+    scheduler level. Once a background inference stalls indefinitely and
+    the queue drains, consecutive empty ticks must escalate past
+    `starvation_grace_ticks` and halt -- the same bound that already
+    escalates a run of consecutive tick *failures*, now doing the same job
+    for a run of consecutive *empty* ticks."""
+
+    class StallingPolicy(FakePolicyClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._hang = asyncio.Event()
+
+        async def do_command(self, command, **kwargs):
+            if command.get("command") == "infer":
+                self.infer_calls += 1
+                if self.infer_calls > 1:
+                    # Never set: simulates a policy call that never returns,
+                    # so every inference after the first stalls forever.
+                    await self._hang.wait()
+                chunk = np.full((self.n, self.action_dim), self.action_value, dtype=np.float32)
+                return {
+                    "actions": encode_matrix(chunk),
+                    "raw_actions": encode_matrix(chunk),
+                    "latency_s": 0.001,
+                }
+            return await super().do_command(command, **kwargs)
+
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = StallingPolicy(n=3)
+    svc = _svc(
+        config=_config(
+            mode="async",
+            fps=100.0,
+            queue_threshold=2,
+            starvation_grace_ticks=2,
+            safety={"max_start_delta_degs": 1000.0},
+        ),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=5.0)
+    assert "starvation_grace_ticks" in status["last_error"]
+    assert "starved" in status["last_error"].lower()
+    assert arm.stopped >= 1
+    # The first chunk's real actions were commanded before starvation took
+    # over -- this is not a "nothing ever worked" failure.
+    assert len(arm.moves) >= 1
+
+
+async def test_async_mode_stop_cancels_a_background_inference_not_on_the_call_stack():
+    """The background inference is not always on the loop task's own await
+    stack -- once AsyncScheduler starts serving already-queued actions
+    instead of blocking on it, cancelling the loop task alone does not
+    reach it. `_stop()` must still reach it via `scheduler.close()`, or it
+    would keep running orphaned past the point the controller reports
+    stopped."""
+
+    class ControllablePolicy(FakePolicyClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.second_call_started = asyncio.Event()
+            self.hang = asyncio.Event()
+
+        async def do_command(self, command, **kwargs):
+            if command.get("command") == "infer":
+                self.infer_calls += 1
+                if self.infer_calls == 2:
+                    self.second_call_started.set()
+                    await self.hang.wait()  # never released in this test
+                chunk = np.full((self.n, self.action_dim), self.action_value, dtype=np.float32)
+                return {
+                    "actions": encode_matrix(chunk),
+                    "raw_actions": encode_matrix(chunk),
+                    "latency_s": 0.001,
+                }
+            return await super().do_command(command, **kwargs)
+
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = ControllablePolicy(n=5)
+    svc = _svc(
+        config=_config(mode="async", fps=200.0, queue_threshold=4),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.wait_for(policy.second_call_started.wait(), timeout=2.0)
+    # The 2nd inference is now hung in the background, independent of
+    # whatever tick the loop task itself happens to be suspended on.
+    await asyncio.sleep(0.05)
+    await svc.do_command({"command": "stop"})
+
+    assert svc._scheduler._inflight is None

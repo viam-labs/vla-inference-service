@@ -75,7 +75,7 @@ from .config import ControllerConfig
 from .gripper import GripperAdapter, make_gripper_adapter
 from .observation import ObservationBuilder
 from .safety import SafetyLayer, SafetyLimits
-from .scheduler import SequentialScheduler
+from .scheduler import AsyncScheduler, ChunkScheduler, SequentialScheduler
 from .units import to_degrees
 
 LOGGER = logging.getLogger(__name__)
@@ -96,7 +96,7 @@ class VLAController(Generic, EasyResource):
         self._specs: dict[str, Any] | None = None
         self._latencies: list[float] = []
         self._measured_fps = 0.0
-        self._scheduler: SequentialScheduler | None = None
+        self._scheduler: ChunkScheduler | None = None
         self._stop_task: asyncio.Task | None = None
 
     @classmethod
@@ -227,6 +227,17 @@ class VLAController(Generic, EasyResource):
                 # (transitioning to state="error"); this is defense in depth
                 # so _stop() itself never raises.
                 LOGGER.exception("loop task raised while stopping")
+        if self._scheduler is not None:
+            # Cancelling the loop task above does not guarantee an
+            # AsyncScheduler's background inference task gets cancelled too
+            # -- that only cascades automatically when the loop task
+            # happened to be suspended *directly* on it (the blocking
+            # first-call path). The non-blocking "return None while starved"
+            # path leaves the background task running independently, so
+            # without this it would keep running orphaned past the point
+            # the controller reports stopped. SequentialScheduler's close()
+            # is an inherited no-op, so this is a no-op for it.
+            await self._scheduler.close()
         await self._safe_stop_arm()
         if was_active and self._state != "error":
             self._state = "stopped"
@@ -271,6 +282,8 @@ class VLAController(Generic, EasyResource):
         cfg = self._cfg
         if cfg.mode == "sequential":
             return "sequential"
+        if cfg.mode == "async":
+            return "async"
         if cfg.mode == "rtc":
             if not specs.get("supports_rtc"):
                 raise RuntimeError("mode=rtc but the policy does not support RTC")
@@ -281,9 +294,17 @@ class VLAController(Generic, EasyResource):
                 )
             raise RuntimeError(
                 "mode=rtc is not implemented yet (RTCScheduler is a follow-up plan); "
-                "use mode=sequential or mode=auto"
+                "use mode=sequential, mode=async, or mode=auto"
             )
-        return "sequential"  # auto: RTCScheduler ships in a follow-up plan
+        # auto: "async" is explicit opt-in only (see config.py's docstring) --
+        # an existing deployment's behavior must not change underneath it
+        # just because this module gained a new mode.
+        return "sequential"
+
+    def _build_scheduler(self, mode: str, builder: ObservationBuilder) -> ChunkScheduler:
+        if mode == "async":
+            return AsyncScheduler(lambda rtc: self._infer(builder, rtc), self._cfg.queue_threshold)
+        return SequentialScheduler(lambda rtc: self._infer(builder, rtc))
 
     def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer:
         s = self._cfg.safety
@@ -418,7 +439,7 @@ class VLAController(Generic, EasyResource):
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
             )
             self._safety = self._build_safety(gripper)
-            self._scheduler = SequentialScheduler(lambda rtc: self._infer(builder, rtc))
+            self._scheduler = self._build_scheduler(mode, builder)
 
             self._state = "running"
             await self._loop(self._scheduler, gripper)
@@ -476,13 +497,14 @@ class VLAController(Generic, EasyResource):
                 self._cfg.fps,
             )
 
-    async def _loop(self, scheduler: SequentialScheduler, gripper: GripperAdapter) -> None:
+    async def _loop(self, scheduler: ChunkScheduler, gripper: GripperAdapter) -> None:
         cfg = self._cfg
         arm = self._resource(cfg.arm)
         period = 1.0 / cfg.fps
         first = True
         last_tick = time.perf_counter()
         consecutive_failures = 0
+        consecutive_starved_ticks = 0
 
         while True:
             tick_started = time.perf_counter()
@@ -524,6 +546,31 @@ class VLAController(Generic, EasyResource):
                 continue
 
             consecutive_failures = 0
+
+            if action is None:
+                # Only AsyncScheduler ever returns this: the queue is empty
+                # and a background inference is already working on the next
+                # chunk. Hold position -- there is no new action to
+                # safety-clamp against, and re-sending the last command
+                # would be indistinguishable from "an action" to anyone
+                # reading clamp_counts. Bounded the same way tick failures
+                # are, by starvation_grace_ticks, but unconditionally (not
+                # gated by stop_on_error): an empty tick is not a failure to
+                # skip, it is an absence of anything to do, so a deployment
+                # cannot spin forever reporting "running" while every tick
+                # silently starves either.
+                consecutive_starved_ticks += 1
+                if consecutive_starved_ticks > cfg.starvation_grace_ticks:
+                    raise RuntimeError(
+                        f"{consecutive_starved_ticks} consecutive ticks starved (queue "
+                        "empty, inference still in flight) exceeded starvation_grace_ticks="
+                        f"{cfg.starvation_grace_ticks}; stopping"
+                    )
+                last_tick = self._record_tick(last_tick)
+                await self._pace(tick_started, period)
+                continue
+
+            consecutive_starved_ticks = 0
 
             degrees = to_degrees(np.asarray(action, dtype=np.float32), cfg.action_units)
 

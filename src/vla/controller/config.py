@@ -41,6 +41,18 @@ generous at 2 Hz but is the *entire* tick at 10 Hz), and the operator is the
 only party who knows which regime they are in. Defaults match
 `observation.py`'s own constants, so an operator who never sets these two
 fields observes no behavior change.
+
+`mode: "async"` (Task 22) overlaps execution with inference instead of
+stalling the arm between chunks -- the fix for the measured case where
+inference latency approaches or exceeds chunk duration (~5.3s vs. a 5.0s
+chunk on Apple Silicon), where RTC cannot help (it needs `delay <
+chunk_length`, and here `delay > chunk_length`). It is explicit opt-in,
+not a value `"auto"` resolves to: `"auto"` still resolves to `"sequential"`
+here, unchanged, so an existing deployment's behavior never changes underneath
+it just because this module gained a new mode. An operator picks `"async"`
+by name once they have measured that their own inference latency warrants
+the discontinuity-at-chunk-boundary tradeoff it accepts in exchange (see
+`AsyncScheduler`'s docstring in `scheduler.py`).
 """
 
 from __future__ import annotations
@@ -57,7 +69,7 @@ from .units import SUPPORTED_UNITS
 
 __all__ = ["ConfigError", "SafetyConfig", "ControllerConfig", "MODES", "ENCODINGS"]
 
-MODES = ("auto", "sequential", "rtc")
+MODES = ("auto", "sequential", "rtc", "async")
 ENCODINGS = ("jpeg", "png", "raw")
 
 # Bounds chosen as sanity ceilings/floors, not physical limits: they exist

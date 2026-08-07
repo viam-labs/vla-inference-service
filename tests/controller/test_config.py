@@ -170,7 +170,7 @@ def test_rejects_unknown_mode():
         ControllerConfig.parse({**BASE, "mode": "turbo"})
 
 
-@pytest.mark.parametrize("mode", ["auto", "sequential", "rtc"])
+@pytest.mark.parametrize("mode", ["auto", "sequential", "rtc", "async"])
 def test_accepts_every_known_mode(mode):
     # Hardcoded literal, not MODES itself -- a mutant that shrinks MODES
     # must not be able to shrink this test's coverage along with it.
