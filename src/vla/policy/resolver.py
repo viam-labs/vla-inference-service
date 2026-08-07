@@ -90,8 +90,14 @@ def resolve_checkpoint(
                 f"hf_token_env names {cfg.hf_token_env!r} but that variable is unset or empty"
             )
 
-    if snapshot_download is None:  # pragma: no cover - exercised only with network
-        from huggingface_hub import snapshot_download as _sd
+    if snapshot_download is None:
+        try:
+            from huggingface_hub import snapshot_download as _sd
+        except ImportError as exc:
+            raise ResolveError(
+                "downloading from the Hugging Face hub requires huggingface_hub, which "
+                "ships with the 'lerobot' extra; install it or use model_path instead"
+            ) from exc
 
         snapshot_download = _sd
 

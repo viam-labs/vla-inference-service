@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -162,6 +163,21 @@ def test_hub_download_result_still_verified(tmp_path, monkeypatch):
     cfg = PolicyConfig.parse({"model_hub_id": "a/b"})
     with pytest.raises(ResolveError, match="config.json"):
         resolve_checkpoint(cfg, snapshot_download=fake_snapshot_download)
+
+
+def test_missing_huggingface_hub_dependency_gives_actionable_error(tmp_path, monkeypatch):
+    # huggingface_hub is not a base dependency of this module -- it only
+    # arrives transitively via the optional `lerobot` extra. A wheel
+    # installed without that extra must fail with an actionable
+    # ResolveError, not a bare ModuleNotFoundError surfacing from inside
+    # the function during first boot. No snapshot_download is injected
+    # here specifically to exercise the real import branch.
+    monkeypatch.setenv("VIAM_MODULE_DATA", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+
+    cfg = PolicyConfig.parse({"model_hub_id": "a/b"})
+    with pytest.raises(ResolveError, match="lerobot"):
+        resolve_checkpoint(cfg)
 
 
 def test_hub_token_read_from_env(tmp_path, monkeypatch):
