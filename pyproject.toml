@@ -2,6 +2,7 @@
 name = "viam-vla-inference-service"
 version = "0.1.0"
 description = "Run pre-trained LeRobot VLA policies on Viam machines"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "viam-sdk>=0.80.0",
