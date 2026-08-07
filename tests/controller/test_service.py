@@ -18,13 +18,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 
 import numpy as np
 import pytest
 from google.protobuf.struct_pb2 import Struct
 from viam.proto.app.robot import ServiceConfig
 
-from tests.fakes import FakeArm, FakeCamera, FakeGripper
+from tests.fakes import FakeArm, FakeCamera, FakeGripper, StalledArm
 from vla.controller.service import VLAController
 from vla.wire import encode_matrix
 
@@ -302,7 +303,10 @@ async def test_loop_runs_and_commands_the_arm():
 async def test_arm_commanded_via_move_to_joint_positions_single_call():
     # move_to_joint_positions is the only method the installed SDK's Arm
     # exposes that FakeArm implements; move_through_joint_positions does not
-    # exist. A single positions object, not a list wrapped in one.
+    # exist. A single positions object, not a list wrapped in one. The write
+    # is full-width (every arm joint, 6 here), not just the 5 driven ones --
+    # see test_non_contiguous_state_joint_indices_map_to_the_correct_arm_joints
+    # for why a narrower, purely-positional write is actually wrong.
     arm = FakeArm(positions=[0.0] * 6)
     svc = _svc(
         config=_config(safety={"max_start_delta_degs": 1000.0, "max_vel_degs_per_sec": 30.0}),
@@ -314,7 +318,166 @@ async def test_arm_commanded_via_move_to_joint_positions_single_call():
     assert len(arm.moves) >= 1
     positions = arm.moves[0]
     assert hasattr(positions, "values")
-    assert len(positions.values) == 5
+    assert len(positions.values) == 6
+
+
+async def test_non_contiguous_state_joint_indices_map_to_the_correct_arm_joints():
+    # Exact repro from code review: state_joint_indices=[1,2,3,4,5] on a
+    # 6-joint arm whose base (joint 0) the policy does not drive. A
+    # positional write (clamped slot i -> arm joint i) would scramble every
+    # joint by one, abandon joint 5 entirely, and blow the delta budget on
+    # joint 0 to boot -- this is the exact bug this test guards against.
+    arm = FakeArm(positions=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    policy = FakePolicyClient(action_dim=5, action_value=999.0)  # push hard, same direction
+    svc = _svc(
+        config=_config(
+            state_joint_indices=[1, 2, 3, 4, 5],
+            safety={"max_start_delta_degs": 1000.0},  # default max_joint_delta_degs=8
+        ),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.1)
+    await svc.do_command({"command": "stop"})
+    assert len(arm.moves) >= 1
+    values = list(arm.moves[0].values)
+    assert len(values) == 6
+    # Joint 0 is never driven by this policy -- it must hold its measured
+    # position exactly, never receive a clamped-but-misdirected value.
+    assert values[0] == pytest.approx(10.0)
+    # Joints 1..5 are each clamped by +8 from their OWN measured position
+    # and must land on the joint they were actually computed against.
+    assert values[1] == pytest.approx(28.0)
+    assert values[2] == pytest.approx(38.0)
+    assert values[3] == pytest.approx(48.0)
+    assert values[4] == pytest.approx(58.0)
+    assert values[5] == pytest.approx(68.0)
+
+
+async def test_state_joint_indices_exceeding_arm_joint_count_refuses_to_start():
+    arm = FakeArm(positions=[0.0] * 3)  # only 3 joints; state_joint_indices needs 0..4
+    policy = FakePolicyClient(action_dim=5)
+    svc = _svc(
+        config=_config(safety={"max_start_delta_degs": 1000.0}),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "state_joint_indices" in status["last_error"]
+    # Not just "some error mentioning state_joint_indices" -- ObservationBuilder
+    # (Task 14) independently re-checks this same bound on the very first
+    # tick and produces a similarly-worded message, so a bare substring
+    # check alone would still pass even with _check_joint_indices deleted
+    # entirely (only the *timing* -- before vs. during the first tick -- and
+    # exact wording would differ). This phrase is unique to this method.
+    assert "arm reports joints 0.." in status["last_error"]
+    assert len(arm.moves) == 0
+    assert arm.stopped >= 1
+
+
+async def test_gripper_joint_index_exceeding_arm_joint_count_refuses_to_start():
+    arm = FakeArm(positions=[0.0] * 5)  # 5 joints; gripper wants index 5
+    policy = FakePolicyClient(action_dim=6)
+    svc = _svc(
+        config=_config(
+            gripper={"type": "arm_joint", "joint_index": 5},
+            safety={"max_start_delta_degs": 1000.0},
+        ),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "gripper.joint_index" in status["last_error"]
+    assert len(arm.moves) == 0
+    assert arm.stopped >= 1
+
+
+async def test_delta_clamp_uses_measured_position_not_last_commanded():
+    # With FakeArm (which snaps its measured position to whatever was last
+    # commanded), "measured" and "last commanded" are indistinguishable --
+    # this is structurally untestable without an arm whose measured position
+    # never moves. Across several ticks, the commanded value must stay
+    # clamped to +8 from the (never-moving) measured position of 0 every
+    # time -- not accumulate (8, 16, 24, ...), which is what a controller-
+    # level regression that fed the last commanded value back in as "current"
+    # would produce.
+    arm = StalledArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_dim=5, action_value=50.0)
+    svc = _svc(
+        config=_config(safety={"max_start_delta_degs": 1000.0}),  # default max_joint_delta_degs=8
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.2)
+    await svc.do_command({"command": "stop"})
+    assert len(arm.moves) >= 3
+    for move in arm.moves:
+        for v in list(move.values)[:5]:
+            assert v == pytest.approx(8.0), list(move.values)
+
+
+async def test_action_units_radians_are_converted_before_commanding_the_arm():
+    # If action_units="radians" -> degrees conversion were skipped (an
+    # identity mutation), a policy emitting pi/2 rad (~90deg) would be
+    # commanded as ~1.57 "degrees" -- small enough to never even reach the
+    # delta clamp. Converted correctly, it hits and is capped by the default
+    # max_joint_delta_degs=8.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_dim=5, action_value=math.pi / 2)
+    svc = _svc(
+        config=_config(
+            action_units="radians", safety={"max_start_delta_degs": 1000.0}
+        ),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.1)
+    await svc.do_command({"command": "stop"})
+    assert len(arm.moves) >= 1
+    first_value = list(arm.moves[0].values)[0]
+    assert abs(first_value - 8.0) < 0.5, first_value
+
+
+async def test_check_start_applies_only_to_the_first_tick_not_every_tick():
+    # A large jump mid-run must be clamped, never refused -- check_start only
+    # gates the very first commanded action.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_dim=5, action_value=1.0)  # within default max_start_delta_degs=15
+    svc = _svc(config=_config(safety={}), deps=_deps(policy=policy, arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    await asyncio.sleep(0.15)  # several ticks/chunks at the initial small value
+
+    policy.action_value = 999.0  # far beyond max_start_delta_degs=15, mid-run
+    await asyncio.sleep(0.2)  # enough for a fresh chunk to pick up the new value
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["state"] != "error"
+    assert len(arm.moves) >= 2
+
+
+async def test_arm_joint_gripper_is_commanded_and_clamped():
+    # gripper.type="arm_joint" is the spec's recommended default but was
+    # otherwise never exercised end-to-end through the controller loop.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_dim=6, action_value=999.0)
+    svc = _svc(
+        config=_config(
+            gripper={"type": "arm_joint", "joint_index": 5},
+            safety={"max_start_delta_degs": 1000.0},
+        ),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.1)
+    await svc.do_command({"command": "stop"})
+    assert len(arm.moves) >= 1
+    values = list(arm.moves[0].values)
+    assert len(values) == 6
+    # The gripper joint (index 5) must actually be commanded -- not silently
+    # dropped -- and must be clamped by the same degree-based delta clamp as
+    # any other joint, not passed through raw (999).
+    assert values[5] == pytest.approx(8.0), values
 
 
 async def test_moved_joint_values_land_within_the_derived_delta_clamp():
@@ -353,8 +516,68 @@ async def test_gripper_write_happens_after_arm_move_for_non_arm_joint_gripper():
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
     assert len(arm.moves) >= 1
-    assert len(gripper.sent) >= 1
-    assert gripper.sent[0] == [0.5]
+    # gripper.sent[0] is the pre-flight probe's write-back of its own current
+    # value ([0.0], FakeGripper's default), which now happens before the
+    # arm's first move -- the real tick's value shows up afterward.
+    assert len(gripper.sent) >= 2
+    assert gripper.sent[-1] == [0.5]
+
+
+async def test_gripper_write_order_is_after_arm_move_not_before():
+    """Both happening is necessary but not sufficient -- prove the order too:
+    a swap (write the gripper, then move the arm) must be caught."""
+    events: list[str] = []
+    arm = FakeArm(positions=[0.0] * 5)
+    gripper = FakeGripper()
+
+    real_move = arm.move_to_joint_positions
+    real_go_to_inputs = gripper.go_to_inputs
+
+    async def tracked_move(*a, **k):
+        events.append("arm")
+        return await real_move(*a, **k)
+
+    async def tracked_go_to_inputs(*a, **k):
+        events.append("gripper")
+        return await real_go_to_inputs(*a, **k)
+
+    arm.move_to_joint_positions = tracked_move
+    gripper.go_to_inputs = tracked_go_to_inputs
+
+    policy = FakePolicyClient(action_dim=6, action_value=0.5)
+    svc = _svc(
+        config=_config(gripper={"type": "gripper", "name": "g", "mode": "inputs"}),
+        deps=_deps(policy=policy, arm=arm, g=gripper),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+
+    # events[0] is the pre-flight probe's own gripper write, before any arm
+    # move -- expected and fine. What matters is that once the arm starts
+    # moving, its own tick's gripper write always comes right after it, not
+    # before.
+    first_arm_idx = events.index("arm")
+    assert events[first_arm_idx + 1] == "gripper", events
+
+
+async def test_gripper_incompatible_mode_is_caught_before_any_arm_motion():
+    # mode="inputs" against a driver lacking go_to_inputs must be discovered
+    # by the pre-flight probe, before the arm has ever been commanded --
+    # not on the first real tick, which would break the refuse-before-motion
+    # discipline every other _run() check maintains.
+    arm = FakeArm(positions=[0.0] * 5)
+    gripper = FakeGripper(supports_inputs=False)
+    policy = FakePolicyClient(action_dim=6)
+    svc = _svc(
+        config=_config(gripper={"type": "gripper", "name": "g", "mode": "inputs"}),
+        deps=_deps(policy=policy, arm=arm, g=gripper),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "go_to_inputs" in status["last_error"] or "does not implement" in status["last_error"]
+    assert len(arm.moves) == 0, "the arm must never have been commanded before the gripper probe failed"
+    assert arm.stopped >= 1
 
 
 async def test_extra_configured_camera_not_needed_by_policy_is_ignored():
@@ -463,16 +686,22 @@ async def test_camera_failure_never_leaves_the_loop_dead_without_stopping():
     assert arm.stopped >= 1
 
 
-async def test_stop_on_error_false_skips_the_tick_and_keeps_running():
+async def test_stop_on_error_false_skips_a_single_tick_and_keeps_running():
+    # fps=10 (period 0.1s) so a 0.05s sleep reliably captures exactly the
+    # first tick's failure -- before a second tick, let alone escalation via
+    # starvation_grace_ticks (default 3), can happen.
     arm = FakeArm(positions=[0.0] * 6)
     policy = FakePolicyClient()
     policy.fail_infer = True
     svc = _svc(
-        config=_config(safety={"max_start_delta_degs": 1000.0, "stop_on_error": False}),
+        config=_config(
+            fps=10.0, safety={"max_start_delta_degs": 1000.0, "stop_on_error": False}
+        ),
         deps=_deps(policy=policy, arm=arm),
     )
     await svc.do_command({"command": "start", "task": "t"})
-    await asyncio.sleep(0.2)
+    await _wait_for_state(svc, "running")
+    await asyncio.sleep(0.05)
     status = await svc.do_command({"command": "status"})
     assert status["state"] == "running"
     assert "exploded" in status["last_error"]
@@ -486,7 +715,13 @@ async def test_stop_on_error_false_recovers_once_inference_starts_succeeding():
     policy = FakePolicyClient()
     policy.fail_infer = True
     svc = _svc(
-        config=_config(safety={"max_start_delta_degs": 1000.0, "stop_on_error": False}),
+        config=_config(
+            # A generous grace bound: this test is about recovery mid-failure,
+            # not about the escalation bound itself (see the dedicated
+            # escalation test below).
+            starvation_grace_ticks=100,
+            safety={"max_start_delta_degs": 1000.0, "stop_on_error": False},
+        ),
         deps=_deps(policy=policy, arm=arm),
     )
     await svc.do_command({"command": "start", "task": "t"})
@@ -495,6 +730,71 @@ async def test_stop_on_error_false_recovers_once_inference_starts_succeeding():
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
     assert len(arm.moves) >= 1
+
+
+async def test_stop_on_error_false_escalates_after_starvation_grace_ticks_exceeded():
+    # 113 consecutive failures leaving the loop reporting "running" forever
+    # is exactly the hole this bound closes: more than starvation_grace_ticks
+    # consecutive failures must stop the arm and halt, regardless of
+    # stop_on_error.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient()
+    policy.fail_infer = True
+    svc = _svc(
+        config=_config(
+            fps=50.0,
+            starvation_grace_ticks=2,
+            safety={"max_start_delta_degs": 1000.0, "stop_on_error": False},
+        ),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=2.0)
+    assert "consecutive" in status["last_error"].lower()
+    assert "starvation_grace_ticks" in status["last_error"]
+    assert arm.stopped >= 1
+    assert len(arm.moves) == 0
+
+
+async def test_consecutive_failure_count_resets_on_a_successful_tick():
+    # Without a reset, N-1 sporadic failures interspersed with successes
+    # would eventually cross the same threshold as N-in-a-row -- which is
+    # not what "consecutive" is supposed to mean. n=1 (one action per chunk)
+    # makes every tick call infer(), so waiting for infer_calls to advance
+    # gives an exact, non-timing-dependent handle on "exactly one tick has
+    # happened since the flag was flipped" -- a blind sleep()-based toggle
+    # can't guarantee that and risks two failures landing back to back by
+    # scheduling luck alone.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=0.01, n=1)
+    svc = _svc(
+        config=_config(
+            fps=20.0,
+            starvation_grace_ticks=1,
+            safety={"max_start_delta_degs": 1000.0, "stop_on_error": False},
+        ),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+
+    async def _wait_for_call(target: int) -> None:
+        for _ in range(500):
+            if policy.infer_calls >= target:
+                return
+            await asyncio.sleep(0.002)
+        raise AssertionError(f"infer_calls never reached {target}")
+
+    for _ in range(6):
+        policy.fail_infer = True
+        await _wait_for_call(policy.infer_calls + 1)
+        policy.fail_infer = False
+        await _wait_for_call(policy.infer_calls + 1)
+
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "running"
+    assert arm.stopped == 0  # checked before the explicit stop() below, which legitimately stops it
+    await svc.do_command({"command": "stop"})
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +1033,62 @@ async def test_can_start_again_shortly_after_reconfigure_cancelled_previous_run(
     await svc.do_command({"command": "stop"})
 
 
+async def test_reconfigure_stops_the_old_arm_not_the_new_one():
+    # Every other reconfigure test reuses one `deps` dict and one arm, which
+    # cannot catch a mutation that moved the old-arm capture in reconfigure()
+    # to *after* _cfg/_deps are rebound -- at that point "the arm named `a`"
+    # already resolves to the new arm, and the stop would silently target
+    # the wrong object. Two distinct FakeArm instances make that observable.
+    old_arm = FakeArm(positions=[0.0] * 6)
+    new_arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient()
+    svc = _svc(deps=_deps(policy=policy, arm=old_arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.1)
+
+    new_deps = _deps(policy=policy, arm=new_arm)
+    svc.reconfigure(_config(), new_deps)
+    await asyncio.sleep(0.1)
+
+    assert old_arm.stopped >= 1
+    assert new_arm.stopped == 0
+
+
+async def test_start_resets_telemetry_from_a_previous_run():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=0.01)
+    svc = _svc(deps=_deps(policy=policy, arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+    status_before = await svc.do_command({"command": "status"})
+    assert status_before["avg_latency_s"] > 0
+    assert status_before["measured_fps"] > 0
+
+    await svc.do_command({"command": "start", "task": "t"})
+    status_immediately_after = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status_immediately_after["avg_latency_s"] == 0.0
+    assert status_immediately_after["measured_fps"] == 0.0
+
+
+async def test_last_error_is_cleared_on_start_after_a_previous_failure():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient()
+    policy.fail_infer = True
+    svc = _svc(deps=_deps(policy=policy, arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert status["last_error"] != ""
+
+    policy.fail_infer = False
+    await svc.do_command({"command": "start", "task": "t"})
+    status_immediately_after = await svc.do_command({"command": "status"})
+    assert status_immediately_after["last_error"] == ""
+    await asyncio.sleep(0.1)
+    await svc.do_command({"command": "stop"})
+
+
 # ---------------------------------------------------------------------------
 # close()
 # ---------------------------------------------------------------------------
@@ -801,18 +1157,20 @@ async def test_status_reports_every_documented_field():
 
 
 async def test_status_queue_size_reflects_the_real_scheduler_not_hardcoded():
+    # A loose "0 <= queue_size <= 7" bound would pass even if queue_size were
+    # hardcoded to 0 -- deterministic instead: fps=2 (period 0.5s) means the
+    # second tick is not due for a long while, so shortly after the first
+    # tick completes (one infer, one merge of a 7-step chunk, one get()) the
+    # queue must hold exactly 6, not 0 and not 7.
     arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=7)  # 7-step chunk
-    svc = _svc(deps=_deps(policy=policy, arm=arm))
+    policy = FakePolicyClient(n=7, action_value=0.01)
+    svc = _svc(config=_config(fps=2.0), deps=_deps(policy=policy, arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.02)  # let exactly the first infer/merge happen
+    await asyncio.sleep(0.1)  # first tick has completed; second is not due until t=0.5s
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
-    # After the very first infer, the queue holds n_action_steps - 1 (one
-    # already consumed this tick) or n_action_steps, depending on timing --
-    # either way it must reflect the scheduler, not a constant.
-    assert 0 <= status["queue_size"] <= 7
+    assert status["queue_size"] == 6
 
 
 async def test_status_last_error_is_empty_string_before_any_failure():
@@ -832,11 +1190,16 @@ async def test_status_avg_latency_reflects_recorded_latencies():
 
 
 async def test_mode_reports_configured_value_before_specs_resolve():
+    # mode="rtc" specifically (not "sequential"): with a cold policy that
+    # never leaves "loading", specs never resolve, so this stays reporting
+    # the *configured* value the whole time. Using "sequential" here would
+    # not catch a mutant that hardcoded status()'s mode field to
+    # "sequential" -- it would coincidentally match either way.
     policy = FakePolicyClient(state="loading")
-    svc = _svc(config=_config(mode="sequential"), deps=_deps(policy=policy))
+    svc = _svc(config=_config(mode="rtc"), deps=_deps(policy=policy))
     await svc.do_command({"command": "start", "task": "t"})
     status = await svc.do_command({"command": "status"})
-    assert status["mode"] == "sequential"
+    assert status["mode"] == "rtc"
     await svc.do_command({"command": "stop"})
 
 
@@ -853,10 +1216,33 @@ async def test_measured_fps_reflects_the_configured_pace():
     await asyncio.sleep(0.5)
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
-    # Generous bounds: real scheduling jitter under a test runner is
-    # substantial, but it must land in the neighborhood of 20, not e.g. 2
-    # (10x too slow) or 200 (10x too fast, suggesting no pacing at all).
-    assert 5.0 < status["measured_fps"] < 60.0
+    # Tight enough to catch a 2x pacing error (a mutant doubling `period`
+    # would land near 10, not near 20) while still tolerating real scheduling
+    # jitter under a test runner.
+    assert 12.0 < status["measured_fps"] < 35.0
+
+
+async def test_measured_fps_reflects_actual_pace_not_the_configured_target():
+    # The single most misleading thing measured_fps could report: a
+    # hardcoded `self._measured_fps = cfg.fps` would show ~200 here and this
+    # must fail. fps=200 (period 5ms) is configured, but every tick is
+    # forced to take ~50ms by the policy's own artificial delay, so the real
+    # achieved pace is ~20fps -- nowhere near the configured target.
+    # n=1: without this, SequentialScheduler only calls infer() (and thus
+    # only pays infer_delay_s) once every n_action_steps ticks -- the other
+    # ticks drain the cached chunk almost instantly, and the *last* tick
+    # before status() happens to be sampled could easily be one of those
+    # fast ones, making measured_fps report near the configured target by
+    # accident rather than the forced-slow actual pace.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=0.01, n=1)
+    policy.infer_delay_s = 0.05
+    svc = _svc(config=_config(fps=200.0), deps=_deps(policy=policy, arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.3)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert 5.0 < status["measured_fps"] < 40.0
 
 
 async def test_tick_overrun_warns_instead_of_silently_drifting(caplog):
@@ -952,6 +1338,62 @@ async def test_high_stale_frame_warn_threshold_suppresses_the_warning(caplog):
         await svc.do_command({"command": "stop"})
     warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert not any("stale" in m.lower() for m in warnings), warnings
+
+
+async def test_duration_warn_threshold_is_configurable_through_the_controller(caplog):
+    # duration_warn_s=0.0 means any positive observation-assembly duration
+    # warns -- proof the field is actually threaded through to
+    # ObservationBuilder, not silently dropped.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=0.01)
+    svc = _svc(
+        config=_config(duration_warn_s=0.0),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    with caplog.at_level(logging.WARNING, logger="vla.controller.observation"):
+        await svc.do_command({"command": "start", "task": "t"})
+        await asyncio.sleep(0.1)
+        await svc.do_command({"command": "stop"})
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("observation assembly took" in m for m in warnings), warnings
+
+
+async def test_high_duration_warn_threshold_suppresses_the_warning(caplog):
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=0.01)
+    svc = _svc(
+        config=_config(duration_warn_s=100.0),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    with caplog.at_level(logging.WARNING, logger="vla.controller.observation"):
+        await svc.do_command({"command": "start", "task": "t"})
+        await asyncio.sleep(0.1)
+        await svc.do_command({"command": "stop"})
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert not any("observation assembly took" in m for m in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# _record_latency: the trim to the most recent 50 entries, tested directly
+# rather than through the full timed loop -- deterministic, and the exact
+# unit responsible for avg_latency_s not becoming a lifetime average.
+# ---------------------------------------------------------------------------
+
+
+async def test_record_latency_trims_to_the_most_recent_50():
+    svc = VLAController("c")
+    for i in range(60):
+        svc._record_latency(float(i))
+    assert len(svc._latencies) == 50
+    assert svc._latencies[0] == 10.0  # the first 10 (0..9) were pushed out
+    assert svc._latencies[-1] == 59.0
+
+
+async def test_record_latency_does_not_trim_under_50():
+    svc = VLAController("c")
+    for i in range(10):
+        svc._record_latency(float(i))
+    assert svc._latencies == [float(i) for i in range(10)]
 
 
 # ---------------------------------------------------------------------------

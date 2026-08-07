@@ -48,6 +48,29 @@ class FakeArm:
         self.stopped += 1
 
 
+class StalledArm(FakeArm):
+    """An arm that accepts move commands but whose *measured* position never
+    changes -- simulating a jammed/stalled joint.
+
+    `FakeArm` snaps `self.positions` to whatever was last commanded, so with
+    it, "the measured position" and "the last commanded position" are always
+    identical and indistinguishable to a test. The safety layer's delta clamp
+    is specifically supposed to clamp against the *measured* position on
+    every tick, not the last commanded one (see `safety.py`'s docstring:
+    "so a stalled arm cannot accumulate an ever-growing command") -- a
+    controller-level regression that swapped one for the other (e.g. caching
+    `current` outside the loop, or feeding the previous `safe` back in as the
+    next tick's `current`) would pass every test built on `FakeArm` alone.
+    This fake exists so that specific property has real coverage.
+    """
+
+    async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
+        if self.fail_next_move:
+            raise RuntimeError("arm move failed")
+        self.moves.append(positions)
+        # Deliberately does NOT update self.positions -- the whole point.
+
+
 class FakeCamera:
     """Duck-types `viam.components.camera.Camera`.
 

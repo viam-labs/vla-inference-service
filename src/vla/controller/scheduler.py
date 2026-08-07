@@ -6,12 +6,22 @@ rtc_enabled`).
 
 `ChunkScheduler.next_action` is typed to allow returning `None`, but
 `SequentialScheduler` never actually does -- it raises `SchedulerError`
-instead when it cannot produce an action. That makes the controller's
-`starvation_grace_ticks` branch unreachable in this phase: it exists for
-`RTCScheduler`, where a background inference thread can genuinely leave the
-queue empty for a tick. The branch (and its config field) is kept rather
-than added later, since `RTCScheduler` is an explicit follow-up, not a
-hypothetical.
+instead when it cannot produce an action. That makes an "action is None"
+branch inside the controller's loop unreachable in this phase: it would
+exist for `RTCScheduler`, where a background inference thread can genuinely
+leave the queue empty for a tick.
+
+`starvation_grace_ticks` itself is *not* unreachable, though -- the
+controller (`vla.controller.service`) consumes it independently, as a bound
+on consecutive tick *failures* (not empty-queue ticks) when
+`safety.stop_on_error` is `False`: more than `starvation_grace_ticks`
+failures in a row stops the arm and halts regardless of `stop_on_error`, so
+a deployment that opts out of per-failure halting still cannot spin forever
+reporting "running" while every tick silently fails. That reuse of the same
+config field for a related but distinct purpose is deliberate -- both are
+"how much starvation/failure to tolerate before giving up" -- rather than
+adding a second, near-duplicate field ahead of `RTCScheduler` actually
+existing.
 """
 
 from __future__ import annotations

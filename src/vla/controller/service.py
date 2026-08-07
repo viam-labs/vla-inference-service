@@ -29,6 +29,28 @@ reading of the design doc's error-handling table (whose only qualified row is
 inference failure); it is not a retry/backoff mechanism -- skipping a tick is
 exactly the loop's ordinary next iteration, with no attempt counter or delay
 logic added.
+
+``stop_on_error=False`` is bounded, not unconditional: ``starvation_grace_ticks``
+(a config field otherwise unused in this phase -- see ``scheduler.py``) is
+consumed here as a bound on *consecutive* tick failures. More than
+``starvation_grace_ticks`` failures in a row stops the arm and halts
+regardless of ``stop_on_error`` -- a deployment that opts out of per-failure
+halting must still not be able to spin forever reporting ``running`` while
+every tick silently fails and nothing else in the design doc's error table
+(queue starvation, in spirit) ever fires.
+
+The write to the arm is built as a full-width target seeded from the
+*measured* joint positions, not a dense positional list: ``state_joint_
+indices`` is an arbitrary (possibly non-contiguous, possibly reordered) index
+list into the arm's joints, and ``move_to_joint_positions`` has no notion of
+"only these joints" -- a positional write silently maps clamped slot *i* onto
+arm joint *i* rather than arm joint ``state_joint_indices[i]``, which both
+scrambles the joint mapping and voids the delta clamp for any configuration
+where the two differ (e.g. a 5-DoF policy on a 6-joint arm whose base it
+does not drive). ``state_joint_indices`` (and ``gripper.joint_index``, for
+``arm_joint``) are validated against the arm's actual joint count once, at
+``_run()`` setup, before any motion -- config parsing alone cannot check this,
+since it has no access to the arm.
 """
 
 from __future__ import annotations
@@ -57,12 +79,6 @@ from .scheduler import SequentialScheduler
 from .units import to_degrees
 
 LOGGER = logging.getLogger(__name__)
-
-# States, in the order they normally advance through a run:
-#   idle -> waiting_for_policy -> running -> stopped
-# with `error` reachable from any of the last three. `idle` is also the
-# state produced by reconfigure(), whether or not a run was ever started.
-STATES = ("idle", "waiting_for_policy", "running", "stopped", "error")
 
 
 class VLAController(Generic, EasyResource):
@@ -177,6 +193,15 @@ class VLAController(Generic, EasyResource):
         if not self._active_task_text:
             raise ValueError("no task instruction: pass 'task' or configure a default")
         self._last_error = None
+        # A restart must not report the *previous* run's telemetry as live:
+        # without this, status would show yesterday's measured_fps/
+        # avg_latency_s/clamp_counts as if they belonged to a run that
+        # hasn't produced a single tick yet.
+        self._specs = None
+        self._scheduler = None
+        self._safety = None
+        self._latencies = []
+        self._measured_fps = 0.0
         self._state = "waiting_for_policy"
         # Ack immediately: waiting out policy_ready_timeout_s inline would
         # exceed the deadline most DoCommand callers use, so the "still
@@ -294,6 +319,50 @@ class VLAController(Generic, EasyResource):
             f"{'1 gripper' if gripper.in_state else 'no gripper'})"
         )
 
+    def _check_joint_indices(self, measured: list[float], gripper: GripperAdapter) -> None:
+        """Refuse before any motion if config references a joint the arm
+        does not have.
+
+        `state_joint_indices` and `gripper.joint_index` are only checked for
+        `>= 0` at config-parse time -- config parsing has no access to the
+        arm, so it cannot know how many joints it actually has. This is the
+        first point in the lifecycle that does.
+        """
+        cfg = self._cfg
+        n = len(measured)
+        bad = sorted({i for i in cfg.state_joint_indices if i >= n})
+        if bad:
+            raise RuntimeError(
+                f"state_joint_indices {bad} exceed the arm's {n} joints "
+                f"(arm reports joints 0..{n - 1})"
+            )
+        if gripper.arm_joint_index is not None and gripper.arm_joint_index >= n:
+            raise RuntimeError(
+                f"gripper.joint_index {gripper.arm_joint_index} exceeds the arm's "
+                f"{n} joints (arm reports joints 0..{n - 1})"
+            )
+
+    async def _preflight_gripper(self, gripper: GripperAdapter) -> None:
+        """Probe the gripper's actual write capability before any arm motion.
+
+        `go_to_inputs` is abstract in the SDK, so not every driver implements
+        it -- `InputsGripper.write` only discovers that by calling it and
+        catching `NotImplementedError`. Without this probe, that discovery
+        happens on the *first real tick*, after the arm has already been
+        commanded once -- breaking the refuse-before-motion discipline every
+        other check in `_run()` maintains. Reads the gripper's own current
+        value and writes it straight back: a no-op for `InputsGripper`/
+        `ServoGripper` (they land on the same value already reported), and
+        for `ThresholdGripper` it is exactly the same "first write always
+        actuates once" behavior that would happen on tick 1 regardless --
+        merely moved earlier, before any arm command. `arm_joint`/`none` have
+        no separate gripper component to probe.
+        """
+        if not gripper.in_state or gripper.arm_joint_index is not None:
+            return
+        value = await gripper.read()
+        await gripper.write(value)
+
     def _image_sizes(self, specs: dict[str, Any]) -> dict[str, tuple[int, int]]:
         cfg = self._cfg
         # int() is mandatory, not defensive. specs arrives via
@@ -326,6 +395,11 @@ class VLAController(Generic, EasyResource):
             self._check_action_dim(specs, gripper)
             image_sizes = self._image_sizes(specs)
 
+            arm = self._resource(cfg.arm)
+            measured = list((await arm.get_joint_positions()).values)
+            self._check_joint_indices(measured, gripper)
+            await self._preflight_gripper(gripper)
+
             # Only cameras the policy actually asked for: a camera configured
             # but not among specs.image_feature_keys must never be read or
             # sent -- it has no entry in image_sizes, so ObservationBuilder
@@ -333,7 +407,7 @@ class VLAController(Generic, EasyResource):
             # declared, for a feed the policy never asked to see.
             builder = ObservationBuilder(
                 cameras={key: self._resource(cfg.cameras[key]) for key in image_sizes},
-                arm=self._resource(cfg.arm),
+                arm=arm,
                 gripper=gripper,
                 state_joint_indices=cfg.state_joint_indices,
                 state_units=cfg.state_units,
@@ -370,9 +444,17 @@ class VLAController(Generic, EasyResource):
             payload["rtc"] = rtc
         started = time.perf_counter()
         out = await self._resource(self._cfg.policy_service).do_command(payload)
-        self._latencies.append(time.perf_counter() - started)
-        del self._latencies[:-50]
+        self._record_latency(time.perf_counter() - started)
         return decode_matrix(out["actions"]), decode_matrix(out["raw_actions"])
+
+    def _record_latency(self, elapsed: float) -> None:
+        """Append one tick's inference latency, bounded to the most recent
+        50 -- ``avg_latency_s`` must reflect recent performance, not a
+        lifetime average that a long run would otherwise dilute towards
+        whatever the first few ticks happened to look like.
+        """
+        self._latencies.append(elapsed)
+        del self._latencies[:-50]
 
     def _record_tick(self, last_tick: float) -> float:
         now = time.perf_counter()
@@ -400,6 +482,7 @@ class VLAController(Generic, EasyResource):
         period = 1.0 / cfg.fps
         first = True
         last_tick = time.perf_counter()
+        consecutive_failures = 0
 
         while True:
             tick_started = time.perf_counter()
@@ -415,21 +498,46 @@ class VLAController(Generic, EasyResource):
                 # by default this is fatal (stop the arm, halt); an operator
                 # who opts out gets the tick skipped and the loop kept alive
                 # for the next one -- never a retry counter or a backoff, just
-                # the loop's ordinary next iteration.
+                # the loop's ordinary next iteration. But that opt-out is
+                # bounded: starvation_grace_ticks caps how many *consecutive*
+                # failures are tolerated before this escalates to fatal
+                # regardless of stop_on_error, so a bad deployment cannot
+                # spin forever reporting "running" while every tick silently
+                # fails.
+                consecutive_failures += 1
                 self._last_error = str(exc)
-                LOGGER.error("tick failed while producing the next action: %s", exc)
+                LOGGER.error(
+                    "tick failed while producing the next action (%d consecutive): %s",
+                    consecutive_failures,
+                    exc,
+                )
                 if cfg.safety.stop_on_error:
                     raise
+                if consecutive_failures > cfg.starvation_grace_ticks:
+                    raise RuntimeError(
+                        f"{consecutive_failures} consecutive tick failures exceeded "
+                        f"starvation_grace_ticks={cfg.starvation_grace_ticks}; stopping "
+                        "regardless of stop_on_error"
+                    ) from exc
                 last_tick = self._record_tick(last_tick)
                 await self._pace(tick_started, period)
                 continue
 
+            consecutive_failures = 0
+
             degrees = to_degrees(np.asarray(action, dtype=np.float32), cfg.action_units)
 
-            current_all = list((await arm.get_joint_positions()).values)
-            joint_current = [current_all[i] for i in cfg.state_joint_indices]
+            # Every joint the arm has, not just the driven ones: `positions`
+            # below seeds from the *measured* values so an un-driven joint
+            # (state_joint_indices need not be contiguous, or cover every
+            # joint -- a 5-DoF policy on a 6-joint arm is a legitimate
+            # config) holds its measured position rather than being sent an
+            # implicit 0.0, and so each driven value lands on the joint it
+            # was actually clamped against.
+            measured = list((await arm.get_joint_positions()).values)
+            joint_current = [measured[i] for i in cfg.state_joint_indices]
             if gripper.arm_joint_index is not None:
-                joint_current.append(current_all[gripper.arm_joint_index])
+                joint_current.append(measured[gripper.arm_joint_index])
             elif gripper.in_state:
                 joint_current.append(await gripper.read())
             current = np.asarray(joint_current, dtype=np.float32)
@@ -443,15 +551,25 @@ class VLAController(Generic, EasyResource):
 
             safe = self._safety.apply(degrees, current)
 
-            joint_values = [float(v) for v in safe[: len(cfg.state_joint_indices)]]
+            # Positional writes silently mis-map: `move_to_joint_positions`
+            # has no notion of "only these joints", so a dense list built
+            # from `safe` alone would land clamped slot i on arm joint i --
+            # not arm joint `state_joint_indices[i]` -- scrambling the
+            # mapping and voiding the delta clamp whenever the two differ.
+            # Building `target` from `measured` and overwriting only the
+            # driven slots keeps every value on the joint it was computed
+            # for, and holds every other joint at its measured position.
+            target = list(measured)
+            for slot, joint_idx in enumerate(cfg.state_joint_indices):
+                target[joint_idx] = float(safe[slot])
             if gripper.arm_joint_index is not None:
-                joint_values.append(float(safe[-1]))
+                target[gripper.arm_joint_index] = float(safe[-1])
 
             # Arm/gripper command failures are unconditionally fatal too: by
             # this point inference already succeeded and safety already
             # cleared the action, so there is no "try again next tick" that
             # would be safe -- the arm itself is reporting the fault.
-            await arm.move_to_joint_positions(JointPositions(values=joint_values))
+            await arm.move_to_joint_positions(JointPositions(values=target))
             if gripper.in_state and gripper.arm_joint_index is None:
                 await gripper.write(float(safe[-1]))
 
