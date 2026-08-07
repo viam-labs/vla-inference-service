@@ -219,10 +219,14 @@ def test_hub_token_read_from_env(tmp_path, monkeypatch):
     assert captured["token"] == "secret-value"
 
 
-def test_hub_token_is_none_when_hf_token_env_unset(tmp_path, monkeypatch):
-    # The counterpart to the "token read from env" test: nothing in the
-    # base suite proves token defaults to None rather than some other
-    # placeholder when hf_token_env is not configured.
+def test_hub_token_is_false_when_hf_token_env_unset(tmp_path, monkeypatch):
+    # `token=False` -- not `None` -- must reach snapshot_download when no
+    # hf_token_env is configured. huggingface_hub treats `None` as "defer to
+    # whatever is cached on this machine" and `False` as "anonymous, no
+    # matter what is cached." A module that never asked for a token must not
+    # let some unrelated (and possibly stale/invalid) ambient login get sent
+    # on its behalf -- that previously turned into a `401 Unauthorized` on a
+    # fully public repo, which reads like "model_hub_id is wrong" and is not.
     monkeypatch.setenv("VIAM_MODULE_DATA", str(tmp_path))
     captured = {}
 
@@ -233,7 +237,27 @@ def test_hub_token_is_none_when_hf_token_env_unset(tmp_path, monkeypatch):
     (tmp_path / "dl").mkdir()
     cfg = PolicyConfig.parse({"model_hub_id": "a/b"})
     resolve_checkpoint(cfg, snapshot_download=fake_snapshot_download)
-    assert captured["token"] is None
+    assert captured["token"] is False
+
+
+def test_hub_token_is_the_real_string_not_true_when_hf_token_env_set(tmp_path, monkeypatch):
+    # The counterpart to the anonymous-path test above: when a token *is*
+    # configured, the literal secret string must reach snapshot_download --
+    # not `True` (which would tell huggingface_hub to go pull some other
+    # token from the cache instead of the one actually configured here).
+    monkeypatch.setenv("VIAM_MODULE_DATA", str(tmp_path))
+    monkeypatch.setenv("MY_HF_TOKEN", "secret-value")
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        return str(_make_checkpoint(tmp_path / "dl"))
+
+    (tmp_path / "dl").mkdir()
+    cfg = PolicyConfig.parse({"model_hub_id": "a/b", "hf_token_env": "MY_HF_TOKEN"})
+    resolve_checkpoint(cfg, snapshot_download=fake_snapshot_download)
+    assert captured["token"] == "secret-value"
+    assert captured["token"] is not True
 
 
 def test_missing_token_env_var_errors(tmp_path, monkeypatch):

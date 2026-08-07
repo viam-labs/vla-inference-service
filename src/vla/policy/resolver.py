@@ -109,6 +109,15 @@ def resolve_checkpoint(
     """Return a local directory containing the checkpoint.
 
     `snapshot_download` is injectable so tests never touch the network.
+
+    When no `hf_token_env` is configured, the hub download deliberately
+    passes `token=False` (forcing anonymous access) rather than `token=None`
+    (which would silently defer to huggingface_hub's own cached-login
+    lookup). Without this, a stale or unrelated token cached on the machine
+    running the module -- something this module never asked for and has no
+    way to see -- would still be sent, and a fully public repo would fail
+    with a misleading `401 Unauthorized` / "Repository Not Found" instead of
+    downloading anonymously as configured.
     """
     if cfg.model_path:
         if cfg.hf_token_env:
@@ -124,7 +133,17 @@ def resolve_checkpoint(
             )
         return _verify(cfg.model_path)
 
-    token = None
+    # `False`, not `None`. huggingface_hub treats `token=None` as "use the
+    # ambient cached token if one exists" (huggingface_hub.utils.
+    # get_token_to_send: None falls through to get_token(), which reads
+    # ~/.cache/huggingface/token or HF_TOKEN). Only `token=False` actually
+    # means anonymous. When no hf_token_env is configured this module has
+    # explicitly decided not to authenticate, but `None` would still let a
+    # stale or unrelated cached login on the machine get sent -- and if that
+    # cached token happens to be invalid, a fully public repo comes back as
+    # `401 Unauthorized` / "Repository Not Found", which sends whoever is
+    # debugging it looking for a typo in `model_hub_id` that was never there.
+    token: str | bool = False
     if cfg.hf_token_env:
         token = os.environ.get(cfg.hf_token_env)
         if not token:
