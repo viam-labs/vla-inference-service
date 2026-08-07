@@ -33,6 +33,18 @@ _MAX_EXECUTION_HORIZON = 1000
 _MIN_GUIDANCE_WEIGHT = 1e-6
 _MAX_GUIDANCE_WEIGHT = 1000.0
 
+# load_timeout_s bounds the whole checkpoint-resolve + backend.load +
+# warmup sequence so a hung download or deserialize eventually transitions
+# the resource to "failed" with an actionable message instead of sitting on
+# "loading" forever with no way for an operator to tell "downloading 40 GB"
+# from "wedged". 1800s (30 min) is generous for even a large hub download on
+# a slow link; 86400s (24h) is a ceiling that still catches a wild typo. The
+# floor is not 0 -- a load always takes some nonzero time -- but is set low
+# enough that tests can exercise the timeout path in well under a second.
+_MIN_LOAD_TIMEOUT_S = 0.001
+_MAX_LOAD_TIMEOUT_S = 86400.0
+_DEFAULT_LOAD_TIMEOUT_S = 1800.0
+
 
 @dataclass(frozen=True)
 class RTCSettings:
@@ -88,6 +100,7 @@ class PolicyConfig:
     device: str = "auto"
     dtype: str = "auto"
     warmup_inferences: int = 2
+    load_timeout_s: float = _DEFAULT_LOAD_TIMEOUT_S
     rtc: RTCSettings = field(default_factory=RTCSettings)
 
     def __repr__(self) -> str:
@@ -101,6 +114,7 @@ class PolicyConfig:
             f"device={self.device!r}, "
             f"dtype={self.dtype!r}, "
             f"warmup_inferences={self.warmup_inferences!r}, "
+            f"load_timeout_s={self.load_timeout_s!r}, "
             f"rtc={self.rtc!r})"
         )
 
@@ -124,6 +138,13 @@ class PolicyConfig:
             maximum=_MAX_WARMUP_INFERENCES,
         )
 
+        load_timeout_s = as_float(
+            raw.get("load_timeout_s", _DEFAULT_LOAD_TIMEOUT_S),
+            "load_timeout_s",
+            minimum=_MIN_LOAD_TIMEOUT_S,
+            maximum=_MAX_LOAD_TIMEOUT_S,
+        )
+
         model_revision = as_str(raw.get("model_revision", "main"), "model_revision")
 
         hf_token_env = raw.get("hf_token_env") or None
@@ -144,5 +165,6 @@ class PolicyConfig:
             device=device,
             dtype=dtype,
             warmup_inferences=warmup,
+            load_timeout_s=load_timeout_s,
             rtc=RTCSettings.parse({} if rtc_raw is None else rtc_raw),
         )

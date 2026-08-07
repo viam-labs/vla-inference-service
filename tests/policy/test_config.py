@@ -305,3 +305,58 @@ def test_rejects_excessive_execution_horizon():
 def test_rejects_excessive_max_guidance_weight():
     with pytest.raises(ConfigError, match="max_guidance_weight"):
         PolicyConfig.parse({"model_path": "/m", "rtc": {"max_guidance_weight": 1e30}})
+
+
+# --- load_timeout_s: bounds a stuck download/deserialize so "loading"
+# eventually transitions to "failed" with an actionable message instead of
+# staying wedged forever.
+
+
+def test_default_load_timeout_is_generous():
+    cfg = PolicyConfig.parse({"model_path": "/m"})
+    assert cfg.load_timeout_s == 1800.0
+
+
+def test_accepts_overridden_load_timeout():
+    cfg = PolicyConfig.parse({"model_path": "/m", "load_timeout_s": 60.0})
+    assert cfg.load_timeout_s == 60.0
+
+
+def test_accepts_integral_load_timeout():
+    cfg = PolicyConfig.parse({"model_path": "/m", "load_timeout_s": 60})
+    assert cfg.load_timeout_s == 60.0
+
+
+def test_rejects_zero_load_timeout():
+    with pytest.raises(ConfigError, match="load_timeout_s"):
+        PolicyConfig.parse({"model_path": "/m", "load_timeout_s": 0})
+
+
+def test_rejects_negative_load_timeout():
+    with pytest.raises(ConfigError, match="load_timeout_s"):
+        PolicyConfig.parse({"model_path": "/m", "load_timeout_s": -1.0})
+
+
+def test_rejects_excessive_load_timeout():
+    with pytest.raises(ConfigError, match="load_timeout_s"):
+        PolicyConfig.parse({"model_path": "/m", "load_timeout_s": 1e30})
+
+
+def test_rejects_non_numeric_load_timeout():
+    with pytest.raises(ConfigError, match="load_timeout_s"):
+        PolicyConfig.parse({"model_path": "/m", "load_timeout_s": "forever"})
+
+
+def test_rejects_boolean_load_timeout():
+    with pytest.raises(ConfigError, match="load_timeout_s"):
+        PolicyConfig.parse({"model_path": "/m", "load_timeout_s": True})
+
+
+def test_rejects_nan_load_timeout():
+    with pytest.raises(ConfigError, match="load_timeout_s"):
+        PolicyConfig.parse({"model_path": "/m", "load_timeout_s": math.nan})
+
+
+def test_repr_includes_load_timeout_s():
+    cfg = PolicyConfig.parse({"model_path": "/m", "load_timeout_s": 42.0})
+    assert "load_timeout_s=42.0" in repr(cfg)

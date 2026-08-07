@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 import time
 
@@ -190,9 +191,7 @@ async def test_close_cancels_in_flight_load_without_waiting_for_it(tmp_path):
 
 async def test_close_after_ready_is_safe(tmp_path):
     svc = await _ready_service(tmp_path)
-    await svc.close()
-    status = await svc.do_command({"command": "status"})
-    assert status["state"] == "ready"
+    await svc.close()  # must not raise
 
 
 async def test_close_twice_is_safe(tmp_path):
@@ -204,6 +203,78 @@ async def test_close_twice_is_safe(tmp_path):
 async def test_close_before_any_reconfigure_is_safe():
     svc = VLAPolicy("p")
     await svc.close()  # no load task was ever created
+
+
+# --- close() must actually release: refuse further service, drop the
+# backend, and log loudly if a load was still running. Per the coordinator:
+# viam-server's Python SDK reconfigures a resource by removing it and
+# constructing a brand-new instance (remove-then-add), so close() sits on
+# the critical path of *every* reconfigure, not just final shutdown -- an
+# orphaned download thread here can wedge the REPLACEMENT resource on a
+# filelock it still holds in the HF cache.
+
+
+@pytest.mark.parametrize("command", ["status", "specs", "reset", "infer"])
+async def test_do_command_refuses_after_close(tmp_path, command):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    await svc.close()
+    with pytest.raises(Exception, match="closed"):
+        await svc.do_command({
+            "command": command,
+            "images": {"observation.images.top": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+        })
+
+
+async def test_do_command_works_normally_before_close(tmp_path):
+    """Sanity check for the parametrized refusal test above: closing must be
+    what causes the refusal, not some unrelated regression in do_command."""
+    svc = await _ready_service(tmp_path)
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "ready"
+
+
+async def test_close_drops_backend_reference(tmp_path):
+    """So a loaded torch model isn't kept alive (holding GPU memory) by a
+    resource nothing can reach anymore."""
+    svc = await _ready_service(tmp_path)
+    assert svc._backend is not None
+    await svc.close()
+    assert svc._backend is None
+
+
+async def test_close_logs_warning_when_load_still_running(tmp_path, caplog):
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    release = threading.Event()
+
+    class SlowBackend(FakePolicyBackend):
+        def load(self, *a, **k):
+            release.wait(timeout=5)
+            super().load(*a, **k)
+
+    svc._backend_factory = SlowBackend
+    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
+    await asyncio.sleep(0.05)  # let the load genuinely be in flight
+
+    with caplog.at_level(logging.WARNING, logger="vla.policy.service"):
+        await svc.close()
+
+    release.set()  # let the orphaned thread finish so it doesn't leak
+
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("still be running" in m or "in progress" in m for m in warnings), warnings
+
+
+async def test_close_does_not_warn_when_load_already_settled(tmp_path, caplog):
+    svc = await _ready_service(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="vla.policy.service"):
+        await svc.close()
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == []
 
 
 # --- 2. generation counter ---
@@ -220,7 +291,8 @@ async def test_stale_load_generation_does_not_overwrite_newer_state(tmp_path):
     svc = VLAPolicy("p")
     svc._backend_factory = FakePolicyBackend
     svc._cfg = PolicyConfig.parse({"model_path": str(tmp_path)})
-    svc._backend = FakePolicyBackend(action_dim=9, n_action_steps=3)
+    stale_backend = FakePolicyBackend(action_dim=9, n_action_steps=3)
+    svc._backend = stale_backend
     svc._generation = 5
     # Deliberately a value the stale load's own (successful) run would NOT
     # produce on its own -- if the generation guard were a no-op, `_load`
@@ -229,7 +301,7 @@ async def test_stale_load_generation_does_not_overwrite_newer_state(tmp_path):
     svc._state = "failed"
     svc._error = "some earlier, unrelated failure"
 
-    await svc._load(3)  # stale generation: 3 != current 5
+    await svc._load(3, stale_backend)  # stale generation: 3 != current 5
 
     assert svc._state == "failed"
     assert svc._error == "some earlier, unrelated failure"
@@ -491,3 +563,357 @@ async def test_infer_malformed_image_names_the_failing_camera(tmp_path):
             "state": encode_vector(np.zeros(4, dtype=np.float32)),
             "task": "t",
         })
+
+
+# ---------------------------------------------------------------------------
+# Round 2: coordinator-requested hardening.
+# ---------------------------------------------------------------------------
+
+
+# --- 1. the to_thread boundary is the module's headline property and must
+# be independently testable: mutating either call site to run synchronously
+# on the loop must turn these red, not just "10s slower".
+
+
+async def test_load_does_not_block_the_event_loop(tmp_path):
+    """A slow backend.load() must run off the event loop (via to_thread).
+
+    If _load ever called backend.load() directly on the loop, the entire
+    process would freeze for the duration of the (real, OS-level) blocking
+    call inside it, since asyncio's cooperative scheduling only progresses
+    at await points -- starving even a trivial concurrent coroutine.
+    """
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    release = threading.Event()
+
+    class SlowBackend(FakePolicyBackend):
+        def load(self, *a, **k):
+            release.wait(timeout=1.0)
+            super().load(*a, **k)
+
+    svc._backend_factory = SlowBackend
+    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.2)
+    ticker_task.cancel()
+    try:
+        await ticker_task
+    except asyncio.CancelledError:
+        pass
+
+    release.set()
+    await svc.await_ready()
+
+    assert ticks > 100, (
+        f"event loop only ticked {ticks} times in 0.2s while a slow load "
+        "was in flight -- backend.load() is likely running on the loop "
+        "instead of via asyncio.to_thread"
+    )
+
+
+async def test_infer_does_not_block_the_event_loop(tmp_path):
+    """predict_chunk must run off the event loop (via asyncio.to_thread).
+
+    At the real target's ~100ms-per-forward-pass GPU latency and a 10 Hz
+    control loop, calling it directly on the loop would stall every other
+    DoCommand and health check for the duration of each inference.
+    """
+    _make_checkpoint(tmp_path)
+    release = threading.Event()
+
+    class SlowInferBackend(FakePolicyBackend):
+        def predict_chunk(self, *a, **k):
+            release.wait(timeout=1.0)
+            return super().predict_chunk(*a, **k)
+
+    svc = VLAPolicy("p")
+    svc._backend_factory = lambda: SlowInferBackend(action_dim=4, n_action_steps=5)
+    svc.reconfigure(_config({"model_path": str(tmp_path), "warmup_inferences": 0}), {})
+    await svc.await_ready()
+
+    img = np.zeros((224, 224, 3), dtype=np.uint8)
+    infer_task = asyncio.create_task(svc.do_command({
+        "command": "infer",
+        "images": {"observation.images.top": encode_image(img)},
+        "state": encode_vector(np.zeros(4, dtype=np.float32)),
+        "task": "t",
+    }))
+
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await asyncio.sleep(0)
+
+    ticker_task = asyncio.create_task(ticker())
+    await asyncio.sleep(0.2)
+    ticker_task.cancel()
+    try:
+        await ticker_task
+    except asyncio.CancelledError:
+        pass
+
+    release.set()
+    await infer_task
+
+    assert ticks > 100, (
+        f"event loop only ticked {ticks} times in 0.2s while a slow infer "
+        "was in flight -- predict_chunk is likely running on the loop "
+        "instead of via asyncio.to_thread"
+    )
+
+
+# --- 3. non-dict payloads must raise WireError naming the field, not a bare
+# AttributeError/TypeError escaping from a builtin (standing requirement 5).
+
+
+async def test_infer_rejects_non_dict_images_field(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="images"):
+        await svc.do_command({
+            "command": "infer",
+            "images": ["not", "a", "dict"],
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+        })
+
+
+async def test_infer_rejects_non_dict_image_payload_naming_the_camera(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="observation.images.top"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.top": "oops"},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+        })
+
+
+async def test_infer_rejects_non_dict_state_field(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="state"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.top": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": [0.0, 0.0, 0.0, 0.0],  # bare list, not {"values": [...]}
+            "task": "t",
+        })
+
+
+async def test_infer_rejects_non_dict_truthy_rtc(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="rtc"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.top": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+            "rtc": "yes",
+        })
+
+
+# --- 4. warmup must operate on the backend captured at dispatch time, not
+# self._backend -- which a concurrent reconfigure can swap out from under a
+# still-running worker thread. This races in the thread, not on the loop,
+# so neither cancellation nor the generation counter helps.
+
+
+def test_warmup_once_operates_on_the_given_backend_not_self_backend():
+    svc = VLAPolicy("p")
+    decoy = FakePolicyBackend(action_dim=4, n_action_steps=5)
+    decoy.load("/whatever", device="cpu", dtype="float32", rtc=None)
+    svc._backend = decoy  # simulate self._backend already swapped by a newer reconfigure
+
+    target = FakePolicyBackend(action_dim=4, n_action_steps=5)
+    target.load("/whatever", device="cpu", dtype="float32", rtc=None)
+
+    svc._warmup_once(target)
+
+    assert target.call_count == 1
+    assert decoy.call_count == 0
+
+
+async def test_load_warmup_uses_backend_captured_at_dispatch(tmp_path):
+    """End-to-end: a load's own warmup must never touch a backend swapped
+    into self._backend after that load's backend.load() call started."""
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    reached_warmup = threading.Event()
+    release = threading.Event()
+
+    class PausesBeforeWarmupBackend(FakePolicyBackend):
+        def load(self, *a, **k):
+            super().load(*a, **k)
+            reached_warmup.set()
+            release.wait(timeout=5)
+
+    first_backend_holder = {}
+
+    def factory():
+        b = PausesBeforeWarmupBackend(action_dim=4, n_action_steps=5, state_dim=4)
+        first_backend_holder["backend"] = b
+        return b
+
+    svc._backend_factory = factory
+    svc.reconfigure(_config({"model_path": str(tmp_path), "warmup_inferences": 1}), {})
+
+    for _ in range(500):
+        if reached_warmup.is_set():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("first load never reached its post-load pause")
+
+    first_backend = first_backend_holder["backend"]
+
+    # Simulate a concurrent reconfigure swapping self._backend to a new
+    # instance while the first load's warmup is about to run in its worker
+    # thread -- without going through reconfigure() itself, which would
+    # cancel the in-flight task and confuse the scenario being tested.
+    second_backend = FakePolicyBackend(action_dim=9, n_action_steps=3, state_dim=9)
+    svc._backend = second_backend
+
+    release.set()
+    await asyncio.sleep(0.2)  # let the (still generation-1) warmup actually run
+
+    assert first_backend.call_count == 1, "warmup must run against the backend that was loading"
+    assert second_backend.call_count == 0, "warmup must not touch a backend swapped in afterward"
+
+    await svc.await_ready()
+
+
+# --- 5. a bounded overall load timeout is the last remaining route to a
+# permanent "loading": every exception path is covered, but a hung download
+# just sits there with nothing to distinguish "downloading 40GB" from
+# "wedged".
+
+
+async def test_load_timeout_transitions_to_failed(tmp_path):
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    release = threading.Event()
+
+    class HangingBackend(FakePolicyBackend):
+        def load(self, *a, **k):
+            release.wait(timeout=5)  # far longer than the configured load_timeout_s
+            super().load(*a, **k)
+
+    svc._backend_factory = HangingBackend
+    svc.reconfigure(_config({"model_path": str(tmp_path), "load_timeout_s": 0.05}), {})
+    await svc.await_ready(expect_failure=True)
+
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed"
+    assert "timed out" in status["error"]
+    assert "0.05" in status["error"]
+
+    release.set()  # let the orphaned thread finish so it doesn't leak
+
+
+async def test_load_completes_within_generous_timeout(tmp_path):
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    svc._backend_factory = FakePolicyBackend
+    svc.reconfigure(_config({"model_path": str(tmp_path), "load_timeout_s": 5.0}), {})
+    await svc.await_ready()
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "ready"
+
+
+# --- minors ---
+
+
+async def test_infer_rtc_inference_delay_rejects_negative(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="inference_delay"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.top": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+            "rtc": {"inference_delay": -5},
+        })
+
+
+async def test_infer_rtc_prev_chunk_without_inference_delay_errors(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    prefix = np.ones((3, 4), dtype=np.float32)
+    with pytest.raises(Exception, match="inference_delay"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.top": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+            "rtc": {"prev_chunk_left_over": encode_matrix(prefix)},
+        })
+
+
+async def test_infer_rejects_state_length_mismatch(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="state_dim"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.top": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": encode_vector(np.zeros(7, dtype=np.float32)),  # backend expects 4
+            "task": "t",
+        })
+
+
+async def test_infer_rejects_unexpected_image_keys(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="image_feature_keys"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.wrong_key": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+        })
+
+
+async def test_infer_rejects_non_string_task(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    with pytest.raises(Exception, match="task"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {"observation.images.top": encode_image(
+                np.zeros((224, 224, 3), dtype=np.uint8)
+            )},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": 12345,
+        })
+
+
+async def test_infer_accepts_missing_task_defaults_to_empty_string(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
+    out = await svc.do_command({
+        "command": "infer",
+        "images": {"observation.images.top": encode_image(
+            np.zeros((224, 224, 3), dtype=np.uint8)
+        )},
+        "state": encode_vector(np.zeros(4, dtype=np.float32)),
+    })
+    assert out is not None
