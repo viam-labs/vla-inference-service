@@ -96,6 +96,7 @@ class VLAController(Generic, EasyResource):
         self._specs: dict[str, Any] | None = None
         self._latencies: list[float] = []
         self._measured_fps = 0.0
+        self._starved_ticks = 0
         self._scheduler: ChunkScheduler | None = None
         self._stop_task: asyncio.Task | None = None
 
@@ -131,6 +132,7 @@ class VLAController(Generic, EasyResource):
         self._safety = None
         self._latencies = []
         self._measured_fps = 0.0
+        self._starved_ticks = 0
         self._state = "idle"
         self._last_error = None
         self._log_velocity_budget()
@@ -182,6 +184,14 @@ class VLAController(Generic, EasyResource):
             "avg_latency_s": avg,
             "measured_fps": self._measured_fps,
             "clamp_counts": dict(self._safety.clamp_counts) if self._safety else {},
+            # Cumulative count of ticks the loop held position because the
+            # queue was empty and a background inference was still in
+            # flight (only possible under mode="async") -- distinct from
+            # the *consecutive*-run bound that escalates to a halt at
+            # starvation_grace_ticks: this is a running total across the
+            # whole session, the same shape as clamp_counts, so an operator
+            # can see the loop is quietly stalling without reading logs.
+            "starved_ticks": self._starved_ticks,
             "last_error": self._last_error or "",
         }
 
@@ -202,6 +212,7 @@ class VLAController(Generic, EasyResource):
         self._safety = None
         self._latencies = []
         self._measured_fps = 0.0
+        self._starved_ticks = 0
         self._state = "waiting_for_policy"
         # Ack immediately: waiting out policy_ready_timeout_s inline would
         # exceed the deadline most DoCommand callers use, so the "still
@@ -303,8 +314,36 @@ class VLAController(Generic, EasyResource):
 
     def _build_scheduler(self, mode: str, builder: ObservationBuilder) -> ChunkScheduler:
         if mode == "async":
-            return AsyncScheduler(lambda rtc: self._infer(builder, rtc), self._cfg.queue_threshold)
+            threshold = self._resolve_queue_threshold()
+            return AsyncScheduler(
+                lambda rtc: self._infer(builder, rtc), threshold, self._cfg.fps
+            )
         return SequentialScheduler(lambda rtc: self._infer(builder, rtc))
+
+    def _resolve_queue_threshold(self) -> int:
+        """`queue_threshold=None` (the config default) means "derive it" --
+        config parsing has no access to `specs`, so it cannot pick a value
+        itself. `n_action_steps - 1` fires the background refill as early
+        as possible (maximizing overlap runway), which is unambiguously
+        right in the latency-bound regime this scheduler exists for, and
+        harmless in the fast-inference regime, where the queue never drains
+        that low before the (fast) refill lands regardless. An explicit
+        config value always overrides this -- this is a default, not a
+        clamp.
+        """
+        configured = self._cfg.queue_threshold
+        if configured is not None:
+            return configured
+        n_action_steps = int(self._specs["n_action_steps"])
+        derived = max(0, n_action_steps - 1)
+        LOGGER.info(
+            "queue_threshold not configured; deriving %d from the checkpoint's "
+            "n_action_steps=%d (fires the background refill as early as possible, "
+            "maximizing overlap runway)",
+            derived,
+            n_action_steps,
+        )
+        return derived
 
     def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer:
         s = self._cfg.safety
@@ -559,6 +598,7 @@ class VLAController(Generic, EasyResource):
                 # skip, it is an absence of anything to do, so a deployment
                 # cannot spin forever reporting "running" while every tick
                 # silently starves either.
+                self._starved_ticks += 1
                 consecutive_starved_ticks += 1
                 if consecutive_starved_ticks > cfg.starvation_grace_ticks:
                     raise RuntimeError(

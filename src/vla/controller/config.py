@@ -53,6 +53,19 @@ it just because this module gained a new mode. An operator picks `"async"`
 by name once they have measured that their own inference latency warrants
 the discontinuity-at-chunk-boundary tradeoff it accepts in exchange (see
 `AsyncScheduler`'s docstring in `scheduler.py`).
+
+`queue_threshold: int | None = None` -- `None`, not a fixed number, because
+the right value is a property of the checkpoint (`n_action_steps`), which
+config parsing has no access to. A fixed default measurably forfeits overlap
+benefit whenever it lands far from the checkpoint's actual chunk length (a
+default of 30 against a 50-step chunk realizes roughly half the possible
+throughput gain, measured) -- so `VLAController._build_scheduler` derives
+`n_action_steps - 1` once `specs` is known, maximizing refill runway, and
+this field is consulted only as an explicit override of that derived value.
+`None` therefore means "derive it," not "zero" -- an operator who wants
+literally `0` (fire the refill only once the queue is already empty) must
+still be able to say so, which a sentinel of `0` itself could not
+distinguish from "unset".
 """
 
 from __future__ import annotations
@@ -192,7 +205,7 @@ class ControllerConfig:
     task: str = ""
     fps: float = 10.0
     mode: str = "auto"
-    queue_threshold: int = 30
+    queue_threshold: int | None = None
     starvation_grace_ticks: int = 3
     policy_ready_timeout_s: int = 600
     state_units: str = "degrees"
@@ -268,7 +281,11 @@ class ControllerConfig:
             task=as_str(raw.get("task", ""), "task"),
             fps=fps,
             mode=mode,
-            queue_threshold=as_int(raw.get("queue_threshold", 30), "queue_threshold", minimum=0),
+            queue_threshold=(
+                as_int(raw["queue_threshold"], "queue_threshold", minimum=0)
+                if raw.get("queue_threshold") is not None
+                else None
+            ),
             starvation_grace_ticks=as_int(
                 raw.get("starvation_grace_ticks", 3), "starvation_grace_ticks", minimum=0
             ),

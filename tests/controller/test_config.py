@@ -43,7 +43,10 @@ def test_parses_minimal_config():
     assert cfg.task == ""
     assert cfg.fps == 10.0
     assert cfg.mode == "auto"
-    assert cfg.queue_threshold == 30
+    # None, not a fixed number -- the right value is derived from the
+    # checkpoint's n_action_steps once specs are known (see config.py's
+    # docstring); config parsing alone has no access to that.
+    assert cfg.queue_threshold is None
     assert cfg.starvation_grace_ticks == 3
     assert cfg.policy_ready_timeout_s == 600
     assert cfg.state_units == "degrees"
@@ -450,6 +453,14 @@ def test_task_is_passed_through():
 def test_queue_threshold_accepts_override():
     cfg = ControllerConfig.parse({**BASE, "queue_threshold": 5})
     assert cfg.queue_threshold == 5
+
+
+def test_queue_threshold_explicit_zero_is_not_treated_as_unset():
+    # 0 is a legitimate explicit value (fire the refill only once the queue
+    # is already empty) -- it must not collapse into the same "derive it"
+    # behavior as never mentioning the field at all.
+    cfg = ControllerConfig.parse({**BASE, "queue_threshold": 0})
+    assert cfg.queue_threshold == 0
 
 
 def test_queue_threshold_rejects_fractional_double():

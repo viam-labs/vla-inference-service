@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 
 import numpy as np
@@ -739,3 +740,103 @@ async def test_sequential_scheduler_close_is_a_safe_no_op():
     await s.next_action()
     await s.close()
     assert s.qsize() == 3  # close() must not clear the queue for this scheduler
+
+
+# ---------------------------------------------------------------------------
+# Starvation-risk warning: queue_threshold too low for observed latency.
+#
+# Real inference latency is only known once inference has actually run --
+# _record_observed_latency is exercised directly (white-box) for the precise,
+# timing-independent boundary tests below, and once more through the real
+# code path (a genuinely slow infer(), actually awaited) to prove the wiring
+# from a completed background inference to the warning check is real, not
+# just present in the helper.
+# ---------------------------------------------------------------------------
+
+_SCHEDULER_LOGGER = "vla.controller.scheduler"
+
+
+async def test_no_warning_when_threshold_meets_required_runway(caplog):
+    # avg latency 0.3s at fps=4.0 -> 0.3 * 4 = 1.2 -> ceil = 2.
+    # threshold=2 meets (is not below) the requirement -- no warning.
+    s = AsyncScheduler(RecordingInfer(), queue_threshold=2, fps=4.0)
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        s._record_observed_latency(0.3)
+        s._record_observed_latency(0.3)
+    assert not caplog.records
+
+
+async def test_warns_when_threshold_below_required_runway(caplog):
+    s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        s._record_observed_latency(0.3)
+        s._record_observed_latency(0.3)
+    assert len(caplog.records) == 1
+    message = caplog.records[0].message
+    assert "queue_threshold=1" in message
+    assert "0.3" in message
+    assert "fps=4" in message
+    assert "queue_threshold>=2" in message
+    assert "hold position" in message
+    assert "num_steps" in message or "denoising" in message
+
+
+async def test_warning_uses_ceil_not_floor_at_the_boundary(caplog):
+    # avg * fps = 1.2 exactly straddles 1 and 2. Floor/int-truncation would
+    # compute required=1 (threshold=1 would then satisfy it -- no warning);
+    # ceil correctly computes required=2 (threshold=1 does not satisfy it --
+    # warning fires). This is the precise off-by-one this test exists to
+    # catch: mutating math.ceil to int() or math.floor must fail it.
+    s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        s._record_observed_latency(0.3)
+        s._record_observed_latency(0.3)
+    assert len(caplog.records) == 1
+
+
+async def test_no_warning_when_threshold_exactly_meets_ceil_boundary(caplog):
+    # The flip side of the same boundary: threshold == required (not <) must
+    # not warn -- pins the strict "<" comparison against an "<=" mutation.
+    s = AsyncScheduler(RecordingInfer(), queue_threshold=2, fps=4.0)
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        s._record_observed_latency(0.3)
+        s._record_observed_latency(0.3)
+    assert not caplog.records
+
+
+async def test_warns_only_once_despite_many_observations(caplog):
+    s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        for _ in range(10):
+            s._record_observed_latency(0.3)
+    assert len(caplog.records) == 1
+
+
+async def test_no_warning_before_minimum_sample_count(caplog):
+    # A single sample could be a cold-start outlier -- "a stable reading"
+    # requires more than one observation before the check fires at all.
+    s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        s._record_observed_latency(0.3)
+    assert not caplog.records
+
+
+async def test_warning_reflects_a_real_completed_background_inference(caplog):
+    class SlowInfer:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, rtc):
+            self.calls += 1
+            await asyncio.sleep(0.05)
+            base = np.full((1, 2), float(self.calls), dtype=np.float32)
+            return base + 100.0, base
+
+    # required = ceil(0.05 * 100) = 5, comfortably above threshold=0.
+    s = AsyncScheduler(SlowInfer(), queue_threshold=0, fps=100.0)
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        await s.next_action()  # call #1 completes (blocking) -- 1 sample: gate not open yet
+        assert not caplog.records
+        await s.next_action()  # fast path: queue (n=1) now empty, fires call #2 in background
+        await asyncio.sleep(0.2)  # let call #2 actually complete for real
+    assert len(caplog.records) == 1

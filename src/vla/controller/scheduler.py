@@ -42,6 +42,8 @@ from __future__ import annotations
 import abc
 import asyncio
 import logging
+import math
+import time
 from typing import Any, Awaitable, Callable
 
 import numpy as np
@@ -53,6 +55,12 @@ from .action_queue import ActionQueue, ActionQueueError, QueueSettings
 LOGGER = logging.getLogger(__name__)
 
 InferFn = Callable[[dict[str, Any] | None], Awaitable[tuple[np.ndarray, np.ndarray]]]
+
+# AsyncScheduler's starvation-risk warning: how many recent completed
+# inferences to average over, and the minimum before the average counts as
+# "a stable reading" rather than a possible cold-start outlier.
+_LATENCY_WINDOW = 5
+_MIN_LATENCY_SAMPLES_BEFORE_WARNING = 2
 
 
 class SchedulerError(VLAError, RuntimeError):
@@ -224,14 +232,31 @@ class AsyncScheduler(ChunkScheduler):
         captured and re-raised from the *next* call to `next_action`,
         wrapped as `SchedulerError` if it is not one already, and raised
         exactly once.
+
+    `queue_threshold` is decisive for how much of the overlap this actually
+    realizes -- a threshold that fires the refill too late leaves the queue
+    draining to empty (starvation) before the next chunk lands, even though
+    overlap is "working" in the sense that a background task did fire. This
+    is silent unless something says so out loud: once `fps` and a stable
+    reading of observed inference latency are both known, `next_action`
+    warns once (never every tick -- that would flood the log) if
+    `queue_threshold < ceil(observed_latency * fps)`, naming the observed
+    latency, the configured and required thresholds, and the consequence,
+    with a concrete remedy. This mirrors the safety layer's `clamp_counts`:
+    a misconfiguration that degrades behavior without raising anything gets
+    a loud diagnostic instead of a silently slow loop that looks like "the
+    policy is just slow."
     """
 
-    def __init__(self, infer: InferFn, queue_threshold: int) -> None:
+    def __init__(self, infer: InferFn, queue_threshold: int, fps: float = 10.0) -> None:
         self._infer = infer
         self._queue = ActionQueue(QueueSettings(rtc_enabled=False))
         self._queue_threshold = queue_threshold
+        self._fps = fps
         self._inflight: asyncio.Task[None] | None = None
         self._pending_error: Exception | None = None
+        self._latencies: list[float] = []
+        self._warned_starvation_risk = False
 
     async def next_action(self) -> np.ndarray | None:
         self._raise_pending_error()
@@ -296,6 +321,7 @@ class AsyncScheduler(ChunkScheduler):
         self._inflight = asyncio.create_task(self._infer_and_merge())
 
     async def _infer_and_merge(self) -> None:
+        started = time.perf_counter()
         try:
             processed, raw = await self._infer(None)
             _validate_and_merge(self._queue, processed, raw)
@@ -313,8 +339,50 @@ class AsyncScheduler(ChunkScheduler):
                 if isinstance(exc, SchedulerError)
                 else SchedulerError(f"background inference failed: {exc}")
             )
+        else:
+            # Only a *completed* inference tells us anything about steady-
+            # state latency -- a failed one's duration is not a meaningful
+            # sample (it may have failed immediately, or after a stall for
+            # an unrelated reason).
+            self._record_observed_latency(time.perf_counter() - started)
         finally:
             self._inflight = None
+
+    def _record_observed_latency(self, elapsed: float) -> None:
+        self._latencies.append(elapsed)
+        del self._latencies[:-_LATENCY_WINDOW]
+        self._maybe_warn_starvation_risk()
+
+    def _maybe_warn_starvation_risk(self) -> None:
+        if self._warned_starvation_risk:
+            return
+        if len(self._latencies) < _MIN_LATENCY_SAMPLES_BEFORE_WARNING:
+            # A single sample could be a cold-start outlier -- wait for a
+            # steadier reading before drawing a conclusion from it.
+            return
+
+        avg_latency = sum(self._latencies) / len(self._latencies)
+        required = math.ceil(avg_latency * self._fps)
+        if self._queue_threshold >= required:
+            return
+
+        self._warned_starvation_risk = True
+        shortfall = required - self._queue_threshold
+        LOGGER.warning(
+            "queue_threshold=%d is too low for the observed inference latency "
+            "(avg %.3fs over %d sample(s) at fps=%.2f); avoiding starvation "
+            "needs queue_threshold>=%d. The queue will drain before the next "
+            "chunk arrives, and the arm will hold position for ~%d tick(s) per "
+            "chunk. Raise queue_threshold (up to n_action_steps - 1), lower "
+            "fps, or reduce the policy's number of denoising/diffusion steps "
+            "(num_steps) to cut latency.",
+            self._queue_threshold,
+            avg_latency,
+            len(self._latencies),
+            self._fps,
+            required,
+            shortfall,
+        )
 
     async def _cancel_inflight(self) -> None:
         task = self._inflight

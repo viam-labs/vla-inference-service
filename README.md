@@ -129,7 +129,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
 | `mode` | `auto` \| `sequential` \| `async` \| `rtc` | `"auto"` | `rtc` is not implemented yet — see Limitations. `auto` resolves to `sequential`, unchanged from before `async` existed — `async` is explicit opt-in only, never a default, so an existing deployment's behavior never changes underneath it. See Performance for when to reach for `async`. |
-| `queue_threshold` | integer | `30` | Consumed by `mode: "async"`: refill fires in the background once the queue has this many or fewer actions left. Unused by `sequential`. |
+| `queue_threshold` | integer | derived (`n_action_steps - 1`, once the checkpoint is known) | Consumed by `mode: "async"`: refill fires in the background once the queue has this many or fewer actions left. Unused by `sequential`. Leave unset unless you have a specific reason to override — see Performance for why the derived default is deliberately the largest value that ever makes sense. |
 | `starvation_grace_ticks` | integer | `3` | Two related bounds sharing one field: (1) consecutive tick *failures* tolerated (when `safety.stop_on_error` is `false`) before the loop halts regardless; (2) under `mode: "async"`, consecutive *empty* ticks (queue drained, inference still in flight) tolerated before the loop halts unconditionally — not gated by `stop_on_error`, since an empty tick is not a failure to skip. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
 | `state_units` | `degrees` \| `radians` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see Limitations. |
@@ -150,7 +150,7 @@ backoff for up to `policy_ready_timeout_s`.
 |---|---|---|
 | `start` | optional `task`, overriding the configured default | `{"ok": true}` — returns immediately; does not wait for the policy or the loop to actually be running |
 | `stop` | — | `{"ok": true}` |
-| `status` | — | `state` (`idle` \| `waiting_for_policy` \| `running` \| `stopped` \| `error`), `mode`, `queue_size`, `avg_latency_s`, `measured_fps`, `clamp_counts`, `last_error` |
+| `status` | — | `state` (`idle` \| `waiting_for_policy` \| `running` \| `stopped` \| `error`), `mode`, `queue_size`, `avg_latency_s`, `measured_fps`, `clamp_counts`, `starved_ticks` (cumulative; `mode: "async"` only, see Performance), `last_error` |
 
 ### Gripper variants
 
@@ -353,6 +353,48 @@ lower `fps` (a chunk buys more wall-clock time per inference), a smaller/faster
 checkpoint, or fewer denoising steps. **For anything resembling a live demo, the x86+CUDA
 target remains the practical answer** — the numbers above are Mac-specific, and `async`
 narrows the gap without pretending to close it as well as faster hardware would.
+
+### Tuning `queue_threshold` — the single most actionable knob in `mode: "async"`
+
+`queue_threshold` decides *when* the background refill fires (once the queue has this
+many or fewer actions left), which decides how much runway the refill gets before the
+queue actually drains. A threshold picked too low silently forfeits most of the overlap
+benefit — the loop still "works," it just spends a third of its time holding position,
+and without a diagnostic it looks indistinguishable from "the policy is slow." Measured
+throughput delivering 150 actions at latency ≈ chunk duration × 1.06 (`n_action_steps:
+50`):
+
+| `queue_threshold` | wall time | actions/s | vs. `sequential` |
+|---|---|---|---|
+| — (`sequential`) | 3.20 s | 46.9 | baseline |
+| 10 | 2.99 s | 50.2 | +7% |
+| 30 (the old fixed default) | 2.55 s | 58.7 | +25% |
+| 49 (`n_action_steps - 1`) | 2.16 s | 69.4 | +48% |
+
+The runway a threshold buys is `queue_threshold` ticks; the runway inference *needs* is
+`ceil(observed_latency × fps)` ticks. Because the queue can only ever hold at most
+`n_action_steps - 1` actions before a refill must have already been requested, the
+highest `queue_threshold` can ever usefully be is `n_action_steps - 1` — which is exactly
+why that is the derived default (see the config table above) rather than a fixed number:
+a fixed default is right for at most one checkpoint's chunk length and measurably wrong
+for every other one. Override it explicitly only if you have a specific reason to trade
+some of that throughput back for fresher observations at each chunk boundary (a lower
+threshold fires the refill later, off a more recent — but riskier — observation).
+
+**Two diagnostics exist so a bad threshold is never silent:**
+
+- `AsyncScheduler` tracks its own recent inference latencies and, once it has a stable
+  reading, logs a `WARNING` **once** (never every tick) if `queue_threshold <
+  ceil(observed_latency × fps)` — naming the observed latency, the configured and
+  required thresholds, and the consequence ("the arm will hold position for ~N tick(s)
+  per chunk"), with the concrete remedy (raise `queue_threshold`, lower `fps`, or reduce
+  the policy's `num_steps`).
+- `status.starved_ticks` is a running total (the same shape as `clamp_counts`) of ticks
+  the loop has held position because the queue was empty and a background inference was
+  still in flight — distinct from the *consecutive*-run bound that escalates to a halt at
+  `starvation_grace_ticks`. A deployment that never escalates can still have a
+  persistently nonzero `starved_ticks`, which is exactly the silent-degradation case this
+  counter exists to surface.
 
 ## Limitations
 
