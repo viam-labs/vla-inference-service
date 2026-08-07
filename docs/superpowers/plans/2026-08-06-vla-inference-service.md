@@ -86,7 +86,8 @@ Why this split: `policy/` and `controller/` never import each other — they com
 ## Task 1: Project scaffold
 
 **Files:**
-- Create: `pyproject.toml`, `mise.toml`, `run.sh`, `setup.sh`, `meta.json`, `.gitignore`
+- Create: `pyproject.toml`, `mise.toml`, `run.sh`, `setup.sh`, `meta.json`, `.gitignore`,
+  `.python-version`
 - Create: `src/vla/__init__.py`, `tests/__init__.py`
 
 - [ ] **Step 1: Create `pyproject.toml`**
@@ -150,7 +151,11 @@ build-backend = "hatchling.build"
 
 ```toml
 [tasks.build]
-run = "uv build"
+# `--wheel`: uv otherwise also emits an sdist, and the sdist contains docs/ —
+# packaging it would publish our internal specs and plans to the registry.
+# The clean is inline rather than `depends = ["clean", ...]` because mise runs
+# dependencies in parallel and a clean task would race the build.
+run = "rm -rf dist && uv build --wheel"
 
 [tasks.clean]
 run = "rm -rf dist module.tar.gz"
@@ -162,11 +167,17 @@ run = "uv run pytest -m 'not integration and not differential' -v"
 run = "uv run pytest -v"
 
 [tasks.package]
-run = "tar -czf module.tar.gz meta.json *.sh dist"
+# Name the scripts explicitly: `*.sh` would absorb any future dev or CI script
+# into the published artifact. `dist/*.whl` rather than `dist` so uv's
+# auto-generated dist/.gitignore stays out of the tarball.
+run = "tar -czf module.tar.gz meta.json run.sh setup.sh dist/*.whl"
 depends = ["build"]
 ```
 
 - [ ] **Step 3: Create `run.sh` and `setup.sh`**
+
+Both scripts run unattended on deployed robots, so every failure has to be legible
+in viam-server's log rather than a bare "no such file or directory" restart loop.
 
 `run.sh`:
 ```bash
@@ -174,11 +185,17 @@ depends = ["build"]
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VENV_NAME="${VIAM_MODULE_DATA}/venv"
+# `:?` rejects empty as well as unset — an empty prefix would silently target /venv.
+VENV_NAME="${VIAM_MODULE_DATA:?must be set by viam-server}/venv"
 PYTHON="$VENV_NAME/bin/python"
 
+if [ ! -x "$PYTHON" ]; then
+  echo "run.sh: no venv at $VENV_NAME — first_run (setup.sh) did not complete" >&2
+  exit 1
+fi
+
 echo "Starting module..."
-exec $PYTHON -m vla.main "$@"
+exec "$PYTHON" -m vla.main "$@"
 ```
 
 `setup.sh`:
@@ -187,8 +204,9 @@ exec $PYTHON -m vla.main "$@"
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VENV_NAME="${VIAM_MODULE_DATA}/venv"
-export PATH=$PATH:$HOME/.local/bin
+VENV_NAME="${VIAM_MODULE_DATA:?must be set by viam-server}/venv"
+# Prepend, so a freshly installed uv wins over a stale system one.
+export PATH="$HOME/.local/bin:$PATH"
 
 if [ ! "$(command -v uv)" ]; then
   if [ ! "$(command -v curl)" ]; then
@@ -198,14 +216,28 @@ if [ ! "$(command -v uv)" ]; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 
-uv venv --python 3.12 $VENV_NAME
-source $VENV_NAME/bin/activate
+# The lerobot extra is a git+https direct reference, so uv shells out to git.
+# A minimal robot image may not have it.
+if [ ! "$(command -v git)" ]; then
+  echo "git is required to install the lerobot extra."
+  exit 1
+fi
 
-# Resolve the wheel path first: "./dist/"*.whl[lerobot] does not work, because
-# bash reads [lerobot] as a glob character class, the pattern matches nothing,
-# and the literal string is handed to uv.
-WHEEL=$(ls ./dist/*.whl | head -1)
-uv pip install "${WHEEL}[lerobot]" -q
+uv venv --python 3.12 "$VENV_NAME"
+source "$VENV_NAME/bin/activate"
+
+# Two traps here. First, "./dist/"*.whl[lerobot] does not work: bash reads
+# [lerobot] as a glob character class, matches nothing, and hands uv the
+# literal string. Second, `ls | head -1` sorts lexically, so with 0.1.0 and
+# 0.2.0 both present it would silently install the OLDER wheel.
+shopt -s nullglob
+WHEELS=(./dist/*.whl)
+shopt -u nullglob
+if [ ${#WHEELS[@]} -ne 1 ]; then
+  echo "setup.sh: expected exactly 1 wheel in ./dist, found ${#WHEELS[@]}" >&2
+  exit 1
+fi
+uv pip install "${WHEELS[0]}[lerobot]" -q
 ```
 
 - [ ] **Step 4: Create `meta.json`**
@@ -218,7 +250,8 @@ uv pip install "${WHEEL}[lerobot]" -q
   "url": "https://github.com/viam-labs/viam-vla-inference-service",
   "description": "Run pre-trained LeRobot VLA policies (SmolVLA, Evo-1) on Viam machines",
   "build": {
-    "build": "mise run package",
+    "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && curl -fsSL https://mise.run | sh",
+    "build": "export PATH=\"$HOME/.local/bin:$PATH\" && mise run package",
     "path": "module.tar.gz",
     "arch": ["linux/arm64", "linux/amd64"]
   },
@@ -241,6 +274,12 @@ uv pip install "${WHEEL}[lerobot]" -q
 }
 ```
 
+`build.setup` is required: Viam's cloud-build containers ship neither `mise` nor
+`uv`, so without it `build` fails with `command not found`. The `export PATH` in
+`build` is also required — both installers write their PATH line into
+`~/.bashrc`/`~/.profile`, which the non-interactive shell running `build` never
+sources.
+
 - [ ] **Step 5: Make the scripts executable**
 
 Run: `chmod +x run.sh setup.sh`
@@ -260,10 +299,23 @@ module.tar.gz
 
 Create empty `src/vla/__init__.py` and `tests/__init__.py`.
 
+Also create `.python-version` containing `3.12`. Without it uv picks the newest
+interpreter satisfying `>=3.12` (3.13 today) while `setup.sh` provisions 3.12,
+and with torch and `numpy<2.3.0` downstream that skew is exactly where "passes
+locally, fails on the robot" comes from. Run `uv python install 3.12` first so
+the dev venv uses a uv-managed interpreter rather than whatever it discovers.
+
 - [ ] **Step 7: Verify the toolchain works**
 
-Run: `uv sync && uv run pytest -v`
-Expected: `no tests ran` and exit code 5. That is success — it proves the venv resolves and pytest is wired up.
+Run: `uv sync && uv run python --version && uv run pytest -v`
+Expected: Python 3.12.x, then `no tests ran` and exit code 5. That is success —
+it proves the venv resolves on the deployed interpreter version and pytest is
+wired up.
+
+Then verify packaging does not leak internal docs:
+
+Run: `mise run package && tar -tzf module.tar.gz`
+Expected: `meta.json`, `run.sh`, `setup.sh`, and exactly one `.whl`. **No `docs/`.**
 
 - [ ] **Step 8: Commit**
 
@@ -4604,3 +4656,10 @@ git commit -m "chore: record measured install size"
   `config.use_amp`, as upstream does. Until then the checkpoint's own dtype is used and a non-`auto`
   setting logs a warning.
 - **Hardware smoke test** — a manual checklist with conservative limits, per spec phase 3.
+- **Pinned dependency graph on the robot** (pre-deploy, before the first real machine).
+  `setup.sh` runs `uv pip install "<wheel>[lerobot]"`, which does not consult `uv.lock`, so
+  every robot re-resolves torch and friends at first run. Two machines provisioned a week
+  apart can get different builds, and neither matches CI. Fix by shipping `uv.lock` and
+  using `uv sync --frozen --extra lerobot`, or by exporting a pinned requirements file at
+  package time. Deferred from Task 1 because it changes the deploy contract and the module
+  has not been deployed once; it pairs naturally with measuring install size (Task 21).
