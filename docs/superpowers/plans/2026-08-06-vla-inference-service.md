@@ -110,7 +110,10 @@ lerobot = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0"]
+# pytest-asyncio >=1.0: asyncio_default_test_loop_scope only exists from 0.26.
+# On older versions pytest merely warns about the unknown key, and the
+# module-scoped async fixture in Task 19 then fails with a cross-loop error.
+dev = ["pytest>=8.0.0", "pytest-asyncio>=1.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -162,7 +165,7 @@ depends = ["build"]
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-cd $(dirname $0)
+cd "$(dirname "$0")"
 
 VENV_NAME="${VIAM_MODULE_DATA}/venv"
 PYTHON="$VENV_NAME/bin/python"
@@ -175,7 +178,7 @@ exec $PYTHON -m vla.main "$@"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-cd $(dirname $0)
+cd "$(dirname "$0")"
 
 VENV_NAME="${VIAM_MODULE_DATA}/venv"
 export PATH=$PATH:$HOME/.local/bin
@@ -399,7 +402,9 @@ def decode_image(payload: dict[str, Any]) -> np.ndarray:
         expected = shape[0] * shape[1] * shape[2]
         if len(raw) != expected:
             raise WireError(f"raw image payload is {len(raw)} bytes, expected {expected}")
-        return np.frombuffer(raw, dtype=np.uint8).reshape(shape)
+        # .copy() so the result is writable: a bare frombuffer view makes
+        # torch.from_numpy warn downstream.
+        return np.frombuffer(raw, dtype=np.uint8).reshape(shape).copy()
 
     if encoding in ("jpeg", "png"):
         return np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
@@ -1408,9 +1413,13 @@ class VLAPolicy(Generic, EasyResource):
             c, h, w = specs.input_features[key]
             images[key] = np.zeros((int(h), int(w), int(c)), dtype=np.uint8)
         # State dim, not action dim: they coincide on smolvla_base but need not.
-        # Getting it wrong fails warmup, which fails the whole load.
-        state_dim = int(specs.input_features["observation.state"][0])
-        state = np.zeros(state_dim, dtype=np.float32)
+        # Skip rather than KeyError on a state-less checkpoint — warmup runs
+        # inside _load, so raising here would fail the entire policy.
+        state_feature = specs.input_features.get("observation.state")
+        if state_feature is None:
+            LOGGER.warning("no observation.state feature; skipping warmup")
+            return
+        state = np.zeros(int(state_feature[0]), dtype=np.float32)
         self._backend.predict_chunk(images, state, "warmup", None)
 
     async def await_ready(self, *, expect_failure: bool = False) -> None:
@@ -2385,7 +2394,11 @@ class FakeArm:
         if self.fail_next_move:
             raise RuntimeError("arm move failed")
         self.moves.append((positions, options))
-        self.positions = list(positions[-1].values)
+        # Write into the existing vector rather than replacing it: a commanded
+        # chunk can be shorter than the arm's joint count (gripper on its own
+        # component), and replacing would silently shrink the arm.
+        commanded = list(positions[-1].values)
+        self.positions[: len(commanded)] = commanded
 
     async def stop(self, **kwargs):
         self.stopped += 1
@@ -4000,6 +4013,7 @@ class VLAController(Generic, EasyResource):
         self._latencies: list[float] = []
         self._measured_fps = 0.0
         self._scheduler = None
+        self._stop_task: asyncio.Task | None = None
 
     @classmethod
     def new(cls, config: ServiceConfig, dependencies: Mapping[Any, ResourceBase]) -> Self:
@@ -4022,7 +4036,9 @@ class VLAController(Generic, EasyResource):
         if old_arm is not None:
             # reconfigure is sync, so the stop is scheduled rather than awaited.
             # Cancelling the loop alone leaves the arm executing its last command.
-            asyncio.create_task(self._stop_arm(old_arm))
+            # Keep a reference: CPython may garbage-collect a bare task handle
+            # before it ever runs.
+            self._stop_task = asyncio.create_task(self._stop_arm(old_arm))
         self._cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
         self._deps = {self._key(k): v for k, v in dependencies.items()}
         self._specs = None
