@@ -64,6 +64,12 @@ committing any task, add tests covering these unless they genuinely do not apply
    square ones cannot; a shape used in one test should differ from the shape
    hardcoded anywhere else.
 
+7. **Never parametrize a test off the constant it is testing.** Writing
+   `@pytest.mark.parametrize("device", DEVICES)` looks like it covers every
+   device, but shrinking `DEVICES` shrinks the test too — the mutant becomes
+   invisible and the suite stays green. Hardcode the expected literals in the
+   test file so the test and the implementation can actually disagree.
+
 Where mutation testing is cheap, run it — deliberately break a branch and confirm
 a test goes red. A test that cannot fail is not evidence.
 
