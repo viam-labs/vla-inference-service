@@ -39,24 +39,58 @@ class FakeArm:
 
 
 class FakeCamera:
-    def __init__(self, size=(480, 640), fail=False):
+    """Duck-types `viam.components.camera.Camera`.
+
+    The real API is `get_images()` (plural), returning
+    `(Sequence[NamedImage], ResponseMetadata)` -- not `get_image()`, which
+    does not exist on installed viam-sdk 0.80.0. A fake implementing the
+    nonexistent singular method would let observation-assembly tests pass
+    while failing against a real robot, so this fake matches the real
+    signature exactly.
+    """
+
+    def __init__(self, size=(480, 640), fail=False, empty=False, captured_at=None, populate_metadata=True):
         self.size = size
         self.fail = fail
+        self.empty = empty
+        # `None` (the default) means "use the current time" -- a fresh
+        # frame. Pass an explicit `datetime` to simulate a camera serving a
+        # buffered, stale frame. `populate_metadata=False` simulates a
+        # driver that never sets `captured_at` at all, leaving it at protobuf's
+        # zero-value default -- distinct from "captured just now".
+        self.captured_at = captured_at
+        self.populate_metadata = populate_metadata
         self.reads = 0
 
-    async def get_image(self, *args, **kwargs):
-        from viam.media.video import ViamImage, CameraMimeType
+    async def get_images(self, *args, **kwargs):
+        from viam.media.video import NamedImage, CameraMimeType
+        from viam.proto.common import ResponseMetadata
+        from google.protobuf.timestamp_pb2 import Timestamp
         import io
         from PIL import Image
 
         self.reads += 1
         if self.fail:
             raise RuntimeError("camera read failed")
+
+        metadata = ResponseMetadata()
+        if self.populate_metadata:
+            ts = Timestamp()
+            if self.captured_at is not None:
+                ts.FromDatetime(self.captured_at)
+            else:
+                ts.GetCurrentTime()
+            metadata.captured_at.CopyFrom(ts)
+
+        if self.empty:
+            return [], metadata
+
         h, w = self.size
         arr = np.zeros((h, w, 3), dtype=np.uint8)
         buf = io.BytesIO()
         Image.fromarray(arr).save(buf, format="JPEG")
-        return ViamImage(buf.getvalue(), CameraMimeType.JPEG)
+        image = NamedImage("image", buf.getvalue(), CameraMimeType.JPEG)
+        return [image], metadata
 
 
 class FakeServo:
