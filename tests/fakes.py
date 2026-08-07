@@ -13,6 +13,16 @@ import numpy as np
 
 
 class FakeArm:
+    """Duck-types `viam.components.arm.Arm` as it exists in the INSTALLED SDK.
+
+    The installed viam-sdk 0.80.0 -- the latest on PyPI -- exposes only
+    `get_joint_positions`, `move_to_joint_positions`, `stop`, and
+    `get_kinematics`. It has NO `move_through_joint_positions`, and `MoveOptions`
+    is a generated proto type that no method consumes; both exist only in the
+    unreleased dev checkout. This fake deliberately omits them, so a caller that
+    reaches for the newer API fails here rather than on a robot.
+    """
+
     def __init__(self, positions=None):
         self.positions = list(positions or [0.0] * 6)
         self.moves = []
@@ -24,14 +34,14 @@ class FakeArm:
 
         return JointPositions(values=self.positions)
 
-    async def move_through_joint_positions(self, positions, options=None, **kwargs):
+    async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
         if self.fail_next_move:
             raise RuntimeError("arm move failed")
-        self.moves.append((positions, options))
+        self.moves.append(positions)
         # Write into the existing vector rather than replacing it: a commanded
-        # chunk can be shorter than the arm's joint count (gripper on its own
+        # action can be narrower than the arm's joint count (gripper on its own
         # component), and replacing would silently shrink the arm.
-        commanded = list(positions[-1].values)
+        commanded = list(positions.values)
         self.positions[: len(commanded)] = commanded
 
     async def stop(self, **kwargs):
