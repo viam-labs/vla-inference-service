@@ -62,12 +62,15 @@ def decode_image(payload: dict[str, Any]) -> np.ndarray:
         expected = shape[0] * shape[1] * shape[2]
         if len(raw) != expected:
             raise WireError(f"raw image payload is {len(raw)} bytes, expected {expected}")
-        # .copy() so the result is writable: a bare frombuffer view makes
-        # torch.from_numpy warn downstream.
+        # Every path below guarantees a writable array: a bare frombuffer
+        # view (or a PIL-backed np.asarray) is read-only, and torch.from_numpy
+        # warns on non-writable input downstream.
         return np.frombuffer(raw, dtype=np.uint8).reshape(shape).copy()
 
     if encoding in ("jpeg", "png"):
-        return np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
+        # np.asarray over a PIL image is read-only; copy for the same reason
+        # the raw branch does — torch.from_numpy warns on non-writable input.
+        return np.array(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
 
     raise WireError(f"unknown encoding {encoding!r}")
 
