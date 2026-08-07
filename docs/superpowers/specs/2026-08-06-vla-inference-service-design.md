@@ -25,7 +25,11 @@ Verified against `lerobot` at `~/src/lerobot` (version `0.6.2`, `main` @ `ff7cc3
 - Generic loading path: `get_policy_class`, `make_policy`, `make_pre_post_processors` in
   `policies/factory.py`.
 - A checkpoint is **self-describing**: `config.json`, `model.safetensors`,
-  `preprocessor_config.json`, `postprocessor_config.json`.
+  `policy_preprocessor.json`, `policy_postprocessor.json` (plus per-step
+  `.safetensors` for normalizer stats). The processor filenames come from
+  `POLICY_PREPROCESSOR_DEFAULT_NAME` / `POLICY_POSTPROCESSOR_DEFAULT_NAME` in
+  `lerobot/utils/constants.py:60-61` — verified against the real
+  `lerobot/smolvla_base` file listing.
   `make_pre_post_processors(cfg, pretrained_path=...)` rebuilds normalization from the checkpoint,
   so the training dataset is not needed at inference time.
 - RTC (Real-Time Chunking) is exposed as kwargs on `predict_action_chunk`:

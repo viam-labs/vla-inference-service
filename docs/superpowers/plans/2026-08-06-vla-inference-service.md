@@ -20,7 +20,13 @@ You likely have not worked with either of these systems. Three things will save 
 
 **Viam modules.** A module is a subprocess that viam-server starts and talks to over gRPC. You subclass a resource type, implement `new()`, `validate_config()`, `reconfigure()`, and `do_command()`, then register the model. `validate_config()` is a **classmethod** that returns a tuple of `(required_dependencies, optional_dependencies)` as lists of resource-name strings, and raises on invalid config. `reconfigure()` receives resolved dependencies and **must return quickly** — viam-server can time out otherwise.
 
-**LeRobot policies.** A checkpoint directory is self-describing: `config.json`, `model.safetensors`, `preprocessor_config.json`, `postprocessor_config.json`. You never need the training dataset at inference time. Loading is `get_policy_class`/`make_policy` plus `make_pre_post_processors(cfg, pretrained_path=...)`.
+**LeRobot policies.** A checkpoint directory is self-describing. The real
+`lerobot/smolvla_base` contains `config.json`, `model.safetensors`,
+`policy_preprocessor.json`, `policy_postprocessor.json`, and per-step normalizer
+`.safetensors`. You never need the training dataset at inference time. Loading is
+`get_policy_class`/`make_policy` plus `make_pre_post_processors(cfg, pretrained_path=...)`.
+(The processor filenames are *not* `preprocessor_config.json` — they come from
+`POLICY_PREPROCESSOR_DEFAULT_NAME` in `lerobot/utils/constants.py:60`.)
 
 **Action chunking.** A VLA does not emit one action — it emits a *chunk* of N future actions. The robot executes them in sequence and re-infers before running out. That queue is the `ActionQueue` you will port.
 
