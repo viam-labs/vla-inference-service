@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from vla.config_util import ConfigError, as_bool, as_choice, as_float, as_int, as_str
+from vla.config_util import ConfigError, as_bool, as_choice, as_env_var_name, as_float, as_int, as_str
 
 __all__ = ["ConfigError", "RTCSettings", "PolicyConfig", "DEVICES", "DTYPES", "SCHEDULES"]
 
@@ -107,7 +107,7 @@ class PolicyConfig:
 
         hf_token_env = raw.get("hf_token_env") or None
         if hf_token_env is not None:
-            hf_token_env = as_str(hf_token_env, "hf_token_env")
+            hf_token_env = as_env_var_name(hf_token_env, "hf_token_env")
 
         # rtc: null (key present, value None) means "use defaults" — the
         # correct JSON reading of an explicit null. Any other non-dict

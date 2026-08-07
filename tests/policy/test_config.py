@@ -222,6 +222,45 @@ def test_rejects_non_string_hf_token_env():
         PolicyConfig.parse({"model_path": "/m", "hf_token_env": 1.0})
 
 
+# --- hf_token_env must look like an env var name, not a pasted secret ---
+# The field exists specifically so the token value never appears in config;
+# an operator confusing "name of the env var" with "the token itself" is
+# the single most likely mistake, so the accepted shape is checked strictly.
+
+
+@pytest.mark.parametrize("name", ["HF_TOKEN", "_TOKEN", "MY_TOKEN_2", "a"])
+def test_accepts_every_valid_hf_token_env_name(name):
+    cfg = PolicyConfig.parse({"model_path": "/m", "hf_token_env": name})
+    assert cfg.hf_token_env == name
+
+
+def test_rejects_hf_token_env_shaped_like_a_pasted_token():
+    with pytest.raises(ConfigError, match="hf_token_env"):
+        PolicyConfig.parse(
+            {
+                "model_path": "/m",
+                "hf_token_env": "sk-live-1234567890abcdef1234567890abcdef",
+            }
+        )
+
+
+def test_rejects_hf_token_env_starting_with_digit():
+    with pytest.raises(ConfigError, match="hf_token_env"):
+        PolicyConfig.parse({"model_path": "/m", "hf_token_env": "1TOKEN"})
+
+
+def test_rejects_hf_token_env_over_64_chars():
+    with pytest.raises(ConfigError, match="hf_token_env"):
+        PolicyConfig.parse({"model_path": "/m", "hf_token_env": "A" * 65})
+
+
+def test_config_error_never_echoes_full_invalid_hf_token_env_value():
+    offending = "sk-live-1234567890abcdef1234567890abcdef"
+    with pytest.raises(ConfigError) as excinfo:
+        PolicyConfig.parse({"model_path": "/m", "hf_token_env": offending})
+    assert offending not in str(excinfo.value)
+
+
 # --- maximum= bounds prevent pathological config values ---
 
 

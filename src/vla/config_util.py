@@ -12,10 +12,33 @@ place so every resource's parser raises the same `ConfigError` — not a bare
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Sequence
 
+# POSIX-ish environment variable name shape: letters/digits/underscore, not
+# starting with a digit, capped at 64 chars. Fields like `hf_token_env` name
+# an env var precisely so the secret itself never appears in config, logs,
+# or error messages; this is the primary defense against an operator pasting
+# the actual token into that field by mistake. It is not a complete defense
+# on its own -- a short token built only from word characters can still
+# match -- so callers must also redact the value wherever it is displayed.
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
-class ConfigError(ValueError):
+
+class VLAError(Exception):
+    """Common base for every error this module's own code raises.
+
+    Existing call sites keep catching `ConfigError`/`WireError`/`ResolveError`
+    (or their historical `ValueError`/`RuntimeError` bases) exactly as
+    before -- this is additive. It exists so a caller that wants to treat
+    "this module rejected the input" and "this module has a bug" differently
+    can `except VLAError` for the former and let anything else (a bare
+    `AttributeError`, `TypeError`, etc.) crash loudly instead of being
+    swallowed by an overly broad `except Exception`.
+    """
+
+
+class ConfigError(VLAError, ValueError):
     """Raised for invalid module configuration."""
 
 
@@ -103,3 +126,34 @@ def as_choice(value: Any, field_name: str, allowed: Sequence[str]) -> str:
     if value not in allowed:
         raise ConfigError(f"{field_name} must be one of {tuple(allowed)}, got {value!r}")
     return value
+
+
+def redact_secret(value: str) -> str:
+    """Redact a possibly-sensitive string for safe inclusion in errors/logs.
+
+    Shows at most the first 4 characters plus the total length -- enough
+    for an operator to recognize which value they pasted without it being
+    reconstructable from a log line or an error surfaced through `status`.
+    """
+    return f"{value[:4]}...<{len(value)} chars>"
+
+
+def as_env_var_name(value: Any, field_name: str) -> str:
+    """Require a value shaped like a POSIX environment variable name.
+
+    Fields such as `hf_token_env` name an env var precisely so the actual
+    secret never has to appear in config, logs, or DoCommand responses. An
+    operator confusing "the name of the env var" with "the token itself" is
+    the single most likely mistake here, so the accepted shape is checked
+    strictly and a rejected value is never echoed back in full -- only a
+    redacted form, since a short pasted secret could plausibly look like a
+    valid name too.
+    """
+    text = as_str(value, field_name)
+    if not _ENV_VAR_NAME_RE.match(text):
+        raise ConfigError(
+            f"{field_name} must look like an environment variable name "
+            f"(letters, digits, underscore; not starting with a digit; "
+            f"64 chars max), got {redact_secret(text)}"
+        )
+    return text

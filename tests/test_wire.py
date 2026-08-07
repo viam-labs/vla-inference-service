@@ -3,10 +3,19 @@ import base64
 import numpy as np
 import pytest
 from viam.utils import dict_to_struct, struct_to_dict
+from vla.config_util import VLAError
 from vla.wire import (
     encode_image, decode_image, encode_matrix, decode_matrix,
     encode_vector, decode_vector, WireError,
 )
+
+
+def test_wire_error_is_a_vla_error():
+    assert issubclass(WireError, VLAError)
+
+
+def test_wire_error_is_still_a_value_error():
+    assert issubclass(WireError, ValueError)
 
 
 def test_jpeg_roundtrip_preserves_shape():

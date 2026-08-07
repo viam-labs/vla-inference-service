@@ -14,10 +14,12 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from vla.config_util import VLAError
+
 _IMAGE_ENCODINGS = ("raw", "jpeg", "png")
 
 
-class WireError(ValueError):
+class WireError(VLAError, ValueError):
     """Raised when a wire payload is malformed."""
 
 

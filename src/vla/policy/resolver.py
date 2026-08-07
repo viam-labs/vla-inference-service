@@ -20,14 +20,23 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
+from vla.config_util import VLAError, redact_secret
+
 from .config import PolicyConfig
 
 LOGGER = logging.getLogger(__name__)
 
 REQUIRED_FILES = ("config.json", "model.safetensors")
 
+# Bounds the initial hub metadata request (etag lookup), so an unreachable
+# endpoint fails fast instead of hanging the caller forever. The transfer
+# itself is governed separately by huggingface_hub reading the
+# HF_HUB_DOWNLOAD_TIMEOUT env var -- there is no per-call parameter for that
+# half of the request, so this module has nothing to pass for it.
+_ETAG_TIMEOUT_SECONDS = 10
 
-class ResolveError(RuntimeError):
+
+class ResolveError(VLAError, RuntimeError):
     """Raised when a checkpoint cannot be resolved."""
 
 
@@ -35,31 +44,61 @@ def _cache_dir() -> str:
     module_data = os.environ.get("VIAM_MODULE_DATA")
     if module_data:
         path = Path(module_data) / "checkpoints"
-    else:
-        # Viam sets VIAM_MODULE_DATA in deployment; on a dev workstation it
-        # is absent, so fall back to somewhere writable.
-        LOGGER.warning(
-            "VIAM_MODULE_DATA unset; caching checkpoints under the system temp dir"
-        )
-        path = Path(tempfile.gettempdir()) / "viam-vla-checkpoints"
-    path.mkdir(parents=True, exist_ok=True)
-    return str(path)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ResolveError(
+                f"could not create checkpoint cache directory {path}: {exc}"
+            ) from exc
+        return str(path)
+
+    # Viam sets VIAM_MODULE_DATA in deployment; on a dev workstation it is
+    # absent. Fall back to a fresh, uniquely-named temp directory rather
+    # than a fixed path under a shared /tmp: a predictable name there is a
+    # symlink-attack vector from another local user, and mkdtemp() also
+    # creates the directory mode 0700 so only this user can read into it.
+    # Downloads made through this fallback are not cached across restarts.
+    LOGGER.warning(
+        "VIAM_MODULE_DATA unset; downloading into a fresh temp directory "
+        "this run instead of a persistent cache"
+    )
+    try:
+        return tempfile.mkdtemp(prefix="viam-vla-checkpoints-")
+    except OSError as exc:
+        raise ResolveError(f"could not create a temp checkpoint cache directory: {exc}") from exc
 
 
 def _verify(directory: str) -> str:
-    d = Path(directory)
-    if d.is_file():
-        raise ResolveError(f"model_path is a file, not a directory: {directory}")
-    if not d.is_dir():
-        raise ResolveError(f"checkpoint directory does not exist: {directory}")
+    if "${" in directory:
+        raise ResolveError(
+            "model_path contains an uninterpolated package reference -- "
+            f"viam-server did not substitute it before this module saw the config: {directory}"
+        )
 
-    missing = [name for name in REQUIRED_FILES if not (d / name).is_file()]
+    d = Path(os.path.expanduser(directory))
+
+    try:
+        if d.is_symlink() and not d.exists():
+            raise ResolveError(
+                f"model_path is a symlink whose target is missing: {directory}"
+            )
+        if d.is_file():
+            raise ResolveError(f"model_path is a file, not a directory: {directory}")
+        if not d.is_dir():
+            raise ResolveError(f"checkpoint directory does not exist: {directory}")
+        missing = [name for name in REQUIRED_FILES if not (d / name).is_file()]
+    except OSError as exc:
+        raise ResolveError(f"could not read checkpoint directory {directory}: {exc}") from exc
+
     if missing:
         raise ResolveError(
             f"checkpoint at {directory} is missing required file(s): "
             f"{', '.join(missing)}"
         )
-    return str(d)
+    # Absolute + canonical: a relative model_path would otherwise resolve
+    # against an unpredictable module cwd, and this value is handed on to
+    # backend.load as-is.
+    return str(d.resolve())
 
 
 def resolve_checkpoint(
@@ -75,10 +114,13 @@ def resolve_checkpoint(
         if cfg.hf_token_env:
             # A local checkpoint has no use for a hub token. Warn rather
             # than raise: a configured-but-unused credential is confusing,
-            # but not itself invalid config.
+            # but not itself invalid config. The value is redacted even
+            # here -- config-time validation already restricts the shape of
+            # hf_token_env, but a short pasted secret could still pass that
+            # check, so this is belt and braces.
             LOGGER.warning(
-                "hf_token_env=%r is set but ignored because model_path is configured",
-                cfg.hf_token_env,
+                "hf_token_env=%s is set but ignored because model_path is configured",
+                redact_secret(cfg.hf_token_env),
             )
         return _verify(cfg.model_path)
 
@@ -87,7 +129,8 @@ def resolve_checkpoint(
         token = os.environ.get(cfg.hf_token_env)
         if not token:
             raise ResolveError(
-                f"hf_token_env names {cfg.hf_token_env!r} but that variable is unset or empty"
+                f"hf_token_env names {redact_secret(cfg.hf_token_env)} "
+                "but that variable is unset or empty"
             )
 
     if snapshot_download is None:
@@ -101,14 +144,23 @@ def resolve_checkpoint(
 
         snapshot_download = _sd
 
+    cache_dir = _cache_dir()
+
     # Never interpolate `token` here (or anywhere else in this module) --
     # hf_token_env exists specifically to keep the secret out of config and
     # logs alike.
     LOGGER.info("downloading checkpoint %s@%s", cfg.model_hub_id, cfg.model_revision)
-    local = snapshot_download(
-        repo_id=cfg.model_hub_id,
-        revision=cfg.model_revision,
-        cache_dir=_cache_dir(),
-        token=token,
-    )
+    try:
+        local = snapshot_download(
+            repo_id=cfg.model_hub_id,
+            revision=cfg.model_revision,
+            cache_dir=cache_dir,
+            token=token,
+            etag_timeout=_ETAG_TIMEOUT_SECONDS,
+        )
+    except OSError as exc:
+        raise ResolveError(
+            f"failed to download checkpoint {cfg.model_hub_id}@{cfg.model_revision} "
+            f"from the Hugging Face hub: {exc}"
+        ) from exc
     return _verify(local)

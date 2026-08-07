@@ -1,7 +1,17 @@
 import math
 
 import pytest
-from vla.config_util import ConfigError, as_bool, as_choice, as_float, as_int, as_str
+from vla.config_util import (
+    ConfigError,
+    VLAError,
+    as_bool,
+    as_choice,
+    as_env_var_name,
+    as_float,
+    as_int,
+    as_str,
+    redact_secret,
+)
 
 
 # --- as_int ---
@@ -142,3 +152,76 @@ def test_as_choice_accepts_member():
 def test_as_choice_rejects_non_member():
     with pytest.raises(ConfigError, match="field"):
         as_choice("tpu", "field", ("auto", "cpu", "cuda"))
+
+
+# --- VLAError base ---
+
+
+def test_config_error_is_a_vla_error():
+    assert issubclass(ConfigError, VLAError)
+
+
+def test_config_error_is_still_a_value_error():
+    # Existing call sites catch ValueError; the new base must not replace it.
+    assert issubclass(ConfigError, ValueError)
+
+
+# --- redact_secret ---
+
+
+def test_redact_secret_shows_first_four_chars_and_length():
+    assert redact_secret("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345") == "ABCD...<32 chars>"
+
+
+def test_redact_secret_never_contains_the_full_value():
+    secret = "hf_AbCdEfGhIjKlMnOpQrStUv123456"
+    redacted = redact_secret(secret)
+    assert secret not in redacted
+
+
+def test_redact_secret_handles_short_values():
+    assert redact_secret("ab") == "ab...<2 chars>"
+
+
+# --- as_env_var_name ---
+
+
+def test_as_env_var_name_accepts_valid_name():
+    assert as_env_var_name("HF_TOKEN", "field") == "HF_TOKEN"
+
+
+def test_as_env_var_name_accepts_leading_underscore():
+    assert as_env_var_name("_FOO_BAR", "field") == "_FOO_BAR"
+
+
+def test_as_env_var_name_rejects_leading_digit():
+    with pytest.raises(ConfigError, match="field"):
+        as_env_var_name("1FOO", "field")
+
+
+def test_as_env_var_name_rejects_value_with_hyphen():
+    # Shaped like a plausible pasted secret (e.g. an API key), not an env
+    # var name -- this is the case the regex is specifically meant to catch.
+    with pytest.raises(ConfigError, match="field"):
+        as_env_var_name("sk-live-1234567890abcdef1234567890abcdef", "field")
+
+
+def test_as_env_var_name_rejects_value_over_64_chars():
+    with pytest.raises(ConfigError, match="field"):
+        as_env_var_name("A" * 65, "field")
+
+
+def test_as_env_var_name_accepts_value_exactly_64_chars():
+    assert as_env_var_name("A" * 64, "field") == "A" * 64
+
+
+def test_as_env_var_name_rejects_non_string():
+    with pytest.raises(ConfigError, match="field"):
+        as_env_var_name(1.0, "field")
+
+
+def test_as_env_var_name_never_echoes_the_full_rejected_value():
+    offending = "sk-live-1234567890abcdef1234567890abcdef"
+    with pytest.raises(ConfigError) as excinfo:
+        as_env_var_name(offending, "field")
+    assert offending not in str(excinfo.value)
