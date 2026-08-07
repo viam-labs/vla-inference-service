@@ -85,6 +85,9 @@ Why this split: `policy/` and `controller/` never import each other — they com
 
 ## Task 1: Project scaffold
 
+> **Implemented** — `f108749`, `d058c64`. Code below is re-synced with the
+> hardening the review added (wheel-only build, script guards, `build.setup`).
+
 **Files:**
 - Create: `pyproject.toml`, `mise.toml`, `run.sh`, `setup.sh`, `meta.json`, `.gitignore`,
   `.python-version`
@@ -328,7 +331,14 @@ git commit -m "chore: scaffold uv/mise Viam module project"
 
 ## Task 2: Wire codec
 
-The controller and policy exchange images and float matrices through protobuf `Struct`, which only carries JSON types. This module owns that translation.
+> **Implemented** — `25f10ab`, `cddc607`, `e6881ff`. The committed code is the
+> source of truth; the code below is the starting point it grew from. Review
+> added `encode_vector`/`decode_vector`, validation and `WireError` wrapping on
+> the compressed path, and took the suite from 7 to 41 tests.
+
+The controller and policy exchange images, float matrices, and the 1-D state
+vector through protobuf `Struct`, which only carries JSON types. This module
+owns that translation, and is the only module both resources import.
 
 **Files:**
 - Create: `src/vla/wire.py`
@@ -1465,7 +1475,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import struct_to_dict
 
-from ..wire import decode_image, decode_matrix, encode_matrix
+from ..wire import WireError, decode_image, decode_matrix, decode_vector, encode_matrix
 from .backend import PolicyBackend
 from .config import PolicyConfig
 from .lerobot_backend import LeRobotBackend
@@ -1577,8 +1587,21 @@ class VLAPolicy(Generic, EasyResource):
     async def _infer(self, command: Mapping[str, Any]) -> Mapping[str, Any]:
         self._require_ready()
 
-        images = {k: decode_image(v) for k, v in (command.get("images") or {}).items()}
-        state = np.asarray(command.get("state") or [], dtype=np.float32)
+        # Wrap per-camera: a bare WireError from decode_image says the payload
+        # was malformed but not which feed produced it, and a robot log needs
+        # to name the camera.
+        images = {}
+        for key, payload in (command.get("images") or {}).items():
+            try:
+                images[key] = decode_image(payload)
+            except WireError as exc:
+                raise WireError(f"{key}: {exc}") from exc
+        # decode_vector, not a bare asarray: `command.get("state") or []` would
+        # silently yield an empty array for a missing or malformed state, and
+        # the shape mismatch would surface deep inside the backend instead.
+        state = decode_vector(command["state"]) if "state" in command else None
+        if state is None:
+            raise WireError("infer requires a 'state' vector")
         task = command.get("task") or ""
 
         rtc_kwargs = None
@@ -3291,7 +3314,15 @@ class ObservationBuilder:
 
     def _encode(self, key: str, arr: np.ndarray) -> dict[str, Any]:
         size = self._sizes.get(key)
-        if size is not None and arr.shape[:2] != size:
+        if size is None:
+            # Never forward an unresized frame. A 1080p frame under
+            # image_encoding="raw" base64-encodes to ~8.3 MB, which exceeds
+            # typical gRPC message limits — and the policy would receive a
+            # resolution it was not trained on either way.
+            raise ObservationError(
+                f"no expected size for {key!r}; policy specs did not declare it"
+            )
+        if arr.shape[:2] != size:
             arr = np.asarray(
                 Image.fromarray(arr).resize((size[1], size[0]), Image.BILINEAR), dtype=np.uint8
             )
@@ -4112,7 +4143,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import struct_to_dict
 
-from ..wire import decode_matrix
+from ..wire import decode_matrix, encode_vector
 from .config import ControllerConfig
 from .gripper import make_gripper_adapter
 from .observation import ObservationBuilder
@@ -4372,7 +4403,7 @@ class VLAController(Generic, EasyResource):
         payload = {
             "command": "infer",
             "images": obs.images,
-            "state": [float(v) for v in obs.state],
+            "state": encode_vector(obs.state),
             "task": self._active_task_text,
         }
         if rtc:
