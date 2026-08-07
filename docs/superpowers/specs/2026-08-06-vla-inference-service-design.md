@@ -100,6 +100,25 @@ Extras needed are narrow: `lerobot[smolvla]` = `transformers` + `num2words` + `a
 
 ### Viam SDK facts
 
+- **All SDK facts below were re-verified against the *installed* package (viam-sdk 0.80.0) on
+  2026-08-07, not against the local `viam-python-sdk` checkout.** The checkout is ahead of every
+  published release, and trusting it produced two wrong claims in this spec (`MoveOptions`, and
+  the camera API). Verify against the installed package.
+
+- **`Camera` exposes `get_images` (plural), not `get_image`.** Signature:
+  `get_images(*, filter_source_names=None, extra=None, timeout=None) -> Tuple[Sequence[NamedImage],
+  ResponseMetadata]`. There is no singular accessor. So a per-camera read is:
+  ```python
+  images, metadata = await cam.get_images()
+  frame = images[0]          # NamedImage: .data, .width, .height, .mime_type
+  ```
+  `NamedImage(name, data, mime_type)` subclasses `ViamImage`, so `viam_to_pil_image` accepts it.
+
+  **This is an improvement for staleness detection.** `ResponseMetadata.captured_at` gives the
+  actual capture time, so the controller can measure true frame *age* rather than merely its own
+  assembly duration — a camera buffering a stale frame is now detectable, which it was not under
+  the original design.
+
 - `JointPositions.values` are **degrees** (rotational) / mm (translational), ordered spatially from
   base toward end effector.
 - **`move_through_joint_positions` is UNRELEASED — corrected 2026-08-07.** The claims below were

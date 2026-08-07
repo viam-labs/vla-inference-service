@@ -3218,6 +3218,23 @@ git commit -m "feat: add safety layer with delta, limit, and start-pose checks"
 
 ## Task 14: Observation assembly
 
+> **API CORRECTION — read before starting.** The code below calls `cam.get_image()`. **That method
+> does not exist in the installed viam-sdk 0.80.0.** The camera API is `get_images` (plural):
+> ```python
+> images, metadata = await cam.get_images()   # -> (Sequence[NamedImage], ResponseMetadata)
+> frame = images[0]                            # NamedImage subclasses ViamImage
+> ```
+> `tests/fakes.py:47` currently implements the wrong `get_image` — **fix the fake too**, or Task 14
+> gets written against a nonexistent method, passes every test, and fails on a real robot.
+>
+> Use `metadata.captured_at` for staleness detection instead of only timing assembly. It gives the
+> true frame age, so a camera serving a buffered stale frame becomes detectable — which the
+> original `t0 = perf_counter()` design could not see. Keep the assembly-duration warning as well;
+> they catch different faults.
+>
+> Handle the empty case: `get_images()` returning zero images must raise `ObservationError` naming
+> the camera, not `IndexError`.
+
 **Files:**
 - Create: `src/vla/controller/observation.py`
 - Test: `tests/controller/test_observation.py`
