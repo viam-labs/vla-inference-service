@@ -58,9 +58,12 @@ The upstream RTC control loop (`rollout/inference/rtc.py`):
 ```python
 time_per_chunk = 1.0 / fps
 prev_actions = queue.get_left_over()                       # policy-space leftover
-delay        = ceil(latency_tracker.max() / time_per_chunk) # PREDICTED → into policy
+latency      = latency_tracker.max()
+delay        = ceil(latency / time_per_chunk) if latency else 0   # PREDICTED → into policy
 idx_before   = queue.get_action_index()
 t0 = perf_counter()
+if prev_actions is not None:                                # zero-pad / truncate to horizon
+    prev_actions = _normalize_prev_actions_length(prev_actions, rtc_config.execution_horizon)
 chunk = predict_action_chunk(obs, inference_delay=delay, prev_chunk_left_over=prev_actions)
 new_delay = ceil((perf_counter() - t0) / time_per_chunk)    # MEASURED → into merge
 queue.merge(original, processed, new_delay, idx_before)
@@ -81,9 +84,10 @@ Two distinct delays: a **predicted** delay telling RTC how much of the prefix to
 | protobuf | 6.33.5 |
 | numpy | 2.2.6 |
 
-No pin fighting because **viam-sdk Python uses `grpclib`, not `grpcio`**, so it never touches
-lerobot's quarantined `grpcio-dep` extra (which caps `grpcio<=1.73.1` / `protobuf<=6.32.0` for
-`reachy2-sdk`).
+No pin fighting because **viam-sdk Python uses `grpclib`, not `grpcio`**, so it never pulls
+lerobot's `grpcio-dep` extra (`grpcio>=1.73.1,<2.0.0`, `protobuf>=6.31.1,<8.0.0`) nor the separate
+`reachy2` extra, which is where the restrictive `grpcio<=1.73.1` / `protobuf<=6.32.0` caps actually
+live.
 
 Extras needed are narrow: `lerobot[smolvla]` = `transformers` + `num2words` + `accelerate`;
 `lerobot[evo1]` = `transformers`.
@@ -94,13 +98,28 @@ Extras needed are narrow: `lerobot[smolvla]` = `transformers` + `num2words` + `a
 
 - `JointPositions.values` are **degrees** (rotational) / mm (translational), ordered spatially from
   base toward end effector.
+- **`MoveOptions` is accepted only by `move_through_joint_positions(positions: List[JointPositions],
+  options: Optional[MoveOptions], ...)`** (`arm.py:130`). `move_to_joint_positions(positions, *,
+  extra, timeout)` (`arm.py:97`) takes no options, and `MoveToJointPositionsRequest` carries only
+  `name` / `positions` / `extra`. Any kinematic ceiling therefore requires the
+  `move_through_joint_positions` call, even for a single waypoint.
 - `MoveOptions` fields: `max_vel_degs_per_sec`, `max_acc_degs_per_sec2`,
-  `max_vel_degs_per_sec_joints`, `max_acc_degs_per_sec2_joints`, `max_tcp_speed`.
-- **`gripper` has no continuous write.** Its API is `open`, `grab`, `is_holding_something`, `stop`,
-  `is_moving`, `get_kinematics`, `get_current_inputs`. `get_current_inputs() -> List[float]` gives a
-  continuous *read*; there is no continuous setter. A VLA emits continuous gripper actions, so this
-  asymmetry must be resolved in config.
+  `max_vel_degs_per_sec_joints`, `max_acc_degs_per_sec2_joints`, and `max_tcp_speed` — the last in
+  **meters per second**, not mm/s.
+- Every scalar `MoveOptions` field has **explicit presence**: an unset field reads back as `0.0`,
+  indistinguishable from an explicit zero. Unconfigured limits must be *omitted*, not zero-filled,
+  or the arm is told not to move.
+- `gripper` supports continuous values in both directions: `get_current_inputs() -> List[float]`
+  reads them and `go_to_inputs(values: List[float])` (`gripper.py:217`, client at `client.py:144`,
+  documented as `GoToInputs`) writes them. The rest of the API is `open`, `grab`,
+  `is_holding_something`, `stop`, `is_moving`, `get_kinematics`. Both input methods are abstract, so
+  a given driver may not implement them.
 - `servo` has `get_position() -> int` and `move(angle: int)` — bidirectional but **integer degrees**.
+- **`get_kinematics()` returns `KinematicsReturn`** — `Tuple[KinematicsFileFormat, bytes]` or
+  `Tuple[KinematicsFileFormat, bytes, Mapping[str, Mesh]]`: raw URDF or SVA file bytes, or
+  `UNSPECIFIED`. The Python SDK explicitly "cannot yet parse a kinematics model" and states that
+  "implementations are responsible for their own limit checking" (`arm.py:161-165`). Reading joint
+  limits from it would mean owning a URDF *and* SVA parser plus an unparseable-file fallback.
 - `${packages.ml_model.<name>}` resolves to the package download directory and works in any module
   config string field. Registry delivery therefore needs no dedicated config field.
 
@@ -166,7 +185,7 @@ viam-labs:vla:controller  deps, control loop, scheduler. No torch.
 │                        │   2. infer ───────┐               │
 │                        │   3. execute      │               │
 │                        ▼                   ▼               │
-│              arm.MoveToJointPositions  viam-labs:vla:policy │
+│         arm.MoveThroughJointPositions  viam-labs:vla:policy │
 └────────────────────────────────────────────┼───────────────┘
                                              ▼
                                     PolicyBackend (ABC)
@@ -229,6 +248,13 @@ No dependencies. `validate()` returns `([], [])`.
   configurable only creates a way to contradict the checkpoint.
 - `device: "auto"` → `cuda` → `mps` → `cpu`, first available. Covers all three deployment targets
   with no per-machine config edits.
+- `hf_token_env` names an **environment variable** holding the Hugging Face token, never the token
+  itself — machine configs are readable by anyone with fleet access.
+- `dtype` is `auto` | `float32` | `bfloat16` | `float16`. `auto` selects `bfloat16` on CUDA and
+  `float32` elsewhere, since MPS `bfloat16` support is uneven.
+- `warmup_inferences` runs N throwaway inferences on synthetic input at load, before `status` flips
+  to `ready`. First-call latency on a cold GPU is often several times steady-state, and RTC's delay
+  tracker would otherwise calibrate against that outlier.
 - `rtc` mirrors `RTCConfig` field-for-field. Ignored with a logged warning when
   `policy.supports_rtc()` is `False`. When RTC is enabled, the service injects the `RTCConfig` at
   load and calls `policy.init_rtc_processor()`.
@@ -237,10 +263,25 @@ No dependencies. `validate()` returns `([], [])`.
 
 | command | input | output |
 |---|---|---|
-| `infer` | `images{key→b64}`, `state[]`, `task`, optional `rtc{inference_delay, prev_chunk_left_over, execution_horizon}` | `actions[][]`, `raw_actions[][]`, `latency_s` |
+| `infer` | `images{key→b64}`, `state[]`, `task`, optional `rtc{inference_delay, prev_chunk_left_over}` | `actions[][]`, `raw_actions[][]`, `latency_s` |
 | `specs` | — | `policy_type`, `input_features`, `output_features`, `n_action_steps`, `action_dim`, `supports_rtc`, `rtc_enabled`, `device` |
 | `status` | — | `loading` \| `ready` \| `failed`, `error` |
 | `reset` | — | clears cached state |
+
+`execution_horizon` is deliberately **not** in the per-request `rtc` block. Upstream passes only
+`inference_delay` and `prev_chunk_left_over` to `predict_action_chunk`
+(`rollout/inference/rtc.py:326`), and `denoise_step` falls back to
+`self.rtc_config.execution_horizon` when the argument is `None`. Keeping it config-only means one
+source of truth, consistent with RTC enablement living on the policy service.
+
+**`LeRobotBackend.predict_chunk` owns prefix normalization.** Immediately before calling
+`predict_action_chunk`, it pads with zeros or truncates the decoded `prev_chunk_left_over` to its
+configured `execution_horizon`, matching `_normalize_prev_actions_length`
+(`rollout/inference/rtc.py:83, 320-323`). This is not optional bookkeeping: `modeling_rtc.py:189-190`
+shrinks `execution_horizon` to the leftover's length when the leftover is shorter, which silently
+changes `get_prefix_weights` and therefore the guidance applied. Because `execution_horizon` is
+config-only, the controller *cannot* perform this step — it does not know the value — so the
+backend must, and the controller sends the raw leftover at whatever length its queue holds.
 
 **The response carries both `actions` and `raw_actions`** because `ActionQueue` maintains two
 parallel arrays: `original_queue` in policy space (feeds `prev_chunk_left_over`) and `queue` in
@@ -287,6 +328,7 @@ per gripper block).
   "mode": "auto",
   "queue_threshold": 30,
   "starvation_grace_ticks": 3,
+  "policy_ready_timeout_s": 600,
 
   "state_joint_indices": [0, 1, 2, 3, 4],
   "state_units": "degrees",
@@ -299,7 +341,8 @@ per gripper block).
     "max_start_delta_degs": 15.0,
     "max_vel_degs_per_sec": 60.0,
     "max_acc_degs_per_sec2": 120.0,
-    "max_tcp_speed_mm_per_sec": 250.0,
+    "max_tcp_speed_m_per_sec": 0.25,
+    "joint_limits_degs": [[-110, 110], [-90, 90], [-90, 90], [-90, 90], [-180, 180], [0, 90]],
     "stop_on_error": true
   },
 
@@ -308,8 +351,17 @@ per gripper block).
 }
 ```
 
-**RTC enablement lives only on the policy service.** The controller has no `rtc.enabled` flag; at
-startup it calls `specs` and reads `supports_rtc` / `rtc_enabled`, then selects its scheduler.
+**The controller must tolerate a cold policy.** It needs `specs` for two things — scheduler
+selection and the image resize target — but the policy answers with a "model loading" error until a
+possibly multi-GB download completes, which is the *normal* case on first boot. So controller
+`reconfigure()` never fails on a loading policy: it stores config, returns, and fetches `specs`
+lazily on the first `start`, polling `status` with backoff up to `policy_ready_timeout_s`
+(default 600). `start` returns a clear "policy still loading" error if the timeout expires; `status`
+reports `waiting_for_policy`. Making `reconfigure` depend on the policy being warm would leave the
+machine in a config-error state every cold boot.
+
+**RTC enablement lives only on the policy service.** The controller has no `rtc.enabled` flag; on
+its first `start` it reads `supports_rtc` / `rtc_enabled` from `specs`, then selects its scheduler.
 `mode` is `auto` | `sequential` | `rtc`: `auto` follows the policy, `sequential` forces the simple
 path for debugging, `rtc` errors loudly if the policy cannot do it. This eliminates split-brain
 misconfiguration where the two halves disagree about which algorithm is running.
@@ -317,7 +369,9 @@ misconfiguration where the two halves disagree about which algorithm is running.
 **No image size in config.** The controller learns the expected resolution from
 `specs.input_features` and resizes to it; a configurable size could only ever disagree with the
 checkpoint. `image_encoding` (`jpeg` | `png` | `raw`) stays configurable because JPEG artifacts vs.
-the training distribution is a real thing to bisect — a debugging knob, not a tuning one.
+the training distribution is a real thing to bisect — a debugging knob, not a tuning one. `raw` is
+base64 of the packed `uint8` HWC buffer, carried alongside an explicit `{height, width, channels}`
+per image so the decoder never infers shape; it exists for fidelity comparisons, not production.
 
 **`state_joint_indices` maps Viam joint order → state-vector position.** Viam returns the driver's
 order (base→end-effector); the state vector's order comes from whatever recorded the training data.
@@ -328,22 +382,36 @@ soon as a public checkpoint is loaded.
 
 ### Gripper block
 
-A discriminated union, because Viam's gripper API cannot accept a continuous command:
+A discriminated union, because a VLA emits one continuous gripper value while Viam offers three
+different components that could carry it, with different fidelity:
 
 ```json
 { "type": "arm_joint", "joint_index": 5 }
-{ "type": "servo", "name": "grip-servo", "min_deg": 0, "max_deg": 90 }
-{ "type": "gripper", "name": "grip", "close_threshold": 0.5 }
+{ "type": "servo",   "name": "grip-servo", "min_deg": 0, "max_deg": 90 }
+{ "type": "gripper", "name": "grip", "mode": "inputs" }
+{ "type": "gripper", "name": "grip", "mode": "threshold", "close_threshold": 0.5 }
 { "type": "none" }
 ```
 
-- **`arm_joint` — recommended.** SO-100-style Viam arm drivers commonly expose the gripper as
-  joint 6, so read and write both go through the arm API and the asymmetry disappears.
+- **`arm_joint` — recommended default.** SO-100-style Viam arm drivers commonly expose the gripper
+  as joint 6, so read and write both ride the arm API and the gripper value stays in the same
+  vector as the joints — no second round trip per tick.
 - `servo` — bidirectional via `get_position()` / `move(angle)`; caveat, both are `int`, so 1°
   resolution.
-- `gripper` — read via `get_current_inputs()`, write by thresholding the continuous output to
-  `open()` / `grab()`. Works with any Viam gripper but loses proportional control. Documented
-  fallback, not the default.
+- `gripper` with `mode: "inputs"` — the symmetric pair `get_current_inputs()` /
+  `go_to_inputs(values)`, preserving proportional control. Preferred over `threshold` whenever the
+  driver implements them; both are abstract methods, so not every driver will.
+- `gripper` with `mode: "threshold"` — read via `get_current_inputs()`, write by thresholding the
+  continuous action to `open()` / `grab()`. Loses proportional control. The fallback for drivers
+  that do not implement `go_to_inputs`. `close_threshold` applies only in this mode.
+
+`validate()` rejects `close_threshold` outside `mode: "threshold"` rather than silently ignoring it.
+
+**Gripper value convention.** For `arm_joint` the value is a joint angle and follows `action_units`
+like every other joint. For `gripper/inputs` and `gripper/threshold` it is normalized `0.0`–`1.0`
+(0 = fully open), matching how LeRobot datasets typically encode a gripper channel; `servo` maps
+that same normalized range onto `min_deg`–`max_deg`. `close_threshold` is compared against the
+normalized value.
 
 ### DoCommand surface
 
@@ -398,11 +466,18 @@ response: actions[] (postprocessed) + raw_actions[] (policy space)
   → split: arm joints | gripper value
   → convert action_units → degrees
   → safety clamp
-  → arm.move_to_joint_positions(..., MoveOptions(...)) + gripper write
+  → arm.move_through_joint_positions([JointPositions(...)], options=MoveOptions(...))
+    + gripper write (per gripper block)
 ```
 
-Joint limits come from `arm.get_kinematics()` at startup, not from config, so they cannot drift from
-the actual hardware.
+**The per-tick write is `move_through_joint_positions` with a single waypoint, not
+`move_to_joint_positions`.** The latter accepts no `MoveOptions`, so it cannot carry the velocity,
+acceleration, or TCP-speed ceilings — using it would silently drop every kinematic limit in the
+safety config. The single-element list is the cost of keeping those ceilings on the hot path.
+
+The `MoveOptions` builder sets only the fields present in config. Unset scalars read back as `0.0`,
+which an arm driver cannot distinguish from an explicit zero — zero-filling would command the arm
+to hold still.
 
 ## Error handling
 
@@ -425,8 +500,26 @@ Applied in order:
 2. Dimension check against `specs.action_dim`.
 3. Per-step delta clamp against the **current measured** position, not the last commanded one — so
    a stalled arm cannot accumulate an ever-growing command.
-4. Joint limit clamp from `arm.get_kinematics()`.
-5. `MoveOptions` velocity / acceleration / TCP caps handed to the driver.
+4. Joint limit clamp from the **optional** `safety.joint_limits_degs` config. **The list is indexed
+   in action-vector order** — one `[min, max]` pair per action dimension, in the same order the
+   policy emits and `state_joint_indices` defines, with the gripper's pair last when a gripper block
+   is active. It is *not* indexed by Viam joint order. `validate()` enforces
+   `len(joint_limits_degs) == len(state_joint_indices) + (1 if gripper else 0)` and fails
+   configuration otherwise, because a silent off-by-one here clamps the wrong joint. The clamp runs
+   after `action_units → degrees` and before `JointPositions` is built. When absent, this
+   layer is skipped and a warning is logged once at start, naming the arm as the sole limit
+   authority. Limits are *not* read from `arm.get_kinematics()`: that returns raw URDF or SVA bytes,
+   and the Python SDK cannot parse a kinematics model, so honoring it would mean owning two parsers
+   plus an unparseable-file fallback — scope disproportionate to a prototype whose delta clamp and
+   `MoveOptions` ceilings already bound motion. The tradeoff is that config limits can drift from
+   hardware; the arm driver remains the backstop.
+5. `MoveOptions` velocity / acceleration / TCP-speed ceilings handed to the driver via
+   `move_through_joint_positions`, with only the configured fields set (see explicit presence,
+   above). `max_tcp_speed` is **meters per second** — config carries
+   `max_tcp_speed_m_per_sec` to keep the unit in the name. The per-joint variants
+   (`max_vel_degs_per_sec_joints`, `max_acc_degs_per_sec2_joints`) are **intentionally not
+   exposed**: setting one causes the driver to ignore its scalar counterpart, so offering both
+   invites a config where the scalar limit is silently dead.
 6. **Log whenever a clamp engages,** and expose `clamp_counts` in `status`. Persistent clamping is
    the signature of wrong units or wrong joint order — the primary diagnostic, so it must be loud
    rather than silently correct.
@@ -445,10 +538,11 @@ so upstream changing merge semantics breaks the build instead of the robot.
 
 | layer | covers | needs |
 |---|---|---|
-| `ActionQueue` port | append continuity, RTC replace + delay trimming, delay clamping `max(0, min(delay, len))`, `get_left_over` indexing, concurrent get/merge | — |
+| `ActionQueue` port | append continuity, RTC replace + delay trimming, delay clamping `max(0, min(real_delay, len(original), len(processed)))`, the `_check_and_resolve_delays` branch that logs and returns the **unclamped** `real_delay` when `last_index - action_index_before_inference != real_delay`, `get_left_over` indexing, concurrent get/merge | — |
+| Prefix normalization | zero-pad and truncate paths of `_normalize_prev_actions_length`, including the shorter-than-horizon case that would otherwise shrink `execution_horizon` | — |
 | Differential vs upstream | port fidelity | lerobot |
-| Mapping | degrees↔radians↔normalized, joint remap, 4 gripper variants, resize/encode | — |
-| Safety | clamp ordering, NaN rejection, start-delta refusal | — |
+| Mapping | degrees↔radians↔normalized, joint remap, 5 gripper variants, resize/encode | — |
+| Safety | clamp ordering, NaN rejection, start-delta refusal, skipped limit layer when `joint_limits_degs` absent, `MoveOptions` omits unconfigured fields rather than zero-filling | — |
 | `policy` service | full DoCommand surface, RTC field plumbing, error paths, loading states | `FakePolicyBackend` |
 | `controller` | loop timing, starvation, stop-on-error, reconfigure-while-running | fake arm/camera/policy |
 | Integration, no robot | real `lerobot/smolvla_base`: chunk shape `[n_action_steps, action_dim]`, finite values, RTC kwargs demonstrably change output | checkpoint |
