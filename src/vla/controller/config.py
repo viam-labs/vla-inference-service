@@ -32,6 +32,15 @@ Two corrections from an earlier plan draft, both load-bearing:
     both are given they must agree, or it is a config-time error -- silently
     preferring one over a contradictory other would hide an operator
     mistake instead of surfacing it.
+
+`duration_warn_s` / `stale_frame_warn_s` are operator-configurable rather
+than the fixed module defaults `observation.py` used to hardcode: a
+checkpoint run at 2 Hz and one run at 10 Hz imply very different "this tick
+is late" and "this frame is stale" thresholds (a 100ms duration budget is
+generous at 2 Hz but is the *entire* tick at 10 Hz), and the operator is the
+only party who knows which regime they are in. Defaults match
+`observation.py`'s own constants, so an operator who never sets these two
+fields observes no behavior change.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ from typing import Any
 from vla.config_util import ConfigError, as_bool, as_choice, as_float, as_int, as_str
 
 from .gripper import GRIPPER_TYPES
+from .observation import DEFAULT_DURATION_WARN_S, STALE_FRAME_WARN_S
 from .units import SUPPORTED_UNITS
 
 __all__ = ["ConfigError", "SafetyConfig", "ControllerConfig", "MODES", "ENCODINGS"]
@@ -177,6 +187,8 @@ class ControllerConfig:
     action_units: str = "degrees"
     image_encoding: str = "jpeg"
     jpeg_quality: int = 90
+    duration_warn_s: float = DEFAULT_DURATION_WARN_S
+    stale_frame_warn_s: float = STALE_FRAME_WARN_S
     safety: SafetyConfig = field(default_factory=SafetyConfig)
 
     @staticmethod
@@ -257,6 +269,16 @@ class ControllerConfig:
             action_units=action_units,
             image_encoding=encoding,
             jpeg_quality=as_int(raw.get("jpeg_quality", 90), "jpeg_quality", minimum=0, maximum=100),
+            duration_warn_s=as_float(
+                raw.get("duration_warn_s", DEFAULT_DURATION_WARN_S),
+                "duration_warn_s",
+                minimum=0.0,
+            ),
+            stale_frame_warn_s=as_float(
+                raw.get("stale_frame_warn_s", STALE_FRAME_WARN_S),
+                "stale_frame_warn_s",
+                minimum=0.0,
+            ),
             safety=safety,
         )
 

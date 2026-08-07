@@ -483,6 +483,65 @@ def test_stop_on_error_rejects_non_bool():
 
 
 # ---------------------------------------------------------------------------
+# duration_warn_s / stale_frame_warn_s -- operator-configurable pass-through
+# to ObservationBuilder. Defaults must match observation.py's own module
+# constants exactly, so a controller that never sets these observes no
+# behavior change from before they existed as config fields.
+# ---------------------------------------------------------------------------
+
+
+def test_default_duration_warn_s_matches_observation_module_default():
+    from vla.controller.observation import DEFAULT_DURATION_WARN_S
+
+    cfg = ControllerConfig.parse(BASE)
+    assert cfg.duration_warn_s == DEFAULT_DURATION_WARN_S
+
+
+def test_default_stale_frame_warn_s_matches_observation_module_default():
+    from vla.controller.observation import STALE_FRAME_WARN_S
+
+    cfg = ControllerConfig.parse(BASE)
+    assert cfg.stale_frame_warn_s == STALE_FRAME_WARN_S
+
+
+def test_duration_warn_s_accepts_override():
+    cfg = ControllerConfig.parse({**BASE, "duration_warn_s": 0.4})
+    assert cfg.duration_warn_s == 0.4
+
+
+def test_stale_frame_warn_s_accepts_override():
+    cfg = ControllerConfig.parse({**BASE, "stale_frame_warn_s": 2.5})
+    assert cfg.stale_frame_warn_s == 2.5
+
+
+def test_duration_warn_s_accepts_protobuf_double_form():
+    cfg = ControllerConfig.parse({**BASE, "duration_warn_s": 1.0})
+    assert cfg.duration_warn_s == 1.0
+
+
+def test_duration_warn_s_rejects_negative():
+    with pytest.raises(ConfigError, match="duration_warn_s"):
+        ControllerConfig.parse({**BASE, "duration_warn_s": -0.1})
+
+
+def test_stale_frame_warn_s_rejects_negative():
+    with pytest.raises(ConfigError, match="stale_frame_warn_s"):
+        ControllerConfig.parse({**BASE, "stale_frame_warn_s": -0.1})
+
+
+def test_duration_warn_s_accepts_zero():
+    # A warn-on-everything setting is an extreme but legitimate operator
+    # choice (maximum verbosity while debugging), so 0.0 is not an error.
+    cfg = ControllerConfig.parse({**BASE, "duration_warn_s": 0.0})
+    assert cfg.duration_warn_s == 0.0
+
+
+def test_duration_warn_s_rejects_non_number():
+    with pytest.raises(ConfigError, match="duration_warn_s"):
+        ControllerConfig.parse({**BASE, "duration_warn_s": "slow"})
+
+
+# ---------------------------------------------------------------------------
 # ConfigError hierarchy: there must be exactly one ConfigError type shared
 # with vla.config_util, not a second module-local one.
 # ---------------------------------------------------------------------------
