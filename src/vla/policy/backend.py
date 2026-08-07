@@ -16,6 +16,7 @@ class PolicySpecs:
 
     policy_type: str
     action_dim: int
+    state_dim: int
     n_action_steps: int
     input_features: dict[str, list[int]]
     output_features: dict[str, list[int]]
@@ -24,6 +25,7 @@ class PolicySpecs:
     rtc_enabled: bool
     relative_actions: bool
     device: str
+    dtype: str
 
     def to_dict(self) -> dict[str, Any]:
         # dataclasses.asdict rather than hand-enumerating fields: a field

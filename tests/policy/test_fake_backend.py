@@ -1,4 +1,6 @@
 import dataclasses
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
@@ -66,6 +68,138 @@ def test_records_rtc_kwargs_for_assertions():
                     {"inference_delay": 2, "prev_chunk_left_over": prefix})
     assert b.last_rtc["inference_delay"] == 2
     np.testing.assert_array_equal(b.last_rtc["prev_chunk_left_over"], prefix)
+
+
+# ---------------------------------------------------------------------------
+# predict_chunk before load() must raise, like the real LeRobotBackend
+# (review item 1). Task 7 has two ordering hazards -- warmup racing ahead of
+# load, and a superseded reconfigure swapping self._backend mid-flight --
+# that a fake which silently "succeeds" unloaded would let pass in tests
+# and fail only in production.
+# ---------------------------------------------------------------------------
+
+
+def test_predict_chunk_before_load_raises():
+    b = FakePolicyBackend()
+    with pytest.raises(RuntimeError, match="not loaded"):
+        b.predict_chunk(_obs(), np.zeros(6, np.float32), "t", None)
+
+
+# ---------------------------------------------------------------------------
+# Constructor defaults must be asserted (standing requirement 2). Mutation-
+# verified: action_dim 6->7, n_action_steps 50->51, or image_size
+# (224,224)->(256,192) left every prior test green.
+# ---------------------------------------------------------------------------
+
+
+def test_default_constructor_dimensions_are_asserted():
+    b = FakePolicyBackend()
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+    specs = b.specs
+    assert specs.action_dim == 6
+    assert specs.n_action_steps == 50
+    assert specs.state_dim == 6
+    assert specs.input_features["observation.images.top"] == [3, 224, 224]
+    assert specs.image_feature_keys == ["observation.images.top"]
+    actions, raw = b.predict_chunk(_obs(), np.zeros(6, np.float32), "t", None)
+    assert actions.shape == (50, 6)
+    assert raw.shape == (50, 6)
+
+
+# ---------------------------------------------------------------------------
+# state_dim must not be conflated with action_dim (review item 2). Task 7's
+# _warmup_once comment ("State dim, not action dim: they coincide on
+# smolvla_base but need not") exists precisely to guard against this bug --
+# a fake that always sets them equal makes that bug undetectable.
+# ---------------------------------------------------------------------------
+
+
+def test_state_dim_defaults_to_action_dim_when_unset():
+    b = FakePolicyBackend(action_dim=6)
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+    assert b.specs.state_dim == 6
+    assert b.specs.input_features["observation.state"] == [6]
+
+
+def test_state_dim_distinct_from_action_dim_is_honored():
+    # action_dim and state_dim deliberately differ here -- a fake (or a
+    # controller) that conflates them would be caught by this test but not
+    # by one where the two happen to coincide.
+    b = FakePolicyBackend(action_dim=6, state_dim=14)
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+    assert b.specs.action_dim == 6
+    assert b.specs.state_dim == 14
+    assert b.specs.input_features["observation.state"] == [14]
+    assert b.specs.output_features == {"action": [6]}
+
+
+# ---------------------------------------------------------------------------
+# Multi-camera support (review item 3). The real lerobot/smolvla_base
+# checkpoint has three cameras (observation.images.camera1/2/3); a fake
+# that only ever declares one camera lets Task 7's per-camera decode loop
+# and Task 17's image-size mapping go completely unexercised for the
+# multi-camera case.
+# ---------------------------------------------------------------------------
+
+
+def test_single_default_camera_key():
+    b = FakePolicyBackend()
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+    assert b.specs.image_feature_keys == ["observation.images.top"]
+    assert set(b.specs.input_features) == {"observation.images.top", "observation.state"}
+
+
+def test_multi_camera_keys_all_appear_in_input_features_and_image_feature_keys():
+    keys = (
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+    )
+    b = FakePolicyBackend(camera_keys=keys, image_size=(180, 320))
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+    assert b.specs.image_feature_keys == list(keys)
+    for key in keys:
+        assert b.specs.input_features[key] == [3, 180, 320]
+    # observation.state must still be present alongside the cameras.
+    assert "observation.state" in b.specs.input_features
+    assert set(b.specs.input_features) == set(keys) | {"observation.state"}
+
+
+# ---------------------------------------------------------------------------
+# Thread safety of the bookkeeping (review item 4). PolicyBackend's
+# docstring promises "predict_chunk carries no state between calls", but
+# the pre-hardening implementation did read-modify-write on call_count and
+# last-writer-wins on last_rtc with no lock, while Task 7 dispatches
+# concurrent requests via asyncio.to_thread.
+# ---------------------------------------------------------------------------
+
+
+def test_call_count_is_exact_under_concurrent_calls():
+    b = FakePolicyBackend(action_dim=4, n_action_steps=10)
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+
+    n_threads = 32
+    calls_per_thread = 200
+
+    def hammer():
+        for _ in range(calls_per_thread):
+            b.predict_chunk(_obs(), np.zeros(4, np.float32), "t", None)
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = [pool.submit(hammer) for _ in range(n_threads)]
+        for f in futures:
+            f.result()
+
+    assert b.call_count == n_threads * calls_per_thread
+
+
+def test_last_rtc_stores_a_copy_not_the_callers_dict_reference():
+    b = FakePolicyBackend(action_dim=4, n_action_steps=10)
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+    caller_dict = {"inference_delay": 1}
+    b.predict_chunk(_obs(), np.zeros(4, np.float32), "t", caller_dict)
+    caller_dict["inference_delay"] = 999  # mutate after the call returns
+    assert b.last_rtc["inference_delay"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +318,15 @@ def test_specs_device_is_passed_through():
     b = FakePolicyBackend()
     b.load("/fake", device="mps", dtype="float32", rtc=None)
     assert b.specs.device == "mps"
+
+
+def test_specs_dtype_is_passed_through():
+    # load() takes a dtype and (per Task 8) deliberately doesn't apply it to
+    # the model; a specs/status reader has no other way to learn what
+    # precision is actually running unless load() records what it was told.
+    b = FakePolicyBackend()
+    b.load("/fake", device="cpu", dtype="bfloat16", rtc=None)
+    assert b.specs.dtype == "bfloat16"
 
 
 def test_specs_policy_type_is_fake():
