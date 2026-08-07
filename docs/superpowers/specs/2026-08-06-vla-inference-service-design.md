@@ -588,6 +588,41 @@ so upstream changing merge semantics breaks the build instead of the robot.
 Every layer above the integration line runs **without torch**, in milliseconds. That is the payoff
 for the `PolicyBackend` seam even while only one real backend ships.
 
+## Measured: inference latency (2026-08-07, phase 1)
+
+First real numbers, `lerobot/smolvla_base` on Apple Silicon via MPS:
+
+| | |
+|---|---|
+| `predict_chunk` latency | **~5.3 s** (10 Euler denoising steps) |
+| `n_action_steps` | 50 |
+| Chunk duration at `fps: 10` | 5.0 s of motion |
+| Load time | ~26 s cold (pulls the SmolVLM2-500M backbone), ~6 s warm |
+| Checkpoint dtype | **bfloat16** natively — weights are not float32 |
+| Image features | `observation.images.camera1/2/3`, each `[3, 256, 256]` |
+| `action_dim` / `state_dim` | 6 / 6 |
+
+**The Mac dev target cannot close the loop at 10 Hz.** Inference (5.3 s) slightly
+exceeds the motion a chunk buys (5.0 s), so:
+
+- **Sequential mode** stalls the arm for 5.3 s between chunks — it moves roughly
+  half the wall time, in 5-second freezes. Usable to prove plumbing, not to
+  demo behavior.
+- **RTC would not rescue it either.** `measured_delay ≈ ceil(5.3 / 0.1) = 53`
+  steps against a 50-step chunk, which is precisely the
+  `measured_delay >= chunk_length` starvation condition in the error table
+  above: every action gets trimmed away and the queue never fills.
+
+This does not change the architecture, but it does constrain the phasing: the
+hardware demo needs the x86+CUDA target, not the Mac. Three levers if a Mac demo
+is ever wanted — lower `fps` so a chunk buys more wall-clock time, reduce the
+policy's denoising steps (quality tradeoff), or use a smaller checkpoint.
+
+The bfloat16 finding retroactively justifies not casting weights: the model
+already runs mixed precision correctly (float32 inputs, bf16 parameters) with no
+dtype-mismatch error on MPS. A `policy.to(dtype=...)` cast would have broken a
+configuration that works by default.
+
 ## Phasing
 
 1. **Prove the plumbing.** Public `lerobot/smolvla_base` checkpoint, `infer` with synthetic images,
@@ -596,7 +631,8 @@ for the `PolicyBackend` seam even while only one real backend ships.
 2. **Sequential loop against a fake arm.** Full controller loop, measured fps, safety layer
    exercised.
 3. **Own recordings.** Record from a Viam arm so state/action conventions are controlled end to end,
-   then a real demo on hardware with conservative limits.
+   then a real demo on hardware with conservative limits. **Use the x86+CUDA target** — the
+   measured MPS latency above rules out a closed-loop Mac demo at 10 Hz.
 4. **RTC.** Enable after phase-3 latency is measured on the target device, since the delay math is
    only meaningful against real latency. Relative-action checkpoints stay refused until
    prefix re-anchoring is implemented.
