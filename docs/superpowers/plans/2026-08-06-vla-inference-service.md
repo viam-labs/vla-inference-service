@@ -1549,6 +1549,7 @@ class VLAPolicy(Generic, EasyResource):
         self._state = "idle"
         self._error: str | None = None
         self._load_task: asyncio.Task | None = None
+        self._generation = 0
 
     @classmethod
     def new(cls, config: ServiceConfig, dependencies: Mapping[Any, ResourceBase]) -> Self:
@@ -1573,11 +1574,21 @@ class VLAPolicy(Generic, EasyResource):
         self._backend = self._backend_factory()
         if self._load_task and not self._load_task.done():
             self._load_task.cancel()
-        self._load_task = asyncio.create_task(self._load())
+        # Cancelling only abandons the await. The resolver and backend.load run
+        # inside asyncio.to_thread, so the worker thread keeps downloading and
+        # keeps an executor slot. Bump a generation counter so a superseded load
+        # cannot write state after a newer one started; without this, a slow
+        # first load can overwrite the result of the config that replaced it.
+        self._generation += 1
+        self._load_task = asyncio.create_task(self._load(self._generation))
 
-    async def _load(self) -> None:
+    async def _load(self, generation: int) -> None:
         cfg = self._cfg
         assert cfg is not None
+
+        def _superseded() -> bool:
+            return generation != self._generation
+
         try:
             checkpoint = await asyncio.to_thread(resolve_checkpoint, cfg)
             rtc = cfg.rtc if cfg.rtc.enabled else None
@@ -1586,9 +1597,18 @@ class VLAPolicy(Generic, EasyResource):
             )
             for _ in range(cfg.warmup_inferences):
                 await asyncio.to_thread(self._warmup_once)
+            if _superseded():
+                LOGGER.info("discarding superseded load (generation %d)", generation)
+                return
             self._state = "ready"
             LOGGER.info("policy ready: %s", self._backend.specs)
-        except Exception as exc:  # noqa: BLE001 - surfaced through status
+        except VLAError as exc:
+            # Catch VLAError, not Exception: an AttributeError or TypeError is a
+            # bug in this module and should crash loudly rather than becoming a
+            # status="failed" string that looks like a user configuration error.
+            if _superseded():
+                LOGGER.info("ignoring failure from superseded load: %s", exc)
+                return
             self._state = "failed"
             self._error = str(exc)
             LOGGER.error("policy load failed: %s", exc)
