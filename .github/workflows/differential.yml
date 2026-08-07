@@ -1,0 +1,16 @@
+name: differential
+on: [push, pull_request]
+jobs:
+  action-queue-vs-upstream:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        lerobot: ["pinned", "main"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra lerobot
+      - name: Track lerobot main
+        if: matrix.lerobot == 'main'
+        run: uv pip install "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@main"
+      - run: uv run pytest -m differential -v
