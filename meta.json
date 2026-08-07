@@ -5,8 +5,8 @@
   "url": "https://github.com/viam-labs/viam-vla-inference-service",
   "description": "Run pre-trained LeRobot VLA policies (SmolVLA, Evo-1) on Viam machines",
   "build": {
-    "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && curl https://mise.run | sh",
-    "build": "mise run package",
+    "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && curl -fsSL https://mise.run | sh",
+    "build": "export PATH=\"$HOME/.local/bin:$PATH\" && mise run package",
     "path": "module.tar.gz",
     "arch": ["linux/arm64", "linux/amd64"]
   },

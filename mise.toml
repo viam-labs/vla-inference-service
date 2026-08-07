@@ -11,5 +11,5 @@ run = "uv run pytest -m 'not integration and not differential' -v"
 run = "uv run pytest -v"
 
 [tasks.package]
-run = "tar -czf module.tar.gz meta.json run.sh setup.sh dist"
+run = "tar -czf module.tar.gz meta.json run.sh setup.sh dist/*.whl"
 depends = ["build"]

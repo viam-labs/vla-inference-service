@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VENV_NAME="${VIAM_MODULE_DATA}/venv"
-export PATH=$PATH:$HOME/.local/bin
+VENV_NAME="${VIAM_MODULE_DATA:?must be set by viam-server}/venv"
+export PATH="$HOME/.local/bin:$PATH"
 
 if [ ! "$(command -v git)" ]; then
   echo "git is required to install the lerobot extra (a git+https:// direct reference)."
@@ -26,6 +26,7 @@ source "$VENV_NAME/bin/activate"
 # and the literal string is handed to uv.
 shopt -s nullglob
 WHEELS=(./dist/*.whl)
+shopt -u nullglob
 if [ ${#WHEELS[@]} -ne 1 ]; then
   echo "setup.sh: expected exactly 1 wheel in ./dist, found ${#WHEELS[@]}" >&2
   exit 1
