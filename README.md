@@ -128,9 +128,9 @@ backoff for up to `policy_ready_timeout_s`.
 | `gripper` | object | `{"type": "none"}` | Discriminated union — five variants, see below. |
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
-| `mode` | `auto` \| `sequential` \| `rtc` | `"auto"` | `rtc` is not implemented yet — see Limitations. `auto` and `sequential` both currently run the sequential loop. |
-| `queue_threshold` | integer | `30` | Reserved for the RTC scheduler; unused by the sequential loop shipped today. |
-| `starvation_grace_ticks` | integer | `3` | Consecutive tick failures tolerated (when `safety.stop_on_error` is `false`) before the loop halts regardless. |
+| `mode` | `auto` \| `sequential` \| `async` \| `rtc` | `"auto"` | `rtc` is not implemented yet — see Limitations. `auto` resolves to `sequential`, unchanged from before `async` existed — `async` is explicit opt-in only, never a default, so an existing deployment's behavior never changes underneath it. See Performance for when to reach for `async`. |
+| `queue_threshold` | integer | `30` | Consumed by `mode: "async"`: refill fires in the background once the queue has this many or fewer actions left. Unused by `sequential`. |
+| `starvation_grace_ticks` | integer | `3` | Two related bounds sharing one field: (1) consecutive tick *failures* tolerated (when `safety.stop_on_error` is `false`) before the loop halts regardless; (2) under `mode: "async"`, consecutive *empty* ticks (queue drained, inference still in flight) tolerated before the loop halts unconditionally — not gated by `stop_on_error`, since an empty tick is not a failure to skip. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
 | `state_units` | `degrees` \| `radians` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see Limitations. |
 | `action_units` | `degrees` \| `radians` | `"degrees"` | Unit the policy's action is expressed in. |
@@ -329,21 +329,42 @@ Measured on Apple Silicon (MPS), `lerobot/smolvla_base`:
 | `n_action_steps` | 50 |
 | Motion a chunk buys at `fps: 10` | 5.0 s |
 
-**Inference is slower than the motion it produces on Apple Silicon.** A 10 Hz sequential
-loop stalls the arm for ~5.3 s between chunks — it moves roughly half the wall-clock
-time, in 5-second freezes. That is enough to prove the plumbing (see the integration
-test), but **not** to run a real closed-loop demo. There is no fix within this
-architecture for the Mac target: lower `fps` (a chunk buys more wall-clock time per
-inference), a smaller/faster checkpoint, or fewer denoising steps would all help, but
-**the practical answer is to use the x86+CUDA target for anything resembling a live
-demo.**
+**Inference is slower than the motion it produces on Apple Silicon.** `mode: "sequential"`
+stalls the arm for ~5.3 s between chunks — it moves roughly half the wall-clock time, in
+5-second freezes.
+
+**`mode: "async"` is the recommended mode whenever inference latency approaches or
+exceeds chunk duration**, exactly the case measured here. It overlaps execution with
+inference instead of stalling: the current chunk keeps running while the next one infers
+in the background, merged in append mode once it lands. Duty cycle goes from ~50% (in
+multi-second freezes) to ~94% (in ~0.3 s hitches at each chunk boundary) at these
+measured numbers. RTC cannot do this job instead — RTC needs `delay < chunk_length` to
+function at all, and here `delay` (~53 steps) exceeds `chunk_length` (50 steps), so RTC
+would discard the entire chunk on every merge (permanent starvation). See
+`AsyncScheduler`'s docstring in `src/vla/controller/scheduler.py` for the full
+concurrency contract and the discontinuity-at-chunk-boundary tradeoff it accepts in
+exchange.
+
+That tradeoff is why `async` is explicit opt-in rather than a default: it is unambiguously
+better than `sequential` whenever this latency relationship holds, but a deployment
+running comfortably inside its chunk budget has no reason to accept a seam it does not
+need. Other levers still apply if you want to avoid the stall/hitch tradeoff entirely:
+lower `fps` (a chunk buys more wall-clock time per inference), a smaller/faster
+checkpoint, or fewer denoising steps. **For anything resembling a live demo, the x86+CUDA
+target remains the practical answer** — the numbers above are Mac-specific, and `async`
+narrows the gap without pretending to close it as well as faster hardware would.
 
 ## Limitations
 
 - **`mode: "rtc"` is not implemented.** `ActionQueue` supports RTC mode and is
-  differentially tested against upstream, but the async scheduler, two-delay
-  bookkeeping, and `prev_chunk_left_over` wiring are a follow-up plan. Configuring
-  `mode: "rtc"` raises at `start`.
+  differentially tested against upstream, but `RTCScheduler`, two-delay bookkeeping, and
+  `prev_chunk_left_over` wiring are a follow-up plan — deferred until CUDA latency is
+  measured, since RTC needs `delay < chunk_length` to function at all (on the measured
+  Apple Silicon numbers, `delay > chunk_length`, so it could not be validated there even
+  if implemented). Configuring `mode: "rtc"` raises at `start`. `mode: "async"` (see
+  Performance) is the currently-shipped answer to slow inference; it is a plain overlap,
+  not RTC, and does not smooth the seam at each chunk boundary the way RTC eventually
+  would.
 - **`state_units`/`action_units: "normalized"` is unsupported.** It needs a source of
   per-joint min/max (dataset stats vs. explicit config) that is an open design question.
   Only `degrees` and `radians` are accepted.

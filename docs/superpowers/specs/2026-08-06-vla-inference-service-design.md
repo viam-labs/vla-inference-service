@@ -499,8 +499,17 @@ it.
 - **`ActionQueue`** — mechanical numpy port of the upstream class, **same method names** so upstream
   diffs stay reviewable. `.clone()` → `.copy()`, `torch.cat` → `np.concatenate`.
 - **`SequentialScheduler`** — append mode; blocking `infer` when the queue drains. Phase 1.
+- **`AsyncScheduler`** (Task 22, added after the measured-latency finding below) — background
+  task; when `qsize() <= queue_threshold` and none is already in flight, fire `infer` and return
+  immediately with the next queued action. Merges in **append** mode with `real_delay=0` (not RTC
+  semantics). Returns `None` — never blocks — when the queue is empty and an inference is already
+  in flight; the controller holds position for `starvation_grace_ticks` ticks, then halts. Exactly
+  one inference in flight at a time; a background failure is captured and re-raised, wrapped as
+  `SchedulerError`, from the next `next_action()` call.
 - **`RTCScheduler`** — background task; when `qsize() <= queue_threshold`, fire `infer` with the
-  predicted delay; merge on return with the measured delay. Delay math exactly as upstream.
+  predicted delay; merge on return with the measured delay. Delay math exactly as upstream. Still
+  deferred (see Phasing) until CUDA latency is measured, since it needs `delay < chunk_length` to
+  function at all.
 
 ### Data flow
 
@@ -650,12 +659,26 @@ exceeds the motion a chunk buys (5.0 s), so:
 - **RTC would not rescue it either.** `measured_delay ≈ ceil(5.3 / 0.1) = 53`
   steps against a 50-step chunk, which is precisely the
   `measured_delay >= chunk_length` starvation condition in the error table
-  above: every action gets trimmed away and the queue never fills.
+  above: every action gets trimmed away and the queue never fills. RTC is a
+  seam-*smoothing* mechanism that needs `delay < chunk_length` to function at
+  all; it is not a latency-*hiding* one, so no amount of RTC tuning fixes this
+  case.
+- **Resolution (Task 22): `AsyncScheduler`.** Plain overlap — keep executing the
+  current chunk while the next one infers in the background, merged in append
+  mode — does not have RTC's `delay < chunk_length` requirement, because it
+  never discards anything on the strength of a delay computation. Duty cycle
+  goes from ~50% (5.3 s freezes) to ~94% (0.3 s hitches at each chunk
+  boundary). The honest cost is a discontinuity at each boundary that RTC
+  would otherwise smooth; the safety layer's delta clamp bounds it to one
+  tick's budget. See `AsyncScheduler`'s docstring in `scheduler.py` and the
+  README's Performance section for the full tradeoff.
 
 This does not change the architecture, but it does constrain the phasing: the
-hardware demo needs the x86+CUDA target, not the Mac. Three levers if a Mac demo
-is ever wanted — lower `fps` so a chunk buys more wall-clock time, reduce the
-policy's denoising steps (quality tradeoff), or use a smaller checkpoint.
+hardware demo needs the x86+CUDA target, not the Mac. `mode: "async"` narrows
+the gap on the Mac target without closing it as well as faster hardware would.
+Other levers if a Mac demo is ever wanted — lower `fps` so a chunk buys more
+wall-clock time, reduce the policy's denoising steps (quality tradeoff), or use
+a smaller checkpoint.
 
 The bfloat16 finding retroactively justifies not casting weights: the model
 already runs mixed precision correctly (float32 inputs, bf16 parameters) with no
@@ -672,9 +695,18 @@ configuration that works by default.
 3. **Own recordings.** Record from a Viam arm so state/action conventions are controlled end to end,
    then a real demo on hardware with conservative limits. **Use the x86+CUDA target** — the
    measured MPS latency above rules out a closed-loop Mac demo at 10 Hz.
-4. **RTC.** Enable after phase-3 latency is measured on the target device, since the delay math is
-   only meaningful against real latency. Relative-action checkpoints stay refused until
-   prefix re-anchoring is implemented.
+4. **`AsyncScheduler` (Task 22, shipped).** Motivated directly by the phase-1 measurement above:
+   overlaps execution with inference instead of stalling, `mode: "async"`, explicit opt-in. Not
+   RTC — a plain overlap that accepts a bounded discontinuity at each chunk boundary rather than
+   smoothing it.
+5. **RTC.** Still deferred, unlike `AsyncScheduler` above: enable only after CUDA latency is
+   measured on the target device, since RTC's delay math needs `delay < chunk_length` to function
+   at all, and the phase-1 measurement shows `delay > chunk_length` on the Mac target (RTC would
+   discard the entire chunk on every merge there — not merely be less effective, but starve
+   permanently). CUDA latency has not been measured; until it is, there is no evidence RTC's
+   precondition holds anywhere this module runs, so it stays a follow-up rather than shipping
+   speculatively. Relative-action checkpoints stay refused under RTC until prefix re-anchoring is
+   implemented, independent of the latency question.
 
 ## Open questions
 
