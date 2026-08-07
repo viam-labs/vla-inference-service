@@ -264,7 +264,7 @@ No dependencies. `validate()` returns `([], [])`.
 | command | input | output |
 |---|---|---|
 | `infer` | `images{key→b64}`, `state[]`, `task`, optional `rtc{inference_delay, prev_chunk_left_over}` | `actions[][]`, `raw_actions[][]`, `latency_s` |
-| `specs` | — | `policy_type`, `input_features`, `output_features`, `n_action_steps`, `action_dim`, `supports_rtc`, `rtc_enabled`, `device` |
+| `specs` | — | `policy_type`, `input_features`, `output_features`, `n_action_steps`, `action_dim`, `supports_rtc`, `rtc_enabled`, `relative_actions`, `device` |
 | `status` | — | `loading` \| `ready` \| `failed`, `error` |
 | `reset` | — | clears cached state |
 
@@ -281,7 +281,19 @@ configured `execution_horizon`, matching `_normalize_prev_actions_length`
 shrinks `execution_horizon` to the leftover's length when the leftover is shorter, which silently
 changes `get_prefix_weights` and therefore the guidance applied. Because `execution_horizon` is
 config-only, the controller *cannot* perform this step — it does not know the value — so the
-backend must, and the controller sends the raw leftover at whatever length its queue holds.
+backend must, and the controller sends the raw leftover at whatever length its queue holds. The
+normalization itself is a pure numpy helper the backend calls, so it stays testable without torch.
+
+**Relative-action checkpoints are refused, not silently mishandled.** When a preprocessor contains
+an enabled `RelativeActionsProcessorStep`, upstream re-anchors the prefix against the cached raw
+state via `reanchor_relative_rtc_prefix`, using the **processed** leftover
+(`queue.get_processed_left_over()`) rather than the policy-space one, *before* length normalization
+(`rollout/inference/rtc.py:159-176, 305-319`). This design's leftover path is absolute-action only.
+So the backend detects the step at load, surfaces `relative_actions` in `specs`, and `mode: rtc`
+**errors on such a checkpoint** rather than sending an un-rebased prefix — which would apply
+guidance in the wrong coordinate frame and produce plausible-looking but wrong motion. Sequential
+mode is unaffected. Implementing re-anchoring later is tractable because the `ActionQueue` port
+already carries `get_processed_left_over()`.
 
 **The response carries both `actions` and `raw_actions`** because `ActionQueue` maintains two
 parallel arrays: `original_queue` in policy space (feeds `prev_chunk_left_over`) and `queue` in
@@ -355,9 +367,8 @@ per gripper block).
 selection and the image resize target — but the policy answers with a "model loading" error until a
 possibly multi-GB download completes, which is the *normal* case on first boot. So controller
 `reconfigure()` never fails on a loading policy: it stores config, returns, and fetches `specs`
-lazily on the first `start`, polling `status` with backoff up to `policy_ready_timeout_s`
-(default 600). `start` returns a clear "policy still loading" error if the timeout expires; `status`
-reports `waiting_for_policy`. Making `reconfigure` depend on the policy being warm would leave the
+lazily after the first `start`, polling `status` with backoff up to `policy_ready_timeout_s`
+(default 600) in the background while reporting `waiting_for_policy`. Making `reconfigure` depend on the
 machine in a config-error state every cold boot.
 
 **RTC enablement lives only on the policy service.** The controller has no `rtc.enabled` flag; on
@@ -413,13 +424,29 @@ like every other joint. For `gripper/inputs` and `gripper/threshold` it is norma
 that same normalized range onto `min_deg`–`max_deg`. `close_threshold` is compared against the
 normalized value.
 
+**The degrees-based safety clamps skip the normalized gripper channel.** `max_joint_delta_degs` and
+`joint_limits_degs` are meaningful for `arm_joint` (where the gripper *is* a joint in degrees) but
+not for `servo`, `gripper/inputs`, or `gripper/threshold`, where the channel is `0.0`–`1.0`. In
+those modes the gripper dimension is clamped to `[0, 1]` instead, and `joint_limits_degs` carries no
+trailing gripper pair. Leaving degree limits nominally "applied" to a 0–1 channel would mean they
+never fire — a limit that silently does nothing is worse than one that is explicitly absent.
+
 ### DoCommand surface
 
 | command | input | output |
 |---|---|---|
-| `start` | optional `task`, `fps` | ack |
+| `start` | optional `task`, `fps` | ack, immediately |
 | `stop` | — | ack |
-| `status` | — | `running`, `mode`, `queue_size`, `avg_latency_s`, `measured_fps`, `clamp_counts`, `last_error` |
+| `status` | — | `state`, `mode`, `queue_size`, `avg_latency_s`, `measured_fps`, `clamp_counts`, `last_error` |
+
+`start` **acks immediately** rather than blocking on the policy. Waiting out
+`policy_ready_timeout_s` (default 600 s) inline would exceed the deadline most DoCommand callers
+use, so the "still loading" error would never reach anyone. Instead `start` transitions to
+`waiting_for_policy` and the timeout, if it expires, lands in `last_error` where `status` can report
+it.
+
+`state` is `idle` | `waiting_for_policy` | `running` | `stopped` | `error`. `mode` reports the
+*configured* value until `specs` resolves it, then the resolved one — `status` labels which.
 
 ### Scheduler
 
@@ -502,10 +529,15 @@ Applied in order:
    a stalled arm cannot accumulate an ever-growing command.
 4. Joint limit clamp from the **optional** `safety.joint_limits_degs` config. **The list is indexed
    in action-vector order** — one `[min, max]` pair per action dimension, in the same order the
-   policy emits and `state_joint_indices` defines, with the gripper's pair last when a gripper block
-   is active. It is *not* indexed by Viam joint order. `validate()` enforces
-   `len(joint_limits_degs) == len(state_joint_indices) + (1 if gripper else 0)` and fails
-   configuration otherwise, because a silent off-by-one here clamps the wrong joint. The clamp runs
+   policy emits and `state_joint_indices` defines, with a trailing gripper pair **only** when
+   `gripper.type == "arm_joint"` (the sole mode whose gripper channel is in degrees). It is *not*
+   indexed by Viam joint order. `validate()` enforces
+   `len(joint_limits_degs) == len(state_joint_indices) + (1 if gripper.type == "arm_joint" else 0)`
+   and fails configuration otherwise, because a silent off-by-one here clamps the wrong joint. That
+   rule is a proxy: `action_dim` is unknowable at validate time, so once `specs` resolves, the
+   controller additionally cross-checks the total against `specs.action_dim` and refuses to `start`
+   on a mismatch. If the checkpoint emits a gripper channel while `gripper.type == "none"`, that is
+   an error rather than a silent trailing-dimension drop. The clamp runs
    after `action_units → degrees` and before `JointPositions` is built. When absent, this
    layer is skipped and a warning is logged once at start, naming the arm as the sole limit
    authority. Limits are *not* read from `arm.get_kinematics()`: that returns raw URDF or SVA bytes,
@@ -544,7 +576,7 @@ so upstream changing merge semantics breaks the build instead of the robot.
 | Mapping | degrees↔radians↔normalized, joint remap, 5 gripper variants, resize/encode | — |
 | Safety | clamp ordering, NaN rejection, start-delta refusal, skipped limit layer when `joint_limits_degs` absent, `MoveOptions` omits unconfigured fields rather than zero-filling | — |
 | `policy` service | full DoCommand surface, RTC field plumbing, error paths, loading states | `FakePolicyBackend` |
-| `controller` | loop timing, starvation, stop-on-error, reconfigure-while-running | fake arm/camera/policy |
+| `controller` | loop timing, starvation, stop-on-error, reconfigure-while-running, cold-policy `start` → `waiting_for_policy` → `running`, `action_dim` mismatch refusal, `mode: rtc` refusing a `relative_actions` checkpoint | fake arm/camera/policy |
 | Integration, no robot | real `lerobot/smolvla_base`: chunk shape `[n_action_steps, action_dim]`, finite values, RTC kwargs demonstrably change output | checkpoint |
 | Integration, fake arm | full loop sustains target fps | checkpoint |
 | Hardware smoke | documented manual checklist, conservative limits | hardware |
@@ -562,7 +594,8 @@ for the `PolicyBackend` seam even while only one real backend ships.
 3. **Own recordings.** Record from a Viam arm so state/action conventions are controlled end to end,
    then a real demo on hardware with conservative limits.
 4. **RTC.** Enable after phase-3 latency is measured on the target device, since the delay math is
-   only meaningful against real latency.
+   only meaningful against real latency. Relative-action checkpoints stay refused until
+   prefix re-anchoring is implemented.
 
 ## Open questions
 
