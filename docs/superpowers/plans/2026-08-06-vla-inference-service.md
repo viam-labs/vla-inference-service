@@ -38,9 +38,9 @@ Use @superpowers:test-driven-development throughout. Every task is red → green
 
 ```
 src/
-  main.py                              entrypoint; registers both models
   vla/
     __init__.py
+    main.py                            entrypoint (must live under vla/ to be packaged)
     wire.py                            shared wire codec (images, float matrices)
     policy/
       __init__.py
@@ -62,16 +62,18 @@ src/
       scheduler.py                     ChunkScheduler ABC + SequentialScheduler
       service.py                       viam-labs:vla:controller resource
 tests/
+  fakes.py                             fake arm/camera/gripper/servo
   test_wire.py
+  test_integration_full_loop.py        real checkpoint + fake robot
   policy/
-    test_config.py  test_resolver.py  test_prefix.py  test_service.py
+    test_config.py  test_resolver.py  test_prefix.py
+    test_fake_backend.py  test_service.py
     test_lerobot_backend_integration.py
   controller/
     test_config.py  test_units.py  test_action_queue.py
     test_action_queue_differential.py
     test_gripper.py  test_safety.py  test_observation.py
     test_scheduler.py  test_service.py
-  fakes.py                             fake arm/camera/gripper/policy-client
 ```
 
 Why this split: `policy/` and `controller/` never import each other — they communicate only through the wire format in `wire.py`. Everything in `controller/` is pure numpy and can be tested with no model present. `lerobot_backend.py` is the only file that imports `lerobot`, and it does so lazily inside methods.
@@ -91,7 +93,6 @@ Why this split: `policy/` and `controller/` never import each other — they com
 name = "viam-vla-inference-service"
 version = "0.1.0"
 description = "Run pre-trained LeRobot VLA policies on Viam machines"
-readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "viam-sdk>=0.80.0",
@@ -110,6 +111,7 @@ dev = ["pytest>=8.0.0", "pytest-asyncio>=0.24.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
 testpaths = ["tests"]
 markers = [
     "integration: requires a real checkpoint and torch (deselect with '-m \"not integration\"')",
@@ -125,6 +127,10 @@ build-backend = "hatchling.build"
 ```
 
 `requires-python = ">=3.12"` is not arbitrary — LeRobot `main` requires it, and a 3.11 venv fails to resolve.
+
+`readme` is deliberately omitted: hatchling raises `OSError: Readme file does not exist` and aborts `uv sync` when the key points at a file that does not exist yet. Task 20 adds the key together with the file.
+
+`packages = ["src/vla"]` means **everything shipped must live under `src/vla/`**, including the entrypoint — hence `src/vla/main.py` in Task 18, not `src/main.py`. A wheel built from this config contains only `vla/`, so a top-level `main.py` would be missing at runtime and `run.sh` would fail with `ModuleNotFoundError`.
 
 - [ ] **Step 2: Create `mise.toml`**
 
@@ -158,7 +164,7 @@ VENV_NAME="${VIAM_MODULE_DATA}/venv"
 PYTHON="$VENV_NAME/bin/python"
 
 echo "Starting module..."
-exec $PYTHON -m main $@
+exec $PYTHON -m vla.main $@
 ```
 
 `setup.sh`:
@@ -180,7 +186,12 @@ fi
 
 uv venv --python 3.12 $VENV_NAME
 source $VENV_NAME/bin/activate
-uv pip install "./dist/"*.whl[lerobot] -q
+
+# Resolve the wheel path first: "./dist/"*.whl[lerobot] does not work, because
+# bash reads [lerobot] as a glob character class, the pattern matches nothing,
+# and the literal string is handed to uv.
+WHEEL=$(ls ./dist/*.whl | head -1)
+uv pip install "${WHEEL}[lerobot]" -q
 ```
 
 - [ ] **Step 4: Create `meta.json`**
@@ -216,7 +227,12 @@ uv pip install "./dist/"*.whl[lerobot] -q
 }
 ```
 
-- [ ] **Step 5: Create `.gitignore` and package markers**
+- [ ] **Step 5: Make the scripts executable**
+
+Run: `chmod +x run.sh setup.sh`
+`meta.json` points `entrypoint` at `./run.sh`, so a non-executable file fails at deploy time, not build time.
+
+- [ ] **Step 6: Create `.gitignore` and package markers**
 
 `.gitignore`:
 ```
@@ -230,12 +246,12 @@ module.tar.gz
 
 Create empty `src/vla/__init__.py` and `tests/__init__.py`.
 
-- [ ] **Step 6: Verify the toolchain works**
+- [ ] **Step 7: Verify the toolchain works**
 
 Run: `uv sync && uv run pytest -v`
 Expected: `no tests ran` and exit code 5. That is success — it proves the venv resolves and pytest is wired up.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
@@ -891,7 +907,7 @@ Expected: FAIL — no module named `vla.policy.backend`
 from __future__ import annotations
 
 import abc
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -906,6 +922,7 @@ class PolicySpecs:
     n_action_steps: int
     input_features: dict[str, list[int]]
     output_features: dict[str, list[int]]
+    image_feature_keys: list[str]
     supports_rtc: bool
     rtc_enabled: bool
     relative_actions: bool
@@ -918,6 +935,7 @@ class PolicySpecs:
             "n_action_steps": self.n_action_steps,
             "input_features": self.input_features,
             "output_features": self.output_features,
+            "image_feature_keys": self.image_feature_keys,
             "supports_rtc": self.supports_rtc,
             "rtc_enabled": self.rtc_enabled,
             "relative_actions": self.relative_actions,
@@ -1003,6 +1021,7 @@ class FakePolicyBackend(PolicyBackend):
             input_features={"observation.images.top": [3, h, w],
                             "observation.state": [self._action_dim]},
             output_features={"action": [self._action_dim]},
+            image_feature_keys=["observation.images.top"],
             supports_rtc=self._supports_rtc,
             rtc_enabled=bool(rtc and getattr(rtc, "enabled", False)),
             relative_actions=self._relative_actions,
@@ -1146,6 +1165,9 @@ Read `/Users/nick.hehr/src/viam-python-sdk/src/viam/services/generic/generic.py`
 
 ```python
 import asyncio
+import threading
+import time
+
 import numpy as np
 import pytest
 from viam.proto.app.robot import ServiceConfig
@@ -1185,21 +1207,30 @@ def test_validate_rejects_missing_source():
 
 
 async def test_reconfigure_returns_before_load_completes(tmp_path):
+    """reconfigure must not block on a slow load, or viam-server can time out."""
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "model.safetensors").write_text("{}")
     svc = VLAPolicy("p")
-    slow = asyncio.Event()
+    release = threading.Event()
 
     class SlowBackend(FakePolicyBackend):
         def load(self, *a, **k):
-            slow.wait_flag = True
+            if not release.wait(timeout=5):
+                raise AssertionError("load was never released")
             super().load(*a, **k)
 
     svc._backend_factory = SlowBackend
+
+    started = time.perf_counter()
     svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
-    # reconfigure must not block on loading
-    status = await svc.do_command({"command": "status"})
-    assert status["state"] in ("loading", "ready")
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5, f"reconfigure blocked for {elapsed:.2f}s"
+    assert (await svc.do_command({"command": "status"}))["state"] == "loading"
+
+    release.set()
+    await svc.await_ready()
+    assert (await svc.do_command({"command": "status"}))["state"] == "ready"
 
 
 async def test_infer_before_ready_errors(tmp_path):
@@ -1291,16 +1322,16 @@ from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 import numpy as np
 from typing_extensions import Self
-from viam.module.types import Reconfigurable
-from viam.proto.app.robot import ComponentConfig, ServiceConfig
+from viam.proto.app.robot import ServiceConfig
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
+from viam.utils import struct_to_dict
 
 from ..wire import decode_image, decode_matrix, encode_matrix
 from .backend import PolicyBackend
-from .config import ConfigError, PolicyConfig
+from .config import PolicyConfig
 from .lerobot_backend import LeRobotBackend
 from .resolver import resolve_checkpoint
 
@@ -1326,8 +1357,8 @@ class VLAPolicy(Generic, EasyResource):
         return svc
 
     @classmethod
-    def validate_config(cls, config: ServiceConfig) -> Sequence[str]:
-        PolicyConfig.parse(dict(config.attributes.fields_to_dict()))
+    def validate_config(cls, config: ServiceConfig) -> tuple[Sequence[str], Sequence[str]]:
+        PolicyConfig.parse(struct_to_dict(config.attributes))
         return [], []
 
     def reconfigure(self, config: ServiceConfig, dependencies) -> None:
@@ -1336,7 +1367,7 @@ class VLAPolicy(Generic, EasyResource):
         Loading must not block: a multi-GB hub download here would stall the
         module's reconfigure loop and can trip viam-server timeouts.
         """
-        self._cfg = PolicyConfig.parse(dict(config.attributes.fields_to_dict()))
+        self._cfg = PolicyConfig.parse(struct_to_dict(config.attributes))
         self._state = "loading"
         self._error = None
         self._backend = self._backend_factory()
@@ -1368,10 +1399,8 @@ class VLAPolicy(Generic, EasyResource):
         if specs is None:
             return
         images = {}
-        for key, shape in specs.input_features.items():
-            if not key.startswith("observation.images."):
-                continue
-            c, h, w = shape
+        for key in specs.image_feature_keys:
+            c, h, w = specs.input_features[key]
             images[key] = np.zeros((h, w, c), dtype=np.uint8)
         state = np.zeros(specs.action_dim, dtype=np.float32)
         self._backend.predict_chunk(images, state, "warmup", None)
@@ -1490,18 +1519,19 @@ def test_specs_are_populated(backend):
     s = backend.specs
     assert s.policy_type == "smolvla"
     assert s.action_dim > 0
-    assert s.n_action_steps > 0
+    assert s.n_action_steps == 50
     assert s.supports_rtc is True
-    assert any(k.startswith("observation.images.") for k in s.input_features)
+    # smolvla_base declares observation.images.camera1/2/3
+    assert len(s.image_feature_keys) == 3
+    assert all(k in s.input_features for k in s.image_feature_keys)
 
 
 def test_predict_chunk_returns_finite_chunk(backend):
     s = backend.specs
     images = {}
-    for key, shape in s.input_features.items():
-        if key.startswith("observation.images."):
-            c, h, w = shape
-            images[key] = np.zeros((h, w, c), dtype=np.uint8)
+    for key in s.image_feature_keys:
+        c, h, w = s.input_features[key]
+        images[key] = np.zeros((h, w, c), dtype=np.uint8)
     state = np.zeros(s.action_dim, dtype=np.float32)
 
     actions, raw = backend.predict_chunk(images, state, "pick up the red block", None)
@@ -1553,16 +1583,6 @@ def _select_device(requested: str) -> str:
     return "cpu"
 
 
-def _select_dtype(requested: str, device: str):
-    import torch
-
-    if requested == "auto":
-        # MPS bfloat16 support is uneven; float32 is the safe default off CUDA.
-        return torch.bfloat16 if device == "cuda" else torch.float32
-    return {"float32": torch.float32, "bfloat16": torch.bfloat16,
-            "float16": torch.float16}[requested]
-
-
 class LeRobotBackend(PolicyBackend):
     def __init__(self) -> None:
         self._policy = None
@@ -1585,8 +1605,17 @@ class LeRobotBackend(PolicyBackend):
         policy = policy_cls.from_pretrained(checkpoint_dir, config=cfg)
 
         resolved_device = _select_device(device)
-        policy.to(resolved_device, dtype=_select_dtype(dtype, resolved_device))
+        policy.to(resolved_device)
         policy.eval()
+
+        if dtype != "auto":
+            # Deliberately not applied. Casting weights with `policy.to(dtype=...)`
+            # leaves the preprocessor emitting float32 (its serialized
+            # DeviceProcessorStep.float_dtype is None), producing
+            # "expected scalar type BFloat16 but found Float". Upstream never
+            # casts weights; it uses torch.autocast gated on config.use_amp.
+            # Wiring that up is deferred - see "Deferred to follow-up plans".
+            LOGGER.warning("dtype=%s is not yet applied; running in the checkpoint's dtype", dtype)
 
         supports_rtc = bool(policy.supports_rtc())
         if rtc is not None and rtc.enabled:
@@ -1597,7 +1626,20 @@ class LeRobotBackend(PolicyBackend):
                 self._rtc_enabled = True
                 self._execution_horizon = rtc.execution_horizon
 
-        preprocessor, postprocessor = make_pre_post_processors(cfg, pretrained_path=checkpoint_dir)
+        # The device override is mandatory, not cosmetic. With `pretrained_path`,
+        # the processor pipeline is deserialized from the checkpoint including a
+        # DeviceProcessorStep carrying the *training* device. Its __post_init__
+        # calls get_safe_torch_device, which RAISES rather than falling back
+        # (device_utils.py:48) - so a CUDA-trained checkpoint fails outright on
+        # the Apple Silicon dev machine. Even when it does not raise, the
+        # preprocessor would move tensors to a different device than the model.
+        device_override = {"device": resolved_device}
+        preprocessor, postprocessor = make_pre_post_processors(
+            cfg,
+            pretrained_path=checkpoint_dir,
+            preprocessor_overrides={"device_processor": device_override},
+            postprocessor_overrides={"device_processor": {"device": "cpu"}},
+        )
 
         self._policy = policy
         self._preprocessor = preprocessor
@@ -1619,7 +1661,11 @@ class LeRobotBackend(PolicyBackend):
             enabled=True,
             execution_horizon=rtc.execution_horizon,
             max_guidance_weight=rtc.max_guidance_weight,
-            prefix_attention_schedule=RTCAttentionSchedule(rtc.prefix_attention_schedule),
+            # RTCAttentionSchedule members are UPPERCASE ("LINEAR", "EXP",
+            # "ONES", "ZEROS"); config accepts the lowercase spelling.
+            prefix_attention_schedule=RTCAttentionSchedule(
+                rtc.prefix_attention_schedule.upper()
+            ),
         )
         policy.init_rtc_processor()
 
@@ -1638,12 +1684,17 @@ class LeRobotBackend(PolicyBackend):
         input_features = {k: list(v.shape) for k, v in cfg.input_features.items()}
         output_features = {k: list(v.shape) for k, v in cfg.output_features.items()}
         action_dim = int(output_features["action"][0])
+        # Classify on FeatureType.VISUAL rather than a key-prefix guess: the
+        # naming is a checkpoint's choice (smolvla_base uses
+        # observation.images.camera1/2/3), the feature type is not.
+        image_keys = sorted(cfg.image_features.keys())
         return PolicySpecs(
             policy_type=cfg.type,
             action_dim=action_dim,
             n_action_steps=int(cfg.n_action_steps),
             input_features=input_features,
             output_features=output_features,
+            image_feature_keys=image_keys,
             supports_rtc=supports_rtc,
             rtc_enabled=self._rtc_enabled,
             relative_actions=self._detect_relative_actions(preprocessor),
@@ -2771,7 +2822,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -2955,17 +3006,35 @@ async def test_camera_failure_fails_the_whole_tick():
 
 
 async def test_cameras_are_read_concurrently():
-    cams = {f"observation.images.c{i}": FakeCamera() for i in range(3)}
-    b = _builder(cameras=cams,
-                 image_sizes={k: (224, 224) for k in cams})
+    # Serial reads would take ~3x one camera's latency. At 10 Hz the whole
+    # tick budget is 100 ms, so this is a real constraint, not a nicety.
+    import asyncio as _asyncio
+
+    class SlowCamera(FakeCamera):
+        async def get_image(self, *a, **k):
+            await _asyncio.sleep(0.05)
+            return await super().get_image(*a, **k)
+
+    cams = {f"observation.images.c{i}": SlowCamera() for i in range(3)}
+    b = _builder(cameras=cams, image_sizes={k: (224, 224) for k in cams})
+
     obs = await b.build()
+
     assert len(obs.images) == 3
     assert all(c.reads == 1 for c in cams.values())
+    assert obs.duration_s < 0.12, f"reads look serial: {obs.duration_s:.3f}s for 3x50ms"
 
 
-async def test_timestamp_and_duration_recorded():
-    obs = await _builder().build()
-    assert obs.duration_s >= 0
+async def test_duration_reflects_actual_assembly_time():
+    import asyncio as _asyncio
+
+    class SlowCamera(FakeCamera):
+        async def get_image(self, *a, **k):
+            await _asyncio.sleep(0.05)
+            return await super().get_image(*a, **k)
+
+    obs = await _builder(cameras={"observation.images.top": SlowCamera()}).build()
+    assert obs.duration_s >= 0.05
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -3303,6 +3372,11 @@ class SequentialScheduler(ChunkScheduler):
         return self._queue.qsize()
 ```
 
+Note this scheduler never returns `None` — it raises instead. The controller's
+`starvation_grace_ticks` branch is therefore unreachable in phases 1–2; it exists
+for `RTCScheduler`, where a background thread can genuinely leave the queue empty
+for a tick. Keep the branch and its config field rather than adding them later.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `uv run pytest tests/controller/test_scheduler.py -v`
@@ -3436,7 +3510,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .gripper import GRIPPER_TYPES, GripperConfigError
+from .gripper import GRIPPER_TYPES
 
 MODES = ("auto", "sequential", "rtc")
 ENCODINGS = ("jpeg", "png", "raw")
@@ -3642,8 +3716,10 @@ class FakePolicyClient:
                 "policy_type": "fake",
                 "action_dim": self.action_dim,
                 "n_action_steps": self.n,
-                "input_features": {"observation.images.top": [3, 224, 224]},
+                "input_features": {"observation.images.top": [3, 224, 224],
+                                   "observation.state": [self.action_dim]},
                 "output_features": {"action": [self.action_dim]},
+                "image_feature_keys": ["observation.images.top"],
                 "supports_rtc": self.supports_rtc,
                 "rtc_enabled": False,
                 "relative_actions": self.relative,
@@ -3741,14 +3817,30 @@ async def test_arm_commanded_via_move_through_joint_positions_with_options():
 
 
 async def test_unset_move_options_fields_are_omitted_not_zeroed():
+    # An unset scalar reads back as 0.0, indistinguishable from an explicit
+    # zero, which would tell the arm not to move. Setting only acceleration
+    # must leave velocity genuinely absent.
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(config=_config(safety={"max_start_delta_degs": 1000.0,
+                                      "max_acc_degs_per_sec2": 100.0}),
+               deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.2)
+    await svc.do_command({"command": "stop"})
+    _, options = arm.moves[0]
+    assert options.HasField("max_acc_degs_per_sec2")
+    assert not options.HasField("max_vel_degs_per_sec")
+    assert not options.HasField("max_tcp_speed")
+
+
+async def test_no_safety_ceilings_means_no_move_options():
     arm = FakeArm(positions=[0.0] * 6)
     svc = _svc(deps=_deps(arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.2)
     await svc.do_command({"command": "stop"})
     _, options = arm.moves[0]
-    if options is not None:
-        assert not options.HasField("max_vel_degs_per_sec")
+    assert options is None
 
 
 async def test_stop_halts_the_loop():
@@ -3868,12 +3960,13 @@ from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
+from viam.utils import struct_to_dict
 
-from ..wire import decode_matrix, encode_matrix
+from ..wire import decode_matrix
 from .config import ControllerConfig
 from .gripper import make_gripper_adapter
-from .observation import ObservationBuilder, ObservationError
-from .safety import SafetyError, SafetyLayer, SafetyLimits
+from .observation import ObservationBuilder
+from .safety import SafetyLayer, SafetyLimits
 from .scheduler import SequentialScheduler
 from .units import to_degrees
 
@@ -3895,6 +3988,7 @@ class VLAController(Generic, EasyResource):
         self._specs: dict[str, Any] | None = None
         self._latencies: list[float] = []
         self._measured_fps = 0.0
+        self._scheduler = None
 
     @classmethod
     def new(cls, config: ServiceConfig, dependencies: Mapping[Any, ResourceBase]) -> Self:
@@ -3903,16 +3997,22 @@ class VLAController(Generic, EasyResource):
         return svc
 
     @classmethod
-    def validate_config(cls, config: ServiceConfig) -> Sequence[str]:
-        cfg = ControllerConfig.parse(dict(config.attributes.fields_to_dict()))
+    def validate_config(cls, config: ServiceConfig) -> tuple[Sequence[str], Sequence[str]]:
+        cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
         return cfg.dependencies(), []
 
     def reconfigure(self, config: ServiceConfig, dependencies) -> None:
         """Rebuild from config. Never auto-resumes motion after a config change."""
+        was_running = self._task is not None and not self._task.done()
         self._stop_loop_sync()
-        self._cfg = ControllerConfig.parse(dict(config.attributes.fields_to_dict()))
+        if was_running:
+            # reconfigure is sync, so the arm stop is scheduled rather than awaited.
+            # Cancelling the loop alone would leave the arm executing its last command.
+            asyncio.create_task(self._safe_stop_arm())
+        self._cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
         self._deps = {self._key(k): v for k, v in dependencies.items()}
         self._specs = None
+        self._scheduler = None
         self._state = "idle"
         self._last_error = None
 
@@ -3941,7 +4041,7 @@ class VLAController(Generic, EasyResource):
         return {
             "state": self._state,
             "mode": (self._specs or {}).get("_resolved_mode", self._cfg.mode if self._cfg else ""),
-            "queue_size": 0,
+            "queue_size": self._scheduler.qsize() if self._scheduler else 0,
             "avg_latency_s": avg,
             "measured_fps": self._measured_fps,
             "clamp_counts": dict(self._safety.clamp_counts) if self._safety else {},
@@ -4060,10 +4160,15 @@ class VLAController(Generic, EasyResource):
                 )
 
             image_sizes = {
-                key: (shape[1], shape[2])
-                for key, shape in specs["input_features"].items()
-                if key.startswith("observation.images.")
+                key: (specs["input_features"][key][1], specs["input_features"][key][2])
+                for key in specs["image_feature_keys"]
             }
+            missing = set(image_sizes) - set(cfg.cameras)
+            if missing:
+                raise RuntimeError(
+                    f"the policy expects camera feature(s) {sorted(missing)} that are not "
+                    f"mapped in `cameras` (configured: {sorted(cfg.cameras)})"
+                )
             builder = ObservationBuilder(
                 cameras={k: self._resource(v) for k, v in cfg.cameras.items()},
                 arm=self._resource(cfg.arm),
@@ -4075,12 +4180,10 @@ class VLAController(Generic, EasyResource):
                 jpeg_quality=cfg.jpeg_quality,
             )
             self._safety = self._build_safety(gripper)
-            scheduler = SequentialScheduler(
-                lambda rtc: self._infer(builder, rtc)
-            )
+            self._scheduler = SequentialScheduler(lambda rtc: self._infer(builder, rtc))
 
             self._state = "running"
-            await self._loop(scheduler, builder, gripper)
+            await self._loop(self._scheduler, builder, gripper)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -4191,59 +4294,66 @@ git commit -m "feat: add controller service with sequential control loop"
 ## Task 18: Module entrypoint
 
 **Files:**
-- Create: `src/main.py`
+- Create: `src/vla/main.py`
 
-- [ ] **Step 1: Implement `src/main.py`**
+- [ ] **Step 1: Implement `src/vla/main.py`**
+
+Two things make this shorter than it looks. `EasyResource.__init_subclass__` calls `cls.register()` at class-definition time, so **importing** `VLAPolicy` and `VLAController` already registers both models — calling `Registry.register_resource_creator` again raises `DuplicateResourceError: Cannot add resource with duplicate name`. And `Module.run_from_registry()` picks up everything in the registry, so there is nothing to wire by hand.
 
 ```python
-"""Module entrypoint: register both VLA models."""
+"""Module entrypoint.
+
+Importing the two service classes is what registers them: EasyResource
+registers each subclass at class-definition time. run_from_registry then
+serves everything in the registry.
+"""
 
 import asyncio
 
 from viam.module.module import Module
-from viam.resource.registry import Registry, ResourceCreatorRegistration
-from viam.services.generic import Generic
 
-from vla.controller.service import VLAController
-from vla.policy.service import VLAPolicy
-
-
-async def main() -> None:
-    Registry.register_resource_creator(
-        Generic.API,
-        VLAPolicy.MODEL,
-        ResourceCreatorRegistration(VLAPolicy.new, VLAPolicy.validate_config),
-    )
-    Registry.register_resource_creator(
-        Generic.API,
-        VLAController.MODEL,
-        ResourceCreatorRegistration(VLAController.new, VLAController.validate_config),
-    )
-    module = Module.from_args()
-    module.add_model_from_registry(Generic.API, VLAPolicy.MODEL)
-    module.add_model_from_registry(Generic.API, VLAController.MODEL)
-    await module.start()
-
+from vla.controller.service import VLAController  # noqa: F401 - import registers the model
+from vla.policy.service import VLAPolicy  # noqa: F401 - import registers the model
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(Module.run_from_registry())
 ```
 
-- [ ] **Step 2: Verify the module imports cleanly**
+- [ ] **Step 2: Verify the module imports cleanly and registers exactly once**
 
-Run: `uv run python -c "import sys; sys.path.insert(0, 'src'); import main; print('ok')"`
-Expected: `ok`
+Run:
+```bash
+uv run python -c "
+import vla.main
+from viam.resource.registry import Registry
+from viam.services.generic import Generic
+from vla.policy.service import VLAPolicy
+from vla.controller.service import VLAController
+Registry.lookup_resource_creator(Generic.API, VLAPolicy.MODEL)
+Registry.lookup_resource_creator(Generic.API, VLAController.MODEL)
+print('ok')
+"
+```
+Expected: `ok`. A `DuplicateResourceError` here means explicit registration crept back in.
 
-- [ ] **Step 3: Verify the package builds**
+- [ ] **Step 3: Verify the entrypoint is actually inside the wheel**
 
-Run: `uv build && ls dist/`
-Expected: a `.whl` and a `.tar.gz`
+```bash
+uv build
+uv run python -c "
+import zipfile, glob
+names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist()
+assert 'vla/main.py' in names, names
+print('ok')
+"
+```
+Expected: `ok`. This is the check that catches the packaging trap — `packages = ["src/vla"]` ships only `vla/`, so an entrypoint outside that tree builds fine and then fails on the machine with `ModuleNotFoundError`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/main.py
-git commit -m "feat: add module entrypoint registering both models"
+git add src/vla/main.py
+git commit -m "feat: add module entrypoint"
 ```
 
 ---
@@ -4307,8 +4417,8 @@ async def test_full_loop_drives_the_fake_arm(policy):
         _cfg("c", "viam-labs:vla:controller", {
             "policy_service": "p",
             "arm": "a",
-            "cameras": {k: "cam" for k in specs["input_features"]
-                        if k.startswith("observation.images.")},
+            # smolvla_base wants three cameras; one fake serves all three feeds.
+            "cameras": {k: "cam" for k in specs["image_feature_keys"]},
             "state_joint_indices": list(range(dim)),
             "fps": 2.0,
             "task": "pick up the red block",
@@ -4349,6 +4459,7 @@ git commit -m "test: add full-loop integration test with a real checkpoint"
 
 **Files:**
 - Create: `README.md`
+- Modify: `pyproject.toml`
 
 - [ ] **Step 1: Write `README.md`**
 
@@ -4363,14 +4474,29 @@ Cover, in this order:
 7. **Limitations** — `mode: rtc` is not implemented yet; `normalized` state units are unsupported; relative-action checkpoints are refused under RTC.
 8. **Development** — `mise run test` (fast, no torch), `mise run test-all`, `uv sync --extra lerobot` for the integration and differential suites.
 
-- [ ] **Step 2: Verify every config example parses**
+- [ ] **Step 2: Add the `readme` key now that the file exists**
+
+In `pyproject.toml`, under `[project]`, restore:
+
+```toml
+readme = "README.md"
+```
+
+Task 1 omitted it deliberately, because hatchling aborts when it points at a missing file.
+
+- [ ] **Step 3: Verify every config example parses**
 
 For each JSON block in the README, confirm `PolicyConfig.parse` / `ControllerConfig.parse` accepts it. Doc examples that do not parse are worse than no examples.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Verify the build still works with the readme key**
+
+Run: `uv build`
+Expected: succeeds.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add README.md
+git add README.md pyproject.toml
 git commit -m "docs: add module README"
 ```
 
@@ -4422,4 +4548,9 @@ git commit -m "chore: record measured install size"
 - **`RTCScheduler`** — background inference with prefix feedback. `ActionQueue` already supports RTC mode and is differentially tested; what remains is the async scheduling, the two-delay bookkeeping, and wiring `prev_chunk_left_over` from `get_left_over()`. The spec says to enable this only after measuring real latency on the target device.
 - **Relative-action prefix re-anchoring** — a port of `reanchor_relative_rtc_prefix`, which uses `get_processed_left_over()`. Until then such checkpoints are refused under RTC.
 - **`normalized` state units** — needs a decision on where per-joint min/max come from.
+- **`dtype` selection** — the config field is parsed and validated but not applied. Casting weights
+  with `policy.to(dtype=...)` breaks inference, because the deserialized `DeviceProcessorStep` has
+  `float_dtype=None` and keeps emitting float32. The correct fix is `torch.autocast` gated on
+  `config.use_amp`, as upstream does. Until then the checkpoint's own dtype is used and a non-`auto`
+  setting logs a warning.
 - **Hardware smoke test** — a manual checklist with conservative limits, per spec phase 3.
