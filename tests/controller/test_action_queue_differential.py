@@ -153,6 +153,16 @@ def test_returned_arrays_do_not_alias_internal_state():
     neither implementation's subsequently-read state reflects the
     mutation, and that both implementations agree on that non-aliasing
     behavior.
+
+    Review finding: an earlier version of this test mutated `u_action`/
+    `o_action` (row 0, the row `get()` just consumed) and then asserted
+    against `get_processed_left_over()` -- but the leftover starts at
+    `last_index` (1, after one `get()`), i.e. row 1. Row 0 and row 1 are
+    different memory regardless of copy semantics, so that assertion
+    could never fail. Fixed by checking the internal `.queue` buffer
+    directly for the `get()` half (both implementations expose `queue` as
+    a public attribute), and leaving the `get_processed_left_over()` half
+    as a same-slice-read-twice check, which was already sound.
     """
     upstream, ours = _pair(False)
     rng = np.random.default_rng(99)
@@ -161,20 +171,23 @@ def test_returned_arrays_do_not_alias_internal_state():
     upstream.merge(orig_t, proc_t, 0)
     ours.merge(orig_np, proc_np, 0)
 
+    # get() copy contract: check the internal buffer directly, not
+    # get_processed_left_over() -- that excludes the just-consumed row
+    # once last_index has advanced past it, so it cannot observe this
+    # mutation either way.
     u_action = upstream.get()
     o_action = ours.get()
     u_action[0] = -999.0
     o_action[0] = -999.0
+    assert upstream.queue[0, 0].item() != -999.0
+    assert ours.queue[0, 0] != -999.0
+    np.testing.assert_allclose(upstream.queue[0].numpy(), ours.queue[0], rtol=1e-6)
 
+    # get_processed_left_over() copy contract: mutate what it returns,
+    # then take a second, independent read of the same slice (last_index
+    # hasn't moved since) and confirm it doesn't reflect the mutation.
     u_left = upstream.get_processed_left_over()
     o_left = ours.get_processed_left_over()
-    assert u_left[0, 0].item() != -999.0
-    assert o_left[0, 0] != -999.0
-    np.testing.assert_allclose(u_left.numpy(), o_left, rtol=1e-6)
-
-    # Mutate the leftover views too, and confirm a second read is unaffected
-    # on both sides -- this is the get_left_over()/get_processed_left_over()
-    # copy contract, checked against upstream rather than only in isolation.
     u_left[0, 0] = -1234.0
     o_left[0, 0] = -1234.0
     u_left2 = upstream.get_processed_left_over()

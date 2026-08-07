@@ -24,7 +24,19 @@ import numpy as np
 
 from vla.config_util import VLAError
 
-UNITS = ("degrees", "radians", "normalized")
+# Units this module can actually convert. "normalized" is deliberately
+# excluded: it is config-accepted (see UNITS below, and ControllerConfig's
+# eventual validation of the configured unit) but not yet convertible, so
+# it gets its own dedicated error rather than falling into "unknown".
+SUPPORTED_UNITS = ("degrees", "radians")
+
+# Every unit ControllerConfig may accept in configuration, convertible or
+# not. Kept distinct from SUPPORTED_UNITS so the "unknown unit" error
+# message below can list only what a caller can actually ask for -- review
+# finding: it previously listed all of UNITS, including "normalized",
+# three lines after telling the caller "normalized" is specifically
+# rejected, which is actively misleading.
+UNITS = SUPPORTED_UNITS + ("normalized",)
 
 
 class UnitError(VLAError, ValueError):
@@ -37,8 +49,8 @@ def _check_unit(unit: str) -> None:
             "normalized units require per-joint min/max, which is unresolved; "
             "use degrees or radians"
         )
-    if unit not in UNITS:
-        raise UnitError(f"unknown unit {unit!r}, expected one of {UNITS}")
+    if unit not in SUPPORTED_UNITS:
+        raise UnitError(f"unknown unit {unit!r}, expected one of {SUPPORTED_UNITS}")
 
 
 def _check_values(values: object) -> None:

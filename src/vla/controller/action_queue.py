@@ -54,6 +54,41 @@ def _as_int_field(value: Any, field_name: str) -> int:
         raise ActionQueueError(str(exc)) from exc
 
 
+def _check_actions_array(value: Any, field_name: str) -> np.ndarray:
+    """Require `value` to be a 2D (time_steps, action_dim) numpy array.
+
+    Without this, three real mistakes slip straight through `merge()` and
+    detonate frames away instead of at the call site:
+    - a Python list is accepted and degrades silently (`get()` then
+      returns a `list`, not an `ndarray`)
+    - a `torch.Tensor` -- a very plausible mistake in a file whose whole
+      premise is "the torch version lives next door" -- raises a bare
+      `AttributeError: 'Tensor' object has no attribute 'copy'` from deep
+      inside `_replace_actions_queue`/`_append_actions_queue`, which is
+      exactly the kind of escape standing requirement 5 forbids
+    - a 1D array (a single action mistaken for a whole chunk) is accepted,
+      `qsize()` then reports the action dimension instead of a step count,
+      and `get()` returns a scalar that only fails once it reaches
+      `to_degrees` several frames later
+
+    This is a deliberate deviation from upstream, which performs no such
+    check -- like `as_int` above, already a deliberate deviation for the
+    same reason (protobuf doubles vs. plain ints). It doesn't affect
+    fidelity: the differential test only ever exercises valid 2D arrays,
+    since that's the only shape upstream's own callers ever produce.
+    """
+    if not isinstance(value, np.ndarray):
+        raise ActionQueueError(
+            f"{field_name} must be a numpy ndarray, got {type(value).__name__}: {value!r}"
+        )
+    if value.ndim != 2:
+        raise ActionQueueError(
+            f"{field_name} must be a 2D array shaped (time_steps, action_dim), "
+            f"got shape={value.shape}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class QueueSettings:
     rtc_enabled: bool = False
@@ -151,6 +186,14 @@ class ActionQueue:
         RTC enabled: replaces the queue, accounting for inference delay.
         RTC disabled: appends to the queue, maintaining continuity.
         """
+        original_actions = _check_actions_array(original_actions, "original_actions")
+        processed_actions = _check_actions_array(processed_actions, "processed_actions")
+        if original_actions.shape[1] != processed_actions.shape[1]:
+            raise ActionQueueError(
+                "original_actions and processed_actions must have the same "
+                f"action dimension, got {original_actions.shape[1]} vs "
+                f"{processed_actions.shape[1]}"
+            )
         delay_int = _as_int_field(real_delay, "real_delay")
         idx_int = (
             None
@@ -192,6 +235,19 @@ class ActionQueue:
 
         Removes already-consumed actions and appends new ones, maintaining
         queue continuity without replacement.
+
+        Note on the `.copy()` calls feeding `np.concatenate` below: unlike
+        every other `.copy()` in this class, mutating the caller's array
+        *after* this method returns cannot observably affect
+        `self.original_queue`/`self.queue` whether or not that `.copy()`
+        is present -- `np.concatenate` always allocates a fresh output
+        array and copies both inputs' data into it, verified directly:
+        `np.shares_memory(np.concatenate([a, b]), a)` is `False` with or
+        without a `.copy()` on `a`. They are kept for fidelity with
+        upstream's identical `.clone()` before `torch.cat` (same
+        reasoning as the `_check_and_resolve_delays` mismatch-branch
+        oddity documented below), not because a test can catch their
+        removal via caller-side mutation the way the other six can.
         """
         if self.queue is None:
             self.original_queue = original_actions.copy()

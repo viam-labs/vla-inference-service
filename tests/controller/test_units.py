@@ -39,6 +39,19 @@ def test_unknown_unit_errors():
         from_degrees(np.array([0.0], dtype=np.float32), "furlongs")
 
 
+def test_unknown_unit_message_lists_only_actually_convertible_units():
+    # Review finding: the "unknown unit" message previously listed all of
+    # UNITS, including "normalized" -- three lines after telling the
+    # caller "normalized" is specifically rejected. It should list only
+    # what a caller can actually pass and have it work.
+    with pytest.raises(UnitError) as exc_info:
+        from_degrees(np.array([0.0], dtype=np.float32), "furlongs")
+    message = str(exc_info.value)
+    assert "degrees" in message
+    assert "radians" in message
+    assert "normalized" not in message
+
+
 # ---------------------------------------------------------------------------
 # Standing requirement 5: this module's own exception type, and it must sit
 # in the shared VLAError hierarchy like ConfigError/WireError/ResolveError/

@@ -116,12 +116,103 @@ def test_clear_resets_everything():
     assert q.get_left_over() is None
 
 
-def test_returned_actions_are_copies():
+# ---------------------------------------------------------------------------
+# Copy-site coverage. Review finding: the original version of this test
+# below mutated `a[0]` (row 0 of the processed queue, the row `get()` just
+# consumed) and then asserted against `get_processed_left_over()[0]` --
+# but the leftover starts at `last_index` (1, after one `get()`), i.e. row
+# 1. Row 0 and row 1 are different memory regardless of whether `.copy()`
+# is used, so that assertion could never fail: it wasn't testing copy
+# semantics at all. Confirmed by an automated mutation sweep removing each
+# of the 9 `.copy()` call sites in this file one at a time and re-running
+# this suite: all 9 survived (the full suite stayed green even with the
+# `.copy()` gone), including this one's nominal target.
+#
+# The tests below check the *same row* two different ways per site --
+# either against the live internal buffer (`q.queue`, `q.original_queue`)
+# or via two independent reads of the same slice -- so a missing `.copy()`
+# has nowhere to hide. Each was verified against the mutation sweep: it
+# fails when its site's `.copy()` is removed, and only that test fails.
+#
+# Two sites are not covered here on purpose: the `.copy()` calls at
+# `_append_actions_queue`'s `np.concatenate([..., x.copy()])` calls are
+# provably unobservable by any caller-side-mutation test, since
+# `np.concatenate` always allocates fresh memory regardless of whether its
+# inputs were pre-copied -- see the docstring on `_append_actions_queue`
+# for the verification. They're kept for upstream fidelity, the same
+# reasoning as the `_check_and_resolve_delays` mismatch-branch oddity.
+# ---------------------------------------------------------------------------
+
+
+def test_get_returns_a_copy_not_a_view_into_queue():
     q = ActionQueue(QueueSettings(rtc_enabled=False))
     q.merge(chunk(2, 2), chunk(2, 2, 5.0), real_delay=0)
-    a = q.get()
+    a = q.get()  # row 0 of self.queue: [5., 6.]
     a[0] = 999.0
-    np.testing.assert_array_equal(q.get_processed_left_over()[0], [7.0, 8.0])
+    # Check the internal buffer directly, not get_processed_left_over():
+    # that excludes row 0 entirely once last_index has advanced past it,
+    # so it can never observe this mutation either way.
+    np.testing.assert_array_equal(q.queue[0], [5.0, 6.0])
+
+
+def test_get_left_over_returns_a_copy_not_a_view():
+    q = ActionQueue(QueueSettings(rtc_enabled=True))
+    q.merge(chunk(4, 1), chunk(4, 1, 100.0), real_delay=0)
+    q.get()  # last_index = 1
+    left = q.get_left_over()  # [[1.], [2.], [3.]]
+    left[0] = 999.0
+    # A second, independent call to the same slice must be unaffected.
+    left_again = q.get_left_over()
+    np.testing.assert_array_equal(left_again[0], [1.0])
+
+
+def test_get_processed_left_over_returns_a_copy_not_a_view():
+    q = ActionQueue(QueueSettings(rtc_enabled=True))
+    q.merge(chunk(4, 1), chunk(4, 1, 100.0), real_delay=0)
+    q.get()  # last_index = 1
+    processed = q.get_processed_left_over()  # [[101.], [102.], [103.]]
+    processed[0] = 999.0
+    processed_again = q.get_processed_left_over()
+    np.testing.assert_array_equal(processed_again[0], [101.0])
+
+
+def test_rtc_replace_copies_callers_original_actions_buffer():
+    q = ActionQueue(QueueSettings(rtc_enabled=True))
+    original = chunk(3, 1)
+    processed = chunk(3, 1, 100.0)
+    q.merge(original, processed, real_delay=0)
+    original[0] = 999.0  # mutate the caller's array *after* merge() returns
+    np.testing.assert_array_equal(q.original_queue[0], [0.0])
+
+
+def test_rtc_replace_copies_callers_processed_actions_buffer():
+    q = ActionQueue(QueueSettings(rtc_enabled=True))
+    original = chunk(3, 1)
+    processed = chunk(3, 1, 100.0)
+    q.merge(original, processed, real_delay=0)
+    processed[0] = 999.0
+    np.testing.assert_array_equal(q.queue[0], [100.0])
+
+
+def test_append_first_merge_copies_callers_original_actions_buffer():
+    # The queue-is-None branch of _append_actions_queue: no concatenation
+    # happens, so unlike the concat branch, a missing .copy() here IS
+    # observable via caller-side mutation.
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    original = chunk(3, 1)
+    processed = chunk(3, 1, 100.0)
+    q.merge(original, processed, real_delay=0)
+    original[0] = 999.0
+    np.testing.assert_array_equal(q.original_queue[0], [0.0])
+
+
+def test_append_first_merge_copies_callers_processed_actions_buffer():
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    original = chunk(3, 1)
+    processed = chunk(3, 1, 100.0)
+    q.merge(original, processed, real_delay=0)
+    processed[0] = 999.0
+    np.testing.assert_array_equal(q.queue[0], [100.0])
 
 
 def test_index_mismatch_returns_unclamped_delay(caplog):
@@ -162,6 +253,81 @@ def test_left_over_and_processed_left_over_are_not_interchangeable():
     assert not np.array_equal(original_space, processed_space)
     np.testing.assert_array_equal(original_space, [[1.0], [2.0], [3.0]])
     np.testing.assert_array_equal(processed_space, [[101.0], [102.0], [103.0]])
+
+
+# ---------------------------------------------------------------------------
+# merge() array argument validation. Review finding: real_delay and
+# action_index_before_inference were validated strictly (see below) while
+# original_actions/processed_actions were not validated at all, letting
+# three real mistakes slip through silently or explode with the wrong
+# exception type:
+#   - a Python list is accepted and degrades silently (get() then returns
+#     a list, not an ndarray)
+#   - a torch.Tensor raises a bare AttributeError: 'Tensor' object has no
+#     attribute 'copy' -- precisely the escape standing requirement 5
+#     forbids, and a plausible mistake in a file whose premise is "the
+#     torch version lives right next door"
+#   - a 1D array (a single action mistaken for a whole chunk) is accepted,
+#     and detonates several frames away instead of at the call site
+# ---------------------------------------------------------------------------
+
+
+def test_merge_rejects_python_list_for_original_actions():
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    with pytest.raises(ActionQueueError, match="original_actions"):
+        q.merge([[1.0, 2.0]], chunk(1, 2), real_delay=0)
+
+
+def test_merge_rejects_python_list_for_processed_actions():
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    with pytest.raises(ActionQueueError, match="processed_actions"):
+        q.merge(chunk(1, 2), [[1.0, 2.0]], real_delay=0)
+
+
+def test_merge_rejects_torch_tensor_with_a_clear_error_not_attributeerror():
+    torch = pytest.importorskip("torch")
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    with pytest.raises(ActionQueueError, match="original_actions") as exc_info:
+        q.merge(torch.zeros(2, 2), chunk(2, 2), real_delay=0)
+    assert not isinstance(exc_info.value, AttributeError)
+
+
+def test_merge_rejects_1d_original_actions():
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    with pytest.raises(ActionQueueError, match="original_actions"):
+        q.merge(np.array([1.0, 2.0, 3.0], dtype=np.float32), chunk(1, 3), real_delay=0)
+
+
+def test_merge_rejects_1d_processed_actions():
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    with pytest.raises(ActionQueueError, match="processed_actions"):
+        q.merge(chunk(1, 3), np.array([1.0, 2.0, 3.0], dtype=np.float32), real_delay=0)
+
+
+def test_merge_rejects_mismatched_action_dimensions():
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    with pytest.raises(ActionQueueError, match="action dimension"):
+        q.merge(chunk(3, 2), chunk(3, 5), real_delay=0)
+
+
+def test_merge_accepts_valid_2d_arrays_with_matching_action_dimensions():
+    # Standing requirement 1: valid input must still work, not just be
+    # rejected -- a suite that only tests rejection would stay green if
+    # this validation accidentally rejected everything.
+    q = ActionQueue(QueueSettings(rtc_enabled=False))
+    q.merge(chunk(3, 4), chunk(3, 4, 10.0), real_delay=0)
+    assert q.qsize() == 3
+
+
+# ---------------------------------------------------------------------------
+# Standing requirement 2: assert defaults, not just overrides. QueueSettings
+# is never constructed bare (`QueueSettings()`) anywhere else in this file,
+# so flipping rtc_enabled's default to True would be invisible without this.
+# ---------------------------------------------------------------------------
+
+
+def test_queue_settings_default_rtc_enabled_is_false():
+    assert QueueSettings().rtc_enabled is False
 
 
 # ---------------------------------------------------------------------------
