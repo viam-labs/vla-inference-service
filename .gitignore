@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+module.tar.gz
+.pytest_cache/

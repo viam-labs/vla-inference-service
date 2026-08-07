@@ -1,0 +1,29 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam-labs:vla",
+  "visibility": "private",
+  "url": "https://github.com/viam-labs/viam-vla-inference-service",
+  "description": "Run pre-trained LeRobot VLA policies (SmolVLA, Evo-1) on Viam machines",
+  "build": {
+    "setup": "curl -LsSf https://astral.sh/uv/install.sh | sh && curl https://mise.run | sh",
+    "build": "mise run package",
+    "path": "module.tar.gz",
+    "arch": ["linux/arm64", "linux/amd64"]
+  },
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam-labs:vla:policy",
+      "short_description": "Pure VLA inference over a LeRobot checkpoint",
+      "markdown_link": "README.md#policy"
+    },
+    {
+      "api": "rdk:service:generic",
+      "model": "viam-labs:vla:controller",
+      "short_description": "Observation-inference-actuation loop driving a Viam arm",
+      "markdown_link": "README.md#controller"
+    }
+  ],
+  "entrypoint": "./run.sh",
+  "first_run": "./setup.sh"
+}

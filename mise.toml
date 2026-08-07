@@ -1,0 +1,15 @@
+[tasks.build]
+run = "rm -rf dist && uv build --wheel"
+
+[tasks.clean]
+run = "rm -rf dist module.tar.gz"
+
+[tasks.test]
+run = "uv run pytest -m 'not integration and not differential' -v"
+
+[tasks.test-all]
+run = "uv run pytest -v"
+
+[tasks.package]
+run = "tar -czf module.tar.gz meta.json run.sh setup.sh dist"
+depends = ["build"]

@@ -125,6 +125,13 @@ markers = [
     "differential: requires lerobot installed to compare against upstream",
 ]
 
+[tool.hatch.metadata]
+# Required: hatchling refuses to build ANY project whose metadata declares a
+# PEP 508 direct reference (the `lerobot @ git+https://...` pin) without this,
+# and it validates all declared extras during a plain `uv sync` even though
+# that sync never installs them.
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/vla"]
 

@@ -1,0 +1,46 @@
+[project]
+name = "viam-vla-inference-service"
+version = "0.1.0"
+description = "Run pre-trained LeRobot VLA policies on Viam machines"
+requires-python = ">=3.12"
+dependencies = [
+    "viam-sdk>=0.80.0",
+    "numpy>=2.0.0,<2.3.0",
+    "pillow>=10.0.0",
+    "typing-extensions>=4.12.2",
+]
+
+[project.optional-dependencies]
+lerobot = [
+    "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@ff7cc3de1de830f5f3276918a013d04bdf9ea4be",
+]
+
+[dependency-groups]
+# pytest-asyncio >=1.0: asyncio_default_test_loop_scope only exists from 0.26.
+# On older versions pytest merely warns about the unknown key, and the
+# module-scoped async fixture in Task 19 then fails with a cross-loop error.
+dev = ["pytest>=8.0.0", "pytest-asyncio>=1.0"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
+asyncio_default_test_loop_scope = "module"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a real checkpoint and torch (deselect with '-m \"not integration\"')",
+    "differential: requires lerobot installed to compare against upstream",
+]
+
+[tool.hatch.metadata]
+# Required: hatchling refuses to build ANY project whose metadata declares a
+# PEP 508 direct reference (the `lerobot @ git+https://...` pin) without this,
+# and it validates all declared extras during a plain `uv sync` even though
+# that sync never installs them.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vla"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
