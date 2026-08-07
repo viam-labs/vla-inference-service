@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from vla.config_util import ConfigError, as_bool, as_choice, as_env_var_name, as_float, as_int, as_str
+from vla.config_util import ConfigError, as_bool, as_choice, as_env_var_name, as_float, as_int, as_str, redact_secret
 
 __all__ = ["ConfigError", "RTCSettings", "PolicyConfig", "DEVICES", "DTYPES", "SCHEDULES"]
 
@@ -77,11 +77,32 @@ class PolicyConfig:
     model_path: str | None = None
     model_hub_id: str | None = None
     model_revision: str = "main"
-    hf_token_env: str | None = None
+    # Names an env var, not a secret -- but an operator pasting the actual
+    # token into this field by mistake is the single most likely failure
+    # mode here (see as_env_var_name), and a realistic token is itself a
+    # valid env-var name that passes that check cleanly. repr=False keeps
+    # the dataclass-generated repr from ever rendering it in full; the
+    # explicit __repr__ below still shows a redacted placeholder so the
+    # field's presence stays visible for debugging.
+    hf_token_env: str | None = field(default=None, repr=False)
     device: str = "auto"
     dtype: str = "auto"
     warmup_inferences: int = 2
     rtc: RTCSettings = field(default_factory=RTCSettings)
+
+    def __repr__(self) -> str:
+        token_repr = "None" if self.hf_token_env is None else redact_secret(self.hf_token_env)
+        return (
+            "PolicyConfig("
+            f"model_path={self.model_path!r}, "
+            f"model_hub_id={self.model_hub_id!r}, "
+            f"model_revision={self.model_revision!r}, "
+            f"hf_token_env={token_repr}, "
+            f"device={self.device!r}, "
+            f"dtype={self.dtype!r}, "
+            f"warmup_inferences={self.warmup_inferences!r}, "
+            f"rtc={self.rtc!r})"
+        )
 
     @staticmethod
     def parse(raw: dict[str, Any]) -> "PolicyConfig":

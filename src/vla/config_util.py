@@ -15,13 +15,15 @@ import math
 import re
 from typing import Any, Sequence
 
-# POSIX-ish environment variable name shape: letters/digits/underscore, not
-# starting with a digit, capped at 64 chars. Fields like `hf_token_env` name
-# an env var precisely so the secret itself never appears in config, logs,
-# or error messages; this is the primary defense against an operator pasting
-# the actual token into that field by mistake. It is not a complete defense
-# on its own -- a short token built only from word characters can still
-# match -- so callers must also redact the value wherever it is displayed.
+# POSIX environment variable name shape: letters/digits/underscore, not
+# starting with a digit, capped at 64 chars. This is a basic sanity check
+# on the field's shape, not a secret detector: it catches an obviously
+# malformed paste (hyphens, dots, spaces, excessive length) but most real
+# API tokens -- including Hugging Face's, which are `hf_` followed by ~34
+# alphanumerics -- are themselves valid POSIX identifiers and pass this
+# check cleanly. The actual defense against disclosure is redact_secret()
+# applied at every display site (PolicyConfig.__repr__, the resolver's
+# error/log messages), not this regex.
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
@@ -144,10 +146,14 @@ def as_env_var_name(value: Any, field_name: str) -> str:
     Fields such as `hf_token_env` name an env var precisely so the actual
     secret never has to appear in config, logs, or DoCommand responses. An
     operator confusing "the name of the env var" with "the token itself" is
-    the single most likely mistake here, so the accepted shape is checked
-    strictly and a rejected value is never echoed back in full -- only a
-    redacted form, since a short pasted secret could plausibly look like a
-    valid name too.
+    the single most likely mistake here -- but this check only catches an
+    obviously malformed paste (hyphens, dots, spaces, excessive length, a
+    leading digit). It is not a secret detector: a realistic pasted token
+    (e.g. Hugging Face's `hf_<34 alphanumerics>` format) is itself a valid
+    POSIX identifier and passes cleanly. The real defense against
+    disclosure is redaction at every display site, not this shape check;
+    a rejected value is still never echoed back in full here, purely as
+    defense in depth.
     """
     text = as_str(value, field_name)
     if not _ENV_VAR_NAME_RE.match(text):

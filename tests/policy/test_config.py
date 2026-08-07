@@ -261,6 +261,34 @@ def test_config_error_never_echoes_full_invalid_hf_token_env_value():
     assert offending not in str(excinfo.value)
 
 
+# --- hf_token_env must never render in full via repr(), not just via the
+# resolver's two call sites. A realistic Hugging Face token (hf_ + ~34
+# alphanumerics) is itself a valid POSIX env-var name and passes
+# as_env_var_name cleanly -- the only real protection is that the value
+# never gets displayed anywhere in full, including an incidental
+# `LOGGER.debug("config: %s", cfg)` nobody thought to guard.
+
+
+def test_repr_redacts_hf_token_env_value():
+    cfg = PolicyConfig.parse({"model_path": "/m", "hf_token_env": "SECRET_TOKEN_NAME"})
+    text = repr(cfg)
+    assert "SECRET_TOKEN_NAME" not in text
+    assert "SECR" in text
+    assert "17 chars" in text  # len("SECRET_TOKEN_NAME") == 17
+
+
+def test_repr_shows_none_when_hf_token_env_unset():
+    cfg = PolicyConfig.parse({"model_path": "/m"})
+    assert "hf_token_env=None" in repr(cfg)
+
+
+def test_repr_still_shows_other_fields():
+    cfg = PolicyConfig.parse({"model_path": "/models/smolvla", "device": "cuda"})
+    text = repr(cfg)
+    assert "/models/smolvla" in text
+    assert "cuda" in text
+
+
 # --- maximum= bounds prevent pathological config values ---
 
 

@@ -200,10 +200,25 @@ def test_as_env_var_name_rejects_leading_digit():
 
 
 def test_as_env_var_name_rejects_value_with_hyphen():
-    # Shaped like a plausible pasted secret (e.g. an API key), not an env
-    # var name -- this is the case the regex is specifically meant to catch.
+    # An API-key-shaped value with hyphens is not a valid POSIX identifier,
+    # so this specific shape is caught. That is not the general case,
+    # though: a realistic Hugging Face token (hf_ + alphanumerics only) is
+    # itself a valid identifier and is *not* caught by this check -- see
+    # test_as_env_var_name_accepts_a_realistic_looking_token below. This
+    # helper is a shape sanity check, not a secret detector.
     with pytest.raises(ConfigError, match="field"):
         as_env_var_name("sk-live-1234567890abcdef1234567890abcdef", "field")
+
+
+def test_as_env_var_name_accepts_a_realistic_looking_token():
+    # Documents the known gap: a real Hugging Face token is `hf_` plus ~34
+    # alphanumeric characters -- no hyphens, under 64 chars, leading
+    # letter. It is a perfectly valid POSIX env-var name, so this check
+    # cannot and does not reject it. Redaction at display time is the
+    # actual defense; this test exists so nobody "fixes" the regex later
+    # under the mistaken belief it should have caught this.
+    token_shaped = "hf_AbCdEfGhIjKlMnOpQrStUv123456"
+    assert as_env_var_name(token_shaped, "field") == token_shaped
 
 
 def test_as_env_var_name_rejects_value_over_64_chars():
