@@ -3985,6 +3985,27 @@ git commit -m "feat: add controller config parsing and validation"
 
 ## Task 17: Controller service
 
+> **BLOCKER RESOLVED — read before starting.** The code below writes to the arm via
+> `move_through_joint_positions(..., options=MoveOptions(...))`. **That method exists in no
+> released viam-sdk.** Verified: installed 0.80.0 — the latest on PyPI — exposes only
+> `get_joint_positions` and `move_to_joint_positions` on `Arm`, and `MoveOptions` is a generated
+> proto type that no method consumes. Every claim about it in this plan was read from the local
+> dev checkout at `/Users/nick.hehr/src/viam-python-sdk`, which is ahead of release
+> (`9ec2f6c86`, `d2d766d0b`).
+>
+> **Use `await arm.move_to_joint_positions(JointPositions(values=...))`** — no options, a single
+> `JointPositions`, not a list. Delete `_move_options()` entirely.
+>
+> The velocity bound moves into the safety layer instead: config takes `max_vel_degs_per_sec`, and
+> the controller derives `max_joint_delta_degs = max_vel_degs_per_sec / fps`, logging the derived
+> per-tick budget at startup so an operator can see what their velocity limit implies. Drop
+> `max_acc_degs_per_sec2` and `max_tcp_speed_m_per_sec` from config — they have no enforcement
+> path, and a knob that silently does nothing is worse than an absent one.
+>
+> Rewrite every test asserting on `MoveOptions` or `options.HasField(...)`. Feature-detecting the
+> newer call was considered and rejected: it would put a second, untested-in-practice code path
+> into the one place where motion safety lives.
+
 The largest task. Wires everything into a lifecycle and a control loop.
 
 **Files:**

@@ -102,11 +102,32 @@ Extras needed are narrow: `lerobot[smolvla]` = `transformers` + `num2words` + `a
 
 - `JointPositions.values` are **degrees** (rotational) / mm (translational), ordered spatially from
   base toward end effector.
-- **`MoveOptions` is accepted only by `move_through_joint_positions(positions: List[JointPositions],
-  options: Optional[MoveOptions], ...)`** (`arm.py:130`). `move_to_joint_positions(positions, *,
-  extra, timeout)` (`arm.py:97`) takes no options, and `MoveToJointPositionsRequest` carries only
-  `name` / `positions` / `extra`. Any kinematic ceiling therefore requires the
-  `move_through_joint_positions` call, even for a single waypoint.
+- **`move_through_joint_positions` is UNRELEASED — corrected 2026-08-07.** The claims below were
+  read from the local dev checkout at `/Users/nick.hehr/src/viam-python-sdk`, which is ahead of
+  every published release. Verified against the *installed* package: **viam-sdk 0.80.0, the latest
+  on PyPI, exposes only `get_joint_positions` and `move_to_joint_positions` on `Arm`.**
+  `MoveOptions` exists as a generated proto type but **no method consumes it**. The feature landed
+  in the SDK repo as `9ec2f6c86` / `d2d766d0b` and has not shipped.
+
+  Consequence: **driver-side kinematic ceilings are unavailable.** `MoveOptions` velocity,
+  acceleration, and TCP-speed limits cannot be applied on any pinned SDK version.
+
+  **Resolution — enforce the velocity bound ourselves.** Config takes
+  `max_vel_degs_per_sec`, and the controller derives the per-step delta clamp from it:
+
+  ```
+  max_joint_delta_degs = max_vel_degs_per_sec / fps
+  ```
+
+  This is arguably the better design regardless. It gives one knob instead of two overlapping
+  ones, the bound is enforced by code this project tests rather than by a driver whose compliance
+  varies, and it removes a dependency on an unreleased API. What is genuinely lost is
+  acceleration limiting and TCP-speed capping, neither of which the delta clamp can express —
+  those return if and when the SDK ships the call. `check_start` already covers the large-initial-
+  jump case that acceleration limits would otherwise soften.
+
+- `move_to_joint_positions(positions, *, extra, timeout)` (the only available write) takes no
+  options, and `MoveToJointPositionsRequest` carries only `name` / `positions` / `extra`.
 - `MoveOptions` fields: `max_vel_degs_per_sec`, `max_acc_degs_per_sec2`,
   `max_vel_degs_per_sec_joints`, `max_acc_degs_per_sec2_joints`, and `max_tcp_speed` — the last in
   **meters per second**, not mm/s.
@@ -549,13 +570,12 @@ Applied in order:
    plus an unparseable-file fallback — scope disproportionate to a prototype whose delta clamp and
    `MoveOptions` ceilings already bound motion. The tradeoff is that config limits can drift from
    hardware; the arm driver remains the backstop.
-5. `MoveOptions` velocity / acceleration / TCP-speed ceilings handed to the driver via
-   `move_through_joint_positions`, with only the configured fields set (see explicit presence,
-   above). `max_tcp_speed` is **meters per second** — config carries
-   `max_tcp_speed_m_per_sec` to keep the unit in the name. The per-joint variants
-   (`max_vel_degs_per_sec_joints`, `max_acc_degs_per_sec2_joints`) are **intentionally not
-   exposed**: setting one causes the driver to ignore its scalar counterpart, so offering both
-   invites a config where the scalar limit is silently dead.
+5. ~~`MoveOptions` ceilings handed to the driver.~~ **Removed — the API is unreleased** (see the
+   Viam SDK facts above). The velocity bound is instead enforced at layer 3: config takes
+   `max_vel_degs_per_sec` and the controller derives `max_joint_delta_degs = max_vel_degs_per_sec
+   / fps`. Log the derived value at startup so an operator can see the per-tick budget their
+   velocity limit implies. Acceleration and TCP-speed limiting are unavailable until the SDK
+   ships `move_through_joint_positions`; `check_start` covers the large-initial-jump case.
 6. **Log whenever a clamp engages,** and expose `clamp_counts` in `status`. Persistent clamping is
    the signature of wrong units or wrong joint order — the primary diagnostic, so it must be loud
    rather than silently correct.
