@@ -1,0 +1,274 @@
+"""Adapters carrying a policy's continuous gripper channel onto Viam components.
+
+A VLA emits one continuous gripper value per tick. Viam offers three
+components that can carry it at different fidelity, so the config picks one
+explicitly:
+
+  arm_joint  gripper is joint N of the arm; value is a joint angle
+             following ``action_units``, like every other joint.
+  servo      get_position()/move(angle); both int degrees, so the adapter
+             maps normalized 0..1 onto min_deg..max_deg at 1-degree
+             resolution.
+  gripper + mode=inputs      get_current_inputs()/go_to_inputs(); normalized
+                              0..1, proportional. Preferred when the driver
+                              implements both -- they are abstract in the SDK,
+                              so not every driver does.
+  gripper + mode=threshold   read via get_current_inputs(), write by
+                              thresholding the normalized value to
+                              open()/grab(). Binary fallback for drivers that
+                              do not implement go_to_inputs.
+  none       no gripper channel.
+
+Unit convention: ``arm_joint`` is in degrees (or whatever ``action_units``
+is); every other variant is normalized 0.0-1.0, 0 = fully open, matching how
+LeRobot datasets typically encode a gripper channel.
+"""
+
+from __future__ import annotations
+
+import abc
+from typing import Any, Mapping
+
+from vla.config_util import ConfigError, VLAError
+from vla.config_util import as_choice as _as_choice
+from vla.config_util import as_float as _as_float
+from vla.config_util import as_int as _as_int
+from vla.config_util import as_str as _as_str
+
+GRIPPER_TYPES = ("arm_joint", "servo", "gripper", "none")
+GRIPPER_MODES = ("inputs", "threshold")
+
+_DEFAULT_MIN_DEG = 0.0
+_DEFAULT_MAX_DEG = 90.0
+_DEFAULT_CLOSE_THRESHOLD = 0.5
+
+
+class GripperConfigError(VLAError, ValueError):
+    """Raised for an invalid gripper config block."""
+
+
+# config_util's coercion helpers raise `ConfigError`, not this module's own
+# `GripperConfigError` -- wrap every call site so a caller catching
+# `GripperConfigError` (or `VLAError`) never has to also know about
+# `ConfigError` to cover every rejection path this module can raise.
+def as_int(value: Any, field_name: str, *, minimum: int | float | None = None) -> int:
+    try:
+        return _as_int(value, field_name, minimum=minimum)
+    except ConfigError as exc:
+        raise GripperConfigError(str(exc)) from exc
+
+
+def as_float(
+    value: Any, field_name: str, *, minimum: float | None = None, maximum: float | None = None
+) -> float:
+    try:
+        return _as_float(value, field_name, minimum=minimum, maximum=maximum)
+    except ConfigError as exc:
+        raise GripperConfigError(str(exc)) from exc
+
+
+def as_str(value: Any, field_name: str) -> str:
+    try:
+        return _as_str(value, field_name)
+    except ConfigError as exc:
+        raise GripperConfigError(str(exc)) from exc
+
+
+def as_choice(value: Any, field_name: str, allowed) -> str:
+    try:
+        return _as_choice(value, field_name, allowed)
+    except ConfigError as exc:
+        raise GripperConfigError(str(exc)) from exc
+
+
+class GripperRuntimeError(VLAError, RuntimeError):
+    """Raised when a gripper adapter cannot perform a requested operation
+    at runtime -- as opposed to a config-time mistake.
+
+    The one case this covers today: a driver whose ``go_to_inputs`` is
+    unimplemented (it is an abstract SDK method, so this is a real
+    possibility, not a hypothetical). A bare `NotImplementedError` bubbling
+    up from deep inside the SDK is not an actionable error message; this
+    wraps it with the fix.
+    """
+
+
+def _clamp_unit(value: float) -> float:
+    return min(1.0, max(0.0, float(value)))
+
+
+class GripperAdapter(abc.ABC):
+    """Base for every gripper variant.
+
+    ``in_state`` says whether this adapter's value participates in the
+    controller's observation/action vector at all (`False` only for
+    ``none``). ``dependency_name`` is the Viam resource name this adapter
+    needs as a dependency, or `None` when the channel rides the arm
+    (``arm_joint``) or does not exist (``none``).
+    """
+
+    in_state: bool = True
+    uses_degrees: bool = False
+    dependency_name: str | None = None
+    arm_joint_index: int | None = None
+
+    async def read(self) -> float:
+        raise NotImplementedError
+
+    async def write(self, value: float) -> None:
+        raise NotImplementedError
+
+
+class NoGripper(GripperAdapter):
+    in_state = False
+
+    async def read(self) -> float:  # pragma: no cover - never called
+        raise GripperRuntimeError("no gripper configured; read() should never be called")
+
+    async def write(self, value: float) -> None:  # pragma: no cover
+        raise GripperRuntimeError("no gripper configured; write() should never be called")
+
+
+class ArmJointGripper(GripperAdapter):
+    """The arm already carries this channel; read/write ride the arm call.
+
+    This adapter has no `read`/`write` of its own -- the controller reads
+    and writes this joint index as part of the arm's own joint vector.
+    """
+
+    uses_degrees = True
+
+    def __init__(self, joint_index: int) -> None:
+        self.arm_joint_index = joint_index
+
+
+class ServoGripper(GripperAdapter):
+    def __init__(self, name: str, servo: Any, min_deg: float, max_deg: float) -> None:
+        if max_deg <= min_deg:
+            raise GripperConfigError(
+                f"gripper.max_deg must exceed gripper.min_deg, got "
+                f"min_deg={min_deg!r} max_deg={max_deg!r}"
+            )
+        self.dependency_name = name
+        self._servo = servo
+        self._min = min_deg
+        self._max = max_deg
+
+    async def read(self) -> float:
+        deg = float(await self._servo.get_position())
+        return (deg - self._min) / (self._max - self._min)
+
+    async def write(self, value: float) -> None:
+        clamped = _clamp_unit(value)
+        await self._servo.move(int(round(self._min + clamped * (self._max - self._min))))
+
+
+class InputsGripper(GripperAdapter):
+    """The symmetric ``get_current_inputs``/``go_to_inputs`` pair."""
+
+    def __init__(self, name: str, gripper: Any) -> None:
+        self.dependency_name = name
+        self._gripper = gripper
+
+    async def read(self) -> float:
+        values = await self._gripper.get_current_inputs()
+        return float(values[0]) if values else 0.0
+
+    async def write(self, value: float) -> None:
+        try:
+            await self._gripper.go_to_inputs([_clamp_unit(value)])
+        except NotImplementedError as exc:
+            raise GripperRuntimeError(
+                f"gripper {self.dependency_name!r} does not implement go_to_inputs; "
+                'reconfigure gripper.mode to "threshold" for this driver'
+            ) from exc
+
+
+class ThresholdGripper(GripperAdapter):
+    """Binary fallback for drivers without ``go_to_inputs``."""
+
+    def __init__(self, name: str, gripper: Any, close_threshold: float) -> None:
+        self.dependency_name = name
+        self._gripper = gripper
+        self._threshold = close_threshold
+        # `None`, not `False`: the physical state on startup is unknown, so
+        # the first write must always command explicitly rather than being
+        # skipped because it happens to match an assumed initial state.
+        self._closed: bool | None = None
+
+    async def read(self) -> float:
+        values = await self._gripper.get_current_inputs()
+        return float(values[0]) if values else 0.0
+
+    async def write(self, value: float) -> None:
+        should_close = float(value) >= self._threshold
+        if should_close == self._closed:
+            return  # avoid re-commanding the same state every tick
+        self._closed = should_close
+        if should_close:
+            await self._gripper.grab()
+        else:
+            await self._gripper.open()
+
+
+def make_gripper_adapter(
+    raw: Mapping[str, Any] | None, dependencies: Mapping[str, Any]
+) -> GripperAdapter:
+    """Build the configured gripper adapter.
+
+    ``raw`` is the ``gripper`` block from controller config (already a plain
+    dict from ``struct_to_dict``); `None` or omitted means ``{"type":
+    "none"}``. ``dependencies`` maps resource name -> resolved Viam
+    component, exactly as the resource layer hands them to `reconfigure`.
+    """
+    raw = raw or {"type": "none"}
+    if not isinstance(raw, Mapping):
+        raise GripperConfigError(f"gripper must be an object, got {raw!r}")
+
+    kind = raw.get("type", "none")
+    if kind not in GRIPPER_TYPES:
+        raise GripperConfigError(
+            f"gripper.type must be one of {GRIPPER_TYPES}, got {kind!r}"
+        )
+
+    if kind != "gripper" and "close_threshold" in raw:
+        raise GripperConfigError(
+            'close_threshold is only valid with gripper.type="gripper" '
+            f'mode="threshold" (got gripper.type={kind!r})'
+        )
+
+    if kind == "none":
+        return NoGripper()
+
+    if kind == "arm_joint":
+        if "joint_index" not in raw:
+            raise GripperConfigError('gripper.type="arm_joint" requires joint_index')
+        joint_index = as_int(raw["joint_index"], "gripper.joint_index", minimum=0)
+        return ArmJointGripper(joint_index)
+
+    name = raw.get("name")
+    if not name:
+        raise GripperConfigError(f"gripper.type={kind!r} requires name")
+    name = as_str(name, "gripper.name")
+
+    if kind == "servo":
+        min_deg = as_float(raw.get("min_deg", _DEFAULT_MIN_DEG), "gripper.min_deg")
+        max_deg = as_float(raw.get("max_deg", _DEFAULT_MAX_DEG), "gripper.max_deg")
+        return ServoGripper(name, dependencies.get(name), min_deg, max_deg)
+
+    # kind == "gripper"
+    mode = as_choice(raw.get("mode", "inputs"), "gripper.mode", GRIPPER_MODES)
+    if mode == "inputs":
+        if "close_threshold" in raw:
+            raise GripperConfigError(
+                'close_threshold is only valid with gripper.mode="threshold"'
+            )
+        return InputsGripper(name, dependencies.get(name))
+
+    close_threshold = as_float(
+        raw.get("close_threshold", _DEFAULT_CLOSE_THRESHOLD),
+        "gripper.close_threshold",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    return ThresholdGripper(name, dependencies.get(name), close_threshold)
