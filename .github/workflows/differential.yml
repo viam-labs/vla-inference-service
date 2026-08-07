@@ -13,4 +13,13 @@ jobs:
       - name: Track lerobot main
         if: matrix.lerobot == 'main'
         run: uv pip install "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@main"
-      - run: uv run pytest -m differential -v
+      # --no-sync is required: plain `uv run` re-syncs the environment
+      # against uv.lock before running the command, which silently
+      # reinstalls the pinned lerobot over the `main` checkout just
+      # installed above -- verified by reproducing both directions
+      # locally (`uv pip install X`, then `uv run ... -> reverted`,
+      # `uv run --no-sync ... -> preserved`). Without this flag both
+      # matrix legs test the exact same pinned SHA and the 'main' leg's
+      # entire purpose (catch an upstream merge-semantics change before
+      # it reaches the robot) silently does nothing.
+      - run: uv run --no-sync pytest -m differential -v
