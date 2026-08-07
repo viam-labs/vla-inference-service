@@ -2610,7 +2610,12 @@ jobs:
       - name: Track lerobot main
         if: matrix.lerobot == 'main'
         run: uv pip install "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@main"
-      - run: uv run pytest -m differential -v
+      # --no-sync is load-bearing: plain `uv run` re-syncs the environment to
+      # the lockfile and silently undoes the line above, so BOTH matrix legs
+      # would test the pinned SHA and the upstream-drift alarm would never fire.
+      # Verified: after `uv pip install pytest==8.4.2`, `uv run` reports 9.1.1
+      # (the locked version) while `uv run --no-sync` reports 8.4.2.
+      - run: uv run --no-sync pytest -m differential -v
 ```
 
 The `main` leg is the point: if upstream changes merge semantics, the build breaks instead of the robot. Allow it to fail loudly rather than silently skipping.
