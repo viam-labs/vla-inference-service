@@ -636,6 +636,10 @@ git commit -m "feat: add wire codec for image and matrix payloads"
 
 ## Task 3: Policy config
 
+> **Implemented** — `1407a43`, `d9d286d`, `7d486b1`. Review pulled the
+> coercion helpers out into `config_util.py` (shared with Task 4) and
+> hardened `PolicyConfig.__repr__` to redact `hf_token_env`.
+
 **Files:**
 - Create: `src/vla/policy/__init__.py`, `src/vla/policy/config.py`
 - Test: `tests/policy/test_config.py`
@@ -823,6 +827,10 @@ git commit -m "feat: add policy config parsing and validation"
 ---
 
 ## Task 4: Checkpoint resolver
+
+> **Implemented** — `bcc4c23`, `fc9f76d`, `dd3ea1c`. Review added an
+> actionable error when `huggingface_hub` is missing and closed a
+> token-disclosure path in the resolver's error/log messages.
 
 **Files:**
 - Create: `src/vla/policy/resolver.py`
@@ -1026,6 +1034,13 @@ git commit -m "feat: add checkpoint resolver for local and hub sources"
 ---
 
 ## Task 5: PolicyBackend ABC and fake backend
+
+> **Implemented** — `b859edb`, `6755c40`. Review found the fake backend
+> would let several classes of Task 7 bug pass green: it predicted before
+> `load()`, conflated `state_dim` with `action_dim`, declared only one
+> camera, and raced `call_count`/`last_rtc` under concurrent calls. `6755c40`
+> hardens all four and adds `state_dim`/`dtype` to `PolicySpecs`. Code below
+> is re-synced with that hardening.
 
 **Files:**
 - Create: `src/vla/policy/backend.py`, `src/vla/policy/fake_backend.py`
@@ -1258,6 +1273,13 @@ git commit -m "feat: add PolicyBackend ABC and deterministic fake backend"
 ---
 
 ## Task 6: Prefix normalization
+
+> **Implemented** — `a3051de`, `3bacaef`. Verified against
+> `lerobot/rollout/inference/rtc.py:83-94` at the pinned SHA: same
+> truncation/padding semantics, but always returns a copy (upstream
+> aliases/views the input) since the RTC scheduler feeds this output back
+> into the action queue on a later tick. `3bacaef` closes a bare-`TypeError`
+> path on a non-integer `target_steps`. Code below is re-synced with that fix.
 
 This is small but load-bearing. Upstream pads or truncates the RTC prefix to `execution_horizon` before inference. Skip it and `denoise_step` silently shrinks the horizon to the prefix length, changing the guidance weights — wrong motion, no error. See spec section "LeRobotBackend.predict_chunk owns prefix normalization".
 
@@ -1529,6 +1551,7 @@ from viam.resource.types import Model, ModelFamily
 from viam.services.generic import Generic
 from viam.utils import struct_to_dict
 
+from ..config_util import VLAError
 from ..wire import WireError, decode_image, decode_matrix, decode_vector, encode_matrix
 from .backend import PolicyBackend
 from .config import PolicyConfig
