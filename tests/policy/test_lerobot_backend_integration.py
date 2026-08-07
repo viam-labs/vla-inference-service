@@ -16,7 +16,11 @@ from vla.policy.fake_backend import FakePolicyBackend
 pytestmark = pytest.mark.integration
 
 CHECKPOINT = "lerobot/smolvla_base"
-EXECUTION_HORIZON = 10
+# Deliberately NOT lerobot's own RTCConfig default (10, see
+# lerobot/policies/rtc/configuration_rtc.py) -- a backend that forgot to
+# propagate the configured execution_horizon and fell back to the library
+# default would otherwise pass this suite by coincidence.
+EXECUTION_HORIZON = 6
 
 
 def _images_for(specs: PolicySpecs) -> dict[str, np.ndarray]:
