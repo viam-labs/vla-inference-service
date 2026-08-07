@@ -32,6 +32,41 @@ You likely have not worked with either of these systems. Three things will save 
 
 Use @superpowers:test-driven-development throughout. Every task is red → green → commit.
 
+### Standing test requirements
+
+Every task's test list below is a **floor, not a ceiling.** Three separate review
+rounds on this project found the specified suites substantially weaker than they
+looked (43% mutant survival on Task 3), always for the same reasons. Before
+committing any task, add tests covering these unless they genuinely do not apply:
+
+1. **Assert valid values are accepted, not only that invalid ones are rejected.**
+   This is the blind spot that keeps recurring. A suite that only tests rejection
+   stays green when an enum tuple loses a member — so a one-character typo in
+   `DTYPES` would reject every GPU deployment silently. Parametrize over every
+   member of every allowed set and assert the value lands on the parsed result.
+
+2. **Assert defaults, not just overrides.** A default that silently changes is
+   invisible to a suite that only exercises the override path.
+
+3. **Every field must be asserted somewhere.** A field nothing reads can be
+   hardcoded to `None` by a mutation and no test notices.
+
+4. **Numbers arrive from protobuf `Struct` as doubles.** Anything parsed from a
+   Viam config or a `DoCommand` payload gets `2.0`, never `2`. Test the float
+   form of every integer field, and test that a fractional value is rejected
+   rather than silently truncated.
+
+5. **Error paths must raise this module's own exception type**, not a bare
+   `ValueError`/`TypeError`/`AttributeError` escaping from a builtin. Callers
+   write `except ConfigError` / `except WireError`; anything else walks past them.
+
+6. **Fixtures must be able to fail.** Non-square images catch transposition that
+   square ones cannot; a shape used in one test should differ from the shape
+   hardcoded anywhere else.
+
+Where mutation testing is cheap, run it — deliberately break a branch and confirm
+a test goes red. A test that cannot fail is not evidence.
+
 ---
 
 ## File Structure
@@ -41,7 +76,8 @@ src/
   vla/
     __init__.py
     main.py                            entrypoint (must live under vla/ to be packaged)
-    wire.py                            shared wire codec (images, float matrices)
+    wire.py                            shared wire codec (images, matrices, vectors)
+    config_util.py                     ConfigError + as_int/as_float/as_bool/as_str/as_choice
     policy/
       __init__.py
       config.py                        PolicyConfig parse + validate
@@ -80,6 +116,12 @@ tests/
 ```
 
 Why this split: `policy/` and `controller/` never import each other — they communicate only through the wire format in `wire.py`. Everything in `controller/` is pure numpy and can be tested with no model present. `lerobot_backend.py` is the only file that imports `lerobot`, and it does so lazily inside methods.
+
+`config_util.py` holds `ConfigError` and the coercion helpers for **both** config
+modules. It exists because protobuf `Struct` delivers every number as a double,
+so every numeric field needs the same "accept `2.0`, reject `2.5`, reject `True`,
+reject NaN" treatment — and because two separate `ConfigError` classes would mean
+`validate_config` has to catch both or let one escape unhandled.
 
 ---
 
@@ -3570,6 +3612,15 @@ git commit -m "feat: add sequential chunk scheduler"
 ---
 
 ## Task 16: Controller config
+
+> **Use `src/vla/config_util.py`.** The code below predates that module and
+> hand-rolls its coercion and range checks. Every `float(raw.get(...))`,
+> `int(raw.get(...))`, and `if x not in TUPLE` here should be a call to
+> `as_float` / `as_int` / `as_choice` with `minimum=`/`maximum=` folded in.
+> Import `ConfigError` from `vla.config_util`, do **not** define a second one —
+> two `ConfigError` classes means `validate_config` must catch both or let one
+> escape unhandled. This config has ~10 numeric fields plus five in the nested
+> `safety` block, which is exactly why the helpers were extracted.
 
 **Files:**
 - Create: `src/vla/controller/config.py`
