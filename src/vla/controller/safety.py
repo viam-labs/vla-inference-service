@@ -11,10 +11,14 @@ arm. Order matters and is deliberately fixed:
   4. Joint limit clamp from the optional `joint_limits_degs` config,
      indexed in action-vector order, with a trailing gripper pair only when
      the gripper channel is itself in degrees (`gripper.type == "arm_joint"`).
-  5. `MoveOptions` velocity/acceleration/TCP-speed ceilings are applied by
-     the caller (the controller service, handing them to
-     `move_through_joint_positions`) -- not here. This layer only ever
-     produces a target position.
+  5. There is no driver-side ceiling. `MoveOptions` -- and the
+     `move_through_joint_positions` call that would carry it -- ship in no
+     released viam-sdk, so the velocity bound is enforced entirely by layer 3:
+     `ControllerConfig` derives `max_joint_delta_degs = max_vel_degs_per_sec /
+     fps`, making the per-step delta clamp *the* velocity limit rather than a
+     redundant backstop. Acceleration and TCP-speed limiting are unavailable;
+     `check_start` covers the large-initial-jump case they would have softened.
+     This layer only ever produces a target position.
   6. Every clamp is logged and counted in `clamp_counts`, split by which
      layer fired (`delta` / `limit` / `gripper`). Persistent clamping is the
      project's single most likely bug class: wrong units or wrong joint
