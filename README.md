@@ -30,7 +30,7 @@ install at all.
   the macOS wheels omit, so the Linux figure will be **substantially larger** — measure
   on the actual target image (Jetson in particular) before committing to it. The base
   install (no `lerobot` extra — config parsing, the controller's pure-numpy code, the
-  wire codec) has no torch dependency at all and is much smaller.
+  wire codec) has no torch dependency at all and measured **81 MB** on the same machine.
 
 ## `#policy` — `viam-labs:vla:policy`
 
