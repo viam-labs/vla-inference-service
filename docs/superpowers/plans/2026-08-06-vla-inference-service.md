@@ -1597,11 +1597,18 @@ class VLAPolicy(Generic, EasyResource):
         self._backend = self._backend_factory()
         if self._load_task and not self._load_task.done():
             self._load_task.cancel()
-        # Cancelling only abandons the await. The resolver and backend.load run
-        # inside asyncio.to_thread, so the worker thread keeps downloading and
-        # keeps an executor slot. Bump a generation counter so a superseded load
-        # cannot write state after a newer one started; without this, a slow
-        # first load can overwrite the result of the config that replaced it.
+        # Defense in depth, not a live race guard. The Python SDK implements
+        # reconfigure as remove-then-add (module.py:237-250: `await
+        # resource.close()`, then a fresh instance from the creator), so
+        # reconfigure() is never called twice on one object in production, and
+        # cancellation already covers the in-process case. The counter costs
+        # nothing and would matter if either of those assumptions changed.
+        #
+        # The real hazard on that path is close(): cancelling only abandons the
+        # await, and the resolver runs inside asyncio.to_thread, so an orphaned
+        # download keeps running — and the replacement instance viam-server
+        # immediately constructs will block on the filelock the orphan holds in
+        # the HF cache, appearing wedged for reasons its own logs never explain.
         self._generation += 1
         self._load_task = asyncio.create_task(self._load(self._generation))
 
