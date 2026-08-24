@@ -1101,7 +1101,9 @@ Four sites, all of which currently state something now false or incomplete. No t
 
 - [ ] **Step 1: Correct the adapter module docstring**
 
-`gripper.py:1-26` says "Viam offers three components" and describes `inputs` as "normalized 0..1". Update the count, add the `do_command` variant, and correct the `inputs` description: `get_current_inputs`/`go_to_inputs` are a frame-system interface carrying one value per kinematic DOF in radians or meters, so those variants work only against a driver whose gripper model is *jointed*; most gripper models, `devrel:so101:gripper` included, are zero-DOF. Keep the closing unit-convention paragraph, extending it to note `do_command` is normalized like the others.
+> **Partly already done.** Task 2 corrected the `inputs`/`threshold` unit description at `gripper.py:12-13` and updated `GripperRuntimeError`'s docstring, because the design spec §3 named that site as belonging in the same commit as the code change and it needed nothing from the `do_command` type. Re-read the docstring before editing and do not redo that part.
+
+What remains here: `gripper.py:1-26` still says "Viam offers three components" — update the count, and add the `do_command` variant to the list. Extend the closing unit-convention paragraph to note `do_command` is normalized like the others.
 
 - [ ] **Step 2: Add the variant to the safety docstring**
 
@@ -1171,6 +1173,22 @@ assert 'do_command' in GRIPPER_TYPES
 ```
 
 Then re-read each of the four edited passages against the implementation. Every config key named in the README must exist in `make_gripper_adapter`, and every key it accepts must appear in the README.
+
+Finally, add a guard against a class of error this branch already contains once. Task 2's empty-inputs message names `gripper.type="do_command"` — a value that did not exist when that commit landed, and would have been a dead end for anyone reading it from a partial merge. Assert that every gripper type named inside an error string is real:
+
+```python
+uv run python -c "
+import re, pathlib
+from vla.controller.gripper import GRIPPER_TYPES
+src = pathlib.Path('src/vla/controller/gripper.py').read_text()
+named = set(re.findall(r'gripper\.type=\"([a-z_]+)\"', src))
+missing = named - set(GRIPPER_TYPES)
+assert not missing, f'error strings name nonexistent gripper types: {missing}'
+print(f'ok: {sorted(named)} all in GRIPPER_TYPES')
+"
+```
+
+This retires the risk structurally rather than relying on the branch always merging as a unit.
 
 - [ ] **Step 6: Commit**
 
