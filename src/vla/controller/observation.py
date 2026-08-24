@@ -81,6 +81,7 @@ class ObservationBuilder:
         image_sizes: Mapping[str, tuple[int, int]],
         image_encoding: str = "jpeg",
         jpeg_quality: int = 90,
+        image_fit: str = "pad",
         duration_warn_s: float = DEFAULT_DURATION_WARN_S,
         stale_frame_warn_s: float = STALE_FRAME_WARN_S,
     ) -> None:
@@ -92,6 +93,7 @@ class ObservationBuilder:
         self._sizes = dict(image_sizes)
         self._encoding = image_encoding
         self._quality = jpeg_quality
+        self._fit = image_fit
         self._duration_warn_s = duration_warn_s
         self._stale_frame_warn_s = stale_frame_warn_s
 
@@ -202,10 +204,28 @@ class ObservationBuilder:
             raise ObservationError(
                 f"no expected size for {key!r}; policy specs did not declare it"
             )
-        if arr.shape[:2] != tuple(size):
-            arr = np.asarray(
-                Image.fromarray(arr).resize((size[1], size[0]), Image.BILINEAR), dtype=np.uint8
-            )
+        target_h, target_w = int(size[0]), int(size[1])
+        if arr.shape[:2] != (target_h, target_w):
+            if self._fit == "stretch":
+                # The original behavior, kept as the explicit non-default
+                # choice: a plain resize onto the declared shape, distorting
+                # a 16:9 camera frame into whatever aspect the checkpoint
+                # declares (often square). Measured divergence from the
+                # geometry training actually saw: ~8.27 deg vs. ~3.2-4.1 deg
+                # for the aspect-preserving "pad" default -- see the README.
+                arr = np.asarray(
+                    Image.fromarray(arr).resize((target_w, target_h), Image.BILINEAR),
+                    dtype=np.uint8,
+                )
+            elif self._fit == "pad":
+                arr = self._resize_with_pad(arr, target_h, target_w)
+            else:
+                # Unreachable via config (as_choice over IMAGE_FITS gates
+                # it), but spelled out rather than left as an `else: pad`
+                # fallthrough: a third mode added to IMAGE_FITS later would
+                # otherwise silently inherit padding instead of failing
+                # until someone noticed the geometry was wrong.
+                raise ObservationError(f"unrecognized image_fit {self._fit!r}")
         try:
             return encode_image(arr, encoding=self._encoding, quality=self._quality)
         except WireError as exc:
@@ -214,6 +234,36 @@ class ObservationBuilder:
             # about WireError to cover every rejection path this method can
             # raise -- the same convention gripper.py uses for config_util.
             raise ObservationError(f"could not encode image for {key!r}: {exc}") from exc
+
+    @staticmethod
+    def _resize_with_pad(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+        """Resize preserving aspect ratio, padding black on the LEFT and TOP.
+
+        Mirrors lerobot's `resize_with_pad`
+        (lerobot/policies/common/vla_utils.py:219) -- smolvla's own
+        convention, computed by scaling by `ratio = max(cur_w/target_w,
+        cur_h/target_h)` so the resized image never exceeds the target in
+        either dimension, then padding whatever's left on the left/top with
+        zeros (black). This is NOT the centered-padding variant lerobot
+        also ships (:142, openpi's convention) -- padding the wrong side
+        would be as wrong as stretching, since the policy never saw that
+        geometry during training either. Handles upscaling (source smaller
+        than target) the same way: `ratio` just comes out < 1.
+        """
+        cur_h, cur_w = arr.shape[:2]
+        ratio = max(cur_w / target_w, cur_h / target_h)
+        resized_h = max(1, int(cur_h / ratio))
+        resized_w = max(1, int(cur_w / ratio))
+        resized = np.asarray(
+            Image.fromarray(arr).resize((resized_w, resized_h), Image.BILINEAR), dtype=np.uint8
+        )
+
+        pad_h = max(0, target_h - resized_h)
+        pad_w = max(0, target_w - resized_w)
+        padded_shape = (target_h, target_w) + arr.shape[2:]
+        padded = np.zeros(padded_shape, dtype=np.uint8)
+        padded[pad_h : pad_h + resized_h, pad_w : pad_w + resized_w] = resized
+        return padded
 
     def _build_state(self, joint_degrees: list[float], gripper_value: float | None) -> np.ndarray:
         selected = []

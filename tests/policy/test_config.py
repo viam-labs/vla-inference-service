@@ -360,3 +360,113 @@ def test_rejects_nan_load_timeout():
 def test_repr_includes_load_timeout_s():
     cfg = PolicyConfig.parse({"model_path": "/m", "load_timeout_s": 42.0})
     assert "load_timeout_s=42.0" in repr(cfg)
+
+
+# --- unused_image_features: a fine-tune of lerobot/smolvla_base inherits
+# all three of its base image features into config.json regardless of how
+# many cameras the fine-tuning dataset actually had (train.py:285 refuses
+# rename_map without a pretrained checkpoint) -- this field tells the
+# backend which of the checkpoint's declared image features to drop.
+
+
+def test_unused_image_features_defaults_to_empty_tuple():
+    cfg = PolicyConfig.parse({"model_path": "/m"})
+    assert cfg.unused_image_features == ()
+
+
+def test_unused_image_features_parses_a_valid_list():
+    cfg = PolicyConfig.parse(
+        {"model_path": "/m", "unused_image_features": ["observation.images.camera3"]}
+    )
+    assert cfg.unused_image_features == ("observation.images.camera3",)
+
+
+def test_unused_image_features_parses_multiple_entries():
+    cfg = PolicyConfig.parse(
+        {
+            "model_path": "/m",
+            "unused_image_features": [
+                "observation.images.camera2",
+                "observation.images.camera3",
+            ],
+        }
+    )
+    assert cfg.unused_image_features == (
+        "observation.images.camera2",
+        "observation.images.camera3",
+    )
+
+
+def test_unused_image_features_null_means_absent():
+    cfg = PolicyConfig.parse({"model_path": "/m", "unused_image_features": None})
+    assert cfg.unused_image_features == ()
+
+
+def test_unused_image_features_rejects_non_list():
+    with pytest.raises(ConfigError, match="unused_image_features"):
+        PolicyConfig.parse({"model_path": "/m", "unused_image_features": "observation.images.camera3"})
+
+
+def test_unused_image_features_rejects_non_list_dict():
+    with pytest.raises(ConfigError, match="unused_image_features"):
+        PolicyConfig.parse({"model_path": "/m", "unused_image_features": {"key": "value"}})
+
+
+def test_unused_image_features_rejects_non_string_element():
+    with pytest.raises(ConfigError, match="unused_image_features\\[0\\]"):
+        PolicyConfig.parse({"model_path": "/m", "unused_image_features": [1]})
+
+
+def test_unused_image_features_rejects_duplicate_entries():
+    with pytest.raises(ConfigError, match="duplicate"):
+        PolicyConfig.parse(
+            {
+                "model_path": "/m",
+                "unused_image_features": [
+                    "observation.images.camera3",
+                    "observation.images.camera3",
+                ],
+            }
+        )
+
+
+def test_unused_image_features_rejects_empty_string_entry():
+    with pytest.raises(ConfigError, match="unused_image_features\\[0\\]"):
+        PolicyConfig.parse({"model_path": "/m", "unused_image_features": [""]})
+
+
+def test_unused_image_features_rejects_whitespace_only_entry():
+    with pytest.raises(ConfigError, match="unused_image_features\\[0\\]"):
+        PolicyConfig.parse({"model_path": "/m", "unused_image_features": ["   "]})
+
+
+def test_repr_includes_unused_image_features():
+    cfg = PolicyConfig.parse(
+        {"model_path": "/m", "unused_image_features": ["observation.images.camera3"]}
+    )
+    assert "unused_image_features=('observation.images.camera3',)" in repr(cfg)
+
+
+def test_unused_image_features_strips_surrounding_whitespace():
+    cfg = PolicyConfig.parse(
+        {
+            "model_path": "/tmp/ckpt",
+            "unused_image_features": ["  observation.images.camera3  "],
+        }
+    )
+    # Untrimmed, this would parse cleanly and then fail at load with
+    # "checkpoint does not declare", naming a key that reads as correct.
+    assert cfg.unused_image_features == ("observation.images.camera3",)
+
+
+def test_unused_image_features_treats_whitespace_padded_duplicates_as_duplicates():
+    with pytest.raises(ConfigError, match="duplicate"):
+        PolicyConfig.parse(
+            {
+                "model_path": "/tmp/ckpt",
+                "unused_image_features": [
+                    "observation.images.camera3",
+                    " observation.images.camera3 ",
+                ],
+            }
+        )

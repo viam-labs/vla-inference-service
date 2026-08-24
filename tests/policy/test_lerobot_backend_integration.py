@@ -319,3 +319,115 @@ def test_rtc_predict_chunk_normalizes_a_wrong_length_prefix(rtc_backend, monkeyp
     # Proves normalize_prefix_length was actually invoked (not skipped) and
     # invoked with this backend's configured execution_horizon.
     assert calls == [((3, s.action_dim), EXECUTION_HORIZON)]
+
+
+# ---------------------------------------------------------------------------
+# unused_image_features against the real checkpoint. lerobot/smolvla_base
+# declares all three of observation.images.camera1/2/3 (see
+# test_specs_every_field_is_populated above) -- exactly the base checkpoint
+# the field's own docstring describes, so this is the most direct possible
+# check that dropping a declared camera here really does let
+# predict_chunk run on the reduced set, and that the advisory heuristic
+# behaves the way its own comment says it will on a real checkpoint whose
+# VISUAL features are identity-normalized with no rename history.
+# ---------------------------------------------------------------------------
+
+
+def test_unused_image_features_reduces_specs_and_predict_chunk_needs_no_filler(checkpoint_path):
+    from vla.policy.lerobot_backend import LeRobotBackend
+
+    b = LeRobotBackend()
+    b.load(
+        checkpoint_path,
+        device="cpu",
+        dtype="auto",
+        rtc=None,
+        unused_image_features=frozenset({"observation.images.camera3"}),
+    )
+    s = b.specs
+    assert s.declared_image_feature_keys == [
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+    ]
+    assert s.image_feature_keys == [
+        "observation.images.camera1",
+        "observation.images.camera2",
+    ]
+
+    # _images_for reads specs.image_feature_keys, so this only ever builds
+    # the two remaining cameras -- no filler for camera3 at all.
+    images = _images_for(s)
+    assert set(images) == {"observation.images.camera1", "observation.images.camera2"}
+    actions, raw = b.predict_chunk(images, _state_for(s), "pick up the red block", None)
+    assert actions.shape == (s.n_action_steps, s.action_dim)
+    assert np.all(np.isfinite(actions))
+    assert np.all(np.isfinite(raw))
+
+
+def test_unused_image_features_rejects_a_key_this_checkpoint_never_declared(checkpoint_path):
+    from vla.config_util import ConfigError
+    from vla.policy.lerobot_backend import LeRobotBackend
+
+    b = LeRobotBackend()
+    with pytest.raises(ConfigError, match="observation.images.nonexistent"):
+        b.load(
+            checkpoint_path,
+            device="cpu",
+            dtype="auto",
+            rtc=None,
+            unused_image_features=frozenset({"observation.images.nonexistent"}),
+        )
+
+
+def test_unused_image_features_rejects_dropping_every_camera(checkpoint_path):
+    from vla.config_util import ConfigError
+    from vla.policy.lerobot_backend import LeRobotBackend
+
+    b = LeRobotBackend()
+    with pytest.raises(ConfigError, match="every image feature"):
+        b.load(
+            checkpoint_path,
+            device="cpu",
+            dtype="auto",
+            rtc=None,
+            unused_image_features=frozenset(
+                {
+                    "observation.images.camera1",
+                    "observation.images.camera2",
+                    "observation.images.camera3",
+                }
+            ),
+        )
+
+
+def test_advisory_warning_stays_silent_on_a_checkpoint_with_no_rename_map(checkpoint_path, caplog):
+    """smolvla_base is the heuristic's worst case, and it must say nothing.
+
+    Its VISUAL features are identity-normalized (so no normalizer stats)
+    *and* its keys were never renamed (empty rename_map), which without the
+    empty-rename-map guard makes all three of its own declared cameras look
+    "suspicious" -- a warning that is 100% false positives on the single
+    most common base checkpoint, which is how operators learn to ignore
+    warnings. An empty rename map is also exactly the signature of a
+    checkpoint that was never fine-tuned with camera renaming, i.e. one
+    where the inheritance case this warning exists to catch cannot arise.
+
+    The true-positive half of this heuristic is covered by
+    tests/policy/test_lerobot_backend.py, which can build a non-empty
+    rename map directly without downloading a checkpoint.
+    """
+    import logging
+
+    from vla.policy.lerobot_backend import LeRobotBackend
+
+    b = LeRobotBackend()
+    with caplog.at_level(logging.WARNING, logger="vla.policy.lerobot_backend"):
+        b.load(checkpoint_path, device="cpu", dtype="auto", rtc=None)
+
+    # Sanity-check the premise rather than just asserting silence: if a
+    # future lerobot release ships smolvla_base with a rename map, this
+    # test would otherwise keep passing while no longer testing anything.
+    assert len(b.specs.declared_image_feature_keys) == 3
+    warnings = [r.message for r in caplog.records if "unused_image_features" in r.message]
+    assert warnings == []

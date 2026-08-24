@@ -894,6 +894,122 @@ async def test_infer_rejects_unexpected_image_keys(tmp_path):
         })
 
 
+# ---------------------------------------------------------------------------
+# unused_image_features: the checkpoint-declares-more-than-it-consumes case
+# (PolicyConfig.unused_image_features / the smolvla_base inheritance).
+# ---------------------------------------------------------------------------
+
+
+async def test_specs_reports_reduced_and_declared_image_feature_keys(tmp_path):
+    _make_checkpoint(tmp_path)
+    camera_keys = (
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+    )
+    svc = VLAPolicy("p")
+    svc._backend_factory = lambda: FakePolicyBackend(
+        action_dim=4, n_action_steps=5, camera_keys=camera_keys
+    )
+    svc.reconfigure(
+        _config({
+            "model_path": str(tmp_path),
+            "unused_image_features": ["observation.images.camera3"],
+        }),
+        {},
+    )
+    await svc.await_ready()
+
+    specs = await svc.do_command({"command": "specs"})
+    assert specs["image_feature_keys"] == [
+        "observation.images.camera1",
+        "observation.images.camera2",
+    ]
+    assert specs["declared_image_feature_keys"] == list(camera_keys)
+
+
+async def test_infer_accepts_reduced_set_and_rejects_declared_set_as_extra(tmp_path):
+    _make_checkpoint(tmp_path)
+    camera_keys = (
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+    )
+    svc = VLAPolicy("p")
+    svc._backend_factory = lambda: FakePolicyBackend(
+        action_dim=4, n_action_steps=5, camera_keys=camera_keys
+    )
+    svc.reconfigure(
+        _config({
+            "model_path": str(tmp_path),
+            "unused_image_features": ["observation.images.camera3"],
+        }),
+        {},
+    )
+    await svc.await_ready()
+
+    img = np.zeros((224, 224, 3), dtype=np.uint8)
+    # Exactly the reduced set (image_feature_keys) is accepted.
+    await svc.do_command({
+        "command": "infer",
+        "images": {
+            "observation.images.camera1": encode_image(img),
+            "observation.images.camera2": encode_image(img),
+        },
+        "state": encode_vector(np.zeros(4, dtype=np.float32)),
+        "task": "t",
+    })
+
+    # The full declared set -- including the checkpoint-only camera3 -- is
+    # rejected: camera3 shows up as `extra`, exactly the case
+    # unused_image_features exists to make unsatisfiable (there is no
+    # harmless value to feed that slot; see the config field's docstring).
+    with pytest.raises(Exception, match="extra"):
+        await svc.do_command({
+            "command": "infer",
+            "images": {k: encode_image(img) for k in camera_keys},
+            "state": encode_vector(np.zeros(4, dtype=np.float32)),
+            "task": "t",
+        })
+
+
+async def test_unused_image_features_unknown_key_fails_load(tmp_path):
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    svc._backend_factory = lambda: FakePolicyBackend(
+        camera_keys=("observation.images.top",)
+    )
+    svc.reconfigure(
+        _config({
+            "model_path": str(tmp_path),
+            "unused_image_features": ["observation.images.nonexistent"],
+        }),
+        {},
+    )
+    await svc.await_ready(expect_failure=True)
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed"
+    assert "observation.images.nonexistent" in status["error"]
+
+
+async def test_unused_image_features_listing_every_camera_fails_load(tmp_path):
+    _make_checkpoint(tmp_path)
+    camera_keys = ("observation.images.camera1", "observation.images.camera2")
+    svc = VLAPolicy("p")
+    svc._backend_factory = lambda: FakePolicyBackend(camera_keys=camera_keys)
+    svc.reconfigure(
+        _config({
+            "model_path": str(tmp_path),
+            "unused_image_features": list(camera_keys),
+        }),
+        {},
+    )
+    await svc.await_ready(expect_failure=True)
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed"
+    assert "every image feature" in status["error"]
+
+
 async def test_infer_rejects_non_string_task(tmp_path):
     svc = await _ready_service(tmp_path, action_dim=4, n_action_steps=5)
     with pytest.raises(Exception, match="task"):

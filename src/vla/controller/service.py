@@ -474,6 +474,7 @@ class VLAController(Generic, EasyResource):
                 image_sizes=image_sizes,
                 image_encoding=cfg.image_encoding,
                 jpeg_quality=cfg.jpeg_quality,
+                image_fit=cfg.image_fit,
                 duration_warn_s=cfg.duration_warn_s,
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
             )

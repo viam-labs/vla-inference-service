@@ -53,6 +53,7 @@ def test_parses_minimal_config():
     assert cfg.action_units == "degrees"
     assert cfg.image_encoding == "jpeg"
     assert cfg.jpeg_quality == 90
+    assert cfg.image_fit == "pad"
 
 
 def test_default_safety_config():
@@ -438,6 +439,29 @@ def test_jpeg_quality_as_protobuf_double_is_accepted():
 def test_rejects_fractional_jpeg_quality():
     with pytest.raises(ConfigError, match="jpeg_quality"):
         ControllerConfig.parse({**BASE, "jpeg_quality": 90.5})
+
+
+# ---------------------------------------------------------------------------
+# image_fit -- "pad" (aspect-preserving, smolvla's resize_with_pad
+# convention) is the default; "stretch" is kept only so an existing
+# deployment can reproduce its pre-fix output. See observation.py.
+# ---------------------------------------------------------------------------
+
+
+def test_image_fit_defaults_to_pad():
+    cfg = ControllerConfig.parse(BASE)
+    assert cfg.image_fit == "pad"
+
+
+@pytest.mark.parametrize("fit", ["pad", "stretch"])
+def test_accepts_every_known_image_fit(fit):
+    cfg = ControllerConfig.parse({**BASE, "image_fit": fit})
+    assert cfg.image_fit == fit
+
+
+def test_rejects_unknown_image_fit():
+    with pytest.raises(ConfigError, match="image_fit"):
+        ControllerConfig.parse({**BASE, "image_fit": "crop"})
 
 
 # ---------------------------------------------------------------------------

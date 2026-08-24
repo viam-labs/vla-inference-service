@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .backend import PolicyBackend, PolicySpecs
+from .backend import PolicyBackend, PolicySpecs, resolve_image_feature_keys
 from .prefix import normalize_prefix_length
 
 LOGGER = logging.getLogger(__name__)
@@ -39,7 +39,15 @@ class LeRobotBackend(PolicyBackend):
         self._execution_horizon = 10
         self._rtc_enabled = False
 
-    def load(self, checkpoint_dir: str, *, device: str, dtype: str, rtc: Any | None) -> None:
+    def load(
+        self,
+        checkpoint_dir: str,
+        *,
+        device: str,
+        dtype: str,
+        rtc: Any | None,
+        unused_image_features: frozenset[str] = frozenset(),
+    ) -> None:
         import torch
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
@@ -89,7 +97,9 @@ class LeRobotBackend(PolicyBackend):
         self._preprocessor = preprocessor
         self._postprocessor = postprocessor
         self._device = resolved_device
-        self._specs = self._build_specs(cfg, policy, supports_rtc, preprocessor, resolved_device)
+        self._specs = self._build_specs(
+            cfg, policy, supports_rtc, preprocessor, resolved_device, unused_image_features
+        )
 
     @staticmethod
     def _configure_rtc(policy, rtc) -> None:
@@ -122,7 +132,9 @@ class LeRobotBackend(PolicyBackend):
             for s in preprocessor.steps
         )
 
-    def _build_specs(self, cfg, policy, supports_rtc, preprocessor, device) -> PolicySpecs:
+    def _build_specs(
+        self, cfg, policy, supports_rtc, preprocessor, device, unused_image_features
+    ) -> PolicySpecs:
         input_features = {k: list(v.shape) for k, v in cfg.input_features.items()}
         output_features = {k: list(v.shape) for k, v in cfg.output_features.items()}
         action_dim = int(output_features["action"][0])
@@ -131,7 +143,18 @@ class LeRobotBackend(PolicyBackend):
         # Classify on FeatureType.VISUAL rather than a key-prefix guess: the
         # naming is a checkpoint's choice (smolvla_base uses
         # observation.images.camera1/2/3), the feature type is not.
-        image_keys = sorted(cfg.image_features.keys())
+        declared_image_keys = sorted(cfg.image_features.keys())
+        # A fine-tune of lerobot/smolvla_base inherits all three of its base
+        # image features into config.json's input_features regardless of how
+        # many cameras the fine-tuning dataset actually had (train.py:285
+        # refuses rename_map without a pretrained checkpoint, so the
+        # inherited features pass through verbatim) -- unused_image_features
+        # is the operator's way of telling this backend which declared keys
+        # are checkpoint artifacts, never fed at inference. Validated here,
+        # not merely subtracted, so a typo'd key name fails loudly instead of
+        # silently doing nothing.
+        image_keys = resolve_image_feature_keys(declared_image_keys, unused_image_features)
+        self._warn_about_likely_unused_features(declared_image_keys, unused_image_features, preprocessor)
         # dtype is deliberately read off a live parameter rather than echoing
         # the requested string: load() never casts weights (see the warning
         # above), so the requested dtype and the checkpoint's actual dtype
@@ -145,12 +168,79 @@ class LeRobotBackend(PolicyBackend):
             input_features=input_features,
             output_features=output_features,
             image_feature_keys=image_keys,
+            declared_image_feature_keys=declared_image_keys,
             supports_rtc=supports_rtc,
             rtc_enabled=self._rtc_enabled,
             relative_actions=self._detect_relative_actions(preprocessor),
             device=device,
             dtype=dtype,
         )
+
+    @staticmethod
+    def _warn_about_likely_unused_features(
+        declared_image_keys: list[str], unused_image_features: frozenset[str], preprocessor
+    ) -> None:
+        """Advisory-only nudge toward a declared image key an operator forgot to list.
+
+        Deliberately never raises and never changes `image_keys` -- it only
+        logs. "No stats and no rename target" stays too weak a signal to
+        *act* on automatically: VISUAL features are IDENTITY-normalized
+        (lerobot/processor/normalize_processor.py's norm_map), so a
+        perfectly legitimate, actually-fed camera can have no normalizer
+        stats at all. The heuristic is good enough to point a human at a
+        candidate worth double-checking, not good enough to silently drop a
+        camera over.
+
+        Checkpoints with no rename map at all are skipped outright rather
+        than warned about -- see the comment on that early return below.
+
+        Wrapped in try/except: an unexpected processor shape (a future
+        lerobot release, a custom pipeline) must never fail the load just
+        because this advisory check couldn't make sense of it.
+        """
+        try:
+            from lerobot.processor import NormalizerProcessorStep, RenameObservationsProcessorStep
+
+            stats_keys: set[str] = set()
+            rename_targets: set[str] = set()
+            for step in preprocessor.steps:
+                if isinstance(step, NormalizerProcessorStep):
+                    stats_keys |= set(step.stats or {})
+                if isinstance(step, RenameObservationsProcessorStep):
+                    rename_targets |= set(step.rename_map.values())
+
+            # An empty rename map carries no information: the "not a rename
+            # target" clause below is then vacuously true for every declared
+            # key, so the check degenerates into "warn about every camera
+            # without normalizer stats" and fires on all three of
+            # lerobot/smolvla_base's own cameras (its stats cover unrelated
+            # keys and it was never renamed). An empty map is also precisely
+            # the signature of a checkpoint that was *not* fine-tuned with
+            # camera renaming -- which is exactly where the inheritance case
+            # this warning exists to catch cannot arise. Staying silent
+            # costs nothing and keeps the warning worth reading.
+            if not rename_targets:
+                return
+
+            suspicious = sorted(
+                key
+                for key in declared_image_keys
+                if key not in unused_image_features
+                and key not in stats_keys
+                and key not in rename_targets
+            )
+            if suspicious:
+                LOGGER.warning(
+                    "checkpoint declares image feature(s) %s with no normalizer stats and no "
+                    "rename_observations_processor target; this is the same shape as the "
+                    "smolvla_base 3-camera inheritance case (see PolicyConfig.unused_image_features) "
+                    "-- if this camera is not actually fed by this robot, add it to "
+                    "unused_image_features. This is only a heuristic (a legitimately-used VISUAL "
+                    "feature can have no stats), so it may be a false positive.",
+                    suspicious,
+                )
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("unused_image_features advisory check could not run", exc_info=True)
 
     @property
     def specs(self) -> PolicySpecs | None:

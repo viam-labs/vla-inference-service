@@ -20,6 +20,23 @@ Splitting them this way means the policy can be tested with no robot attached, a
 control loop can be developed and tested against a fake policy with no GPU and no torch
 install at all.
 
+## Setting it up
+
+You configure both resources, in this order:
+
+1. **Configure the policy** with a checkpoint — a local path, a Viam registry package, or
+   a Hugging Face repo id. See [worked examples](#worked-config-examples).
+2. **Wait for it to load** — poll `{"command": "status"}` until `state` is `ready`. A
+   multi-GB checkpoint downloads in the background; `reconfigure()` returns immediately.
+3. **Ask it what it needs** — `{"command": "specs"}` reports `image_feature_keys`,
+   `state_dim`, and `action_dim`. These tell you what the controller's `cameras`,
+   `state_joint_indices`, and `gripper` must line up with.
+4. **Configure the controller** to match, then `{"command": "start"}`.
+
+The two settings most likely to bite you are `state_units`/`action_units` (see
+[Units](#units)) and the `cameras` map. If the arm moves but moves wrongly, check
+`status.clamp_counts` first.
+
 ## Requirements
 
 - **Python 3.12+.** LeRobot `main` requires it; a 3.11 venv fails to resolve.
@@ -45,30 +62,188 @@ Has no dependencies; `validate_config` always returns `([], [])`.
 | `model_revision` | string | `"main"` | Hub revision/tag/commit SHA. Ignored for `model_path`. |
 | `hf_token_env` | string | — | The **name** of an environment variable holding a Hugging Face token — never the token itself. Machine configs are readable by anyone with fleet access. |
 | `device` | `auto` \| `cuda` \| `mps` \| `cpu` | `"auto"` | `auto` tries cuda → mps → cpu, first available. Covers all three deployment targets with no per-machine edits. |
-| `dtype` | `auto` \| `float32` \| `bfloat16` \| `float16` | `"auto"` | Parsed and validated but **not yet applied** to loaded weights — see Limitations. |
+| `dtype` | `auto` \| `float32` \| `bfloat16` \| `float16` | `"auto"` | Parsed and validated but **not yet applied** to loaded weights — see [Limitations](#limitations). |
 | `warmup_inferences` | integer, 0–100 | `2` | Throwaway inferences run on synthetic input at load, before `status` reports `ready`. First-call latency on a cold GPU is often several times steady-state. |
 | `load_timeout_s` | number, 0.001–86400 | `1800` | Bounds checkpoint-resolve + load + warmup as a whole. A hang (stuck download, wedged deserialize) becomes `state: failed` with a message instead of `loading` forever. |
 | `rtc.enabled` | boolean | `false` | Enables the RTC processor on the policy, if the checkpoint supports it (ignored with a logged warning otherwise). |
 | `rtc.execution_horizon` | integer, 1–1000 | `10` | Mirrors lerobot's `RTCConfig.execution_horizon`. |
 | `rtc.prefix_attention_schedule` | `linear` \| `exp` \| `ones` \| `zeros` | `"linear"` | Mirrors `RTCConfig`. |
 | `rtc.max_guidance_weight` | number, >0–1000 | `10.0` | Mirrors `RTCConfig`. |
+| `unused_image_features` | array of string | `[]` | Declared image feature keys (from the checkpoint's own `config.json`) to drop before validating/serving `image_feature_keys` — see below. |
 
 `policy_type` is deliberately not configurable — it is read from the checkpoint's own
 `config.json`. Making it a config field would only create a way to contradict the
 checkpoint.
 
+### `unused_image_features`
+
+**Symptom:** your robot has two cameras, but `specs` reports three
+`image_feature_keys` and the controller refuses to start until you map all three.
+
+**Fix:** list the extra key here.
+
+```json
+{
+  "model_path": "/opt/viam/checkpoints/smolvla-box-bot",
+  "unused_image_features": ["observation.images.camera3"]
+}
+```
+
+`specs.image_feature_keys` now reports the two you actually feed, and the controller
+follows automatically. `specs.declared_image_feature_keys` still reports all three, so you
+can see what the checkpoint originally claimed. A key the checkpoint never declared fails
+at load, naming the real declared keys — so a typo does not quietly drop a camera.
+
+**Why this happens.** A fine-tune of `lerobot/smolvla_base` inherits all three of its base
+image features (`observation.images.camera1/2/3`) whatever the dataset actually had:
+`lerobot/configs/train.py:285` refuses a `rename_map` unless a pretrained checkpoint is
+given, so the base's `input_features` passes through verbatim.
+
+**Why drop it rather than feed it something.** Dropping the key reproduces lerobot's own
+behavior exactly — `modeling_smolvla.py:340-346` builds its image batch from whatever keys
+are present and only raises if none are — so the policy sees precisely what it saw in
+training. Filling the slot does not: measured on a real 2-camera fine-tune, black,
+mid-gray, and a duplicate of another camera each shift the predicted 50-step chunk by
+**5.7–7.8°** versus omitting it. No value brings that to zero.
+
+> **Measuring this yourself requires a fixed torch seed.** `predict_chunk` does not seed,
+> and smolvla's flow-matching sampler draws fresh noise per call, so two calls on
+> byte-identical inputs differ by a median of ~15° (up to ~29°) on their own. An unseeded
+> before/after comparison measures the sampler, not your change — and the numbers it
+> produces look entirely plausible.
+
+Two smaller notes:
+
+- **`input_features` still lists the dropped key**, because it reports what the checkpoint
+  declares. `image_feature_keys` is the only field that answers "which cameras do I feed"
+  — enumerating from `input_features` reintroduces the problem this field solves.
+- **A load-time warning names likely candidates** (a declared feature with no normalizer
+  stats and no rename target) but never acts on them: an identity-normalized VISUAL
+  feature can legitimately have no stats. Checkpoints with no rename map at all are
+  skipped, since that test then flags every camera — including all three of
+  `smolvla_base`'s own — and an absent rename map is exactly the case where this
+  inheritance cannot have happened.
+
 ### DoCommand
 
-| Command | Input | Output |
-|---|---|---|
-| `infer` | `images` (map of feature key → image payload — see below), `state` (`{"values": [f, ...]}`), `task` (string), optional `rtc` (`{"inference_delay": int, "prev_chunk_left_over": {"rows": [[...]]}}`) | `actions` (`{"rows": [[...]]}`, postprocessed, ready for the robot), `raw_actions` (same shape, policy-space — what an RTC caller feeds back as `prev_chunk_left_over`), `latency_s` |
-| `specs` | — | `policy_type`, `action_dim`, `state_dim`, `n_action_steps`, `input_features`, `output_features`, `image_feature_keys`, `supports_rtc`, `rtc_enabled`, `relative_actions`, `device`, `dtype` |
-| `status` | — | `state` (`idle` \| `loading` \| `ready` \| `failed`), `error` |
-| `reset` | — | `{"ok": true}` — clears any cached backend state |
+Every request names its command in a `"command"` field. `infer`, `specs`, and `reset`
+return an error unless `status` reports `ready`.
 
-An image payload is `{"encoding": "jpeg"|"png"|"raw", "data": "<base64>", "height": h,
-"width": w, "channels": c}` — see `src/vla/wire.py`. `infer`/`specs`/`reset` all raise
-while the policy is not `ready` (still `loading`, or `failed`).
+#### `status`
+
+Whether the policy has finished loading. Always safe to call.
+
+```json
+{ "command": "status" }
+```
+
+```json
+{ "state": "ready", "error": "" }
+```
+
+`state` is one of `idle`, `loading`, `ready`, `failed`. `error` is non-empty only when
+`state` is `failed`.
+
+#### `specs`
+
+What the loaded checkpoint expects and produces. Call this before configuring a
+controller — `image_feature_keys`, `state_dim`, and `action_dim` are what the
+controller's `cameras`, `state_joint_indices`, and `gripper` have to line up with.
+
+```json
+{ "command": "specs" }
+```
+
+```json
+{
+  "policy_type": "smolvla",
+  "action_dim": 6,
+  "state_dim": 6,
+  "n_action_steps": 50,
+  "input_features": {
+    "observation.state": [6],
+    "observation.images.camera1": [3, 256, 256],
+    "observation.images.camera2": [3, 256, 256]
+  },
+  "output_features": { "action": [6] },
+  "image_feature_keys": [
+    "observation.images.camera1",
+    "observation.images.camera2"
+  ],
+  "declared_image_feature_keys": [
+    "observation.images.camera1",
+    "observation.images.camera2",
+    "observation.images.camera3"
+  ],
+  "supports_rtc": true,
+  "rtc_enabled": false,
+  "relative_actions": false,
+  "device": "cuda",
+  "dtype": "bfloat16"
+}
+```
+
+#### `infer`
+
+One observation in, one whole action chunk out. `images` must contain exactly the keys in
+`specs.image_feature_keys` — no more, no fewer.
+
+```json
+{
+  "command": "infer",
+  "images": {
+    "observation.images.camera1": {
+      "encoding": "jpeg",
+      "data": "<base64>",
+      "height": 256,
+      "width": 256,
+      "channels": 3
+    }
+  },
+  "state": { "values": [-6.8, -11.3, -46.0, 2.6, 53.0, -30.4] },
+  "task": "open box flaps"
+}
+```
+
+```json
+{
+  "actions": { "rows": [[-7.1, -10.3, -47.9, 1.7, 56.5, -30.3]] },
+  "raw_actions": { "rows": [[0.06, 0.09, -0.12, -0.11, 0.03, 0.05]] },
+  "latency_s": 0.32
+}
+```
+
+`actions` has one row per step (`n_action_steps` of them) and is postprocessed, in the
+checkpoint's own units, ready for the robot. `raw_actions` is the same chunk in
+policy space — only an RTC caller needs it, to feed back as `prev_chunk_left_over`.
+`encoding` may be `jpeg`, `png`, or `raw`; see `src/vla/wire.py`.
+
+RTC callers add an optional `rtc` object:
+
+```json
+{
+  "command": "infer",
+  "images": { "...": {} },
+  "state": { "values": [] },
+  "task": "open box flaps",
+  "rtc": {
+    "inference_delay": 5,
+    "prev_chunk_left_over": { "rows": [[0.06, 0.09, -0.12, -0.11, 0.03, 0.05]] }
+  }
+}
+```
+
+#### `reset`
+
+Clears any cached backend state. Useful between episodes.
+
+```json
+{ "command": "reset" }
+```
+
+```json
+{ "ok": true }
+```
 
 ### Worked config examples
 
@@ -128,29 +303,104 @@ backoff for up to `policy_ready_timeout_s`.
 | `gripper` | object | `{"type": "none"}` | Discriminated union — five variants, see below. |
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
-| `mode` | `auto` \| `sequential` \| `async` \| `rtc` | `"auto"` | `rtc` is not implemented yet — see Limitations. `auto` resolves to `sequential`, unchanged from before `async` existed — `async` is explicit opt-in only, never a default, so an existing deployment's behavior never changes underneath it. See Performance for when to reach for `async`. |
-| `queue_threshold` | integer | derived (`n_action_steps - 1`, once the checkpoint is known) | Consumed by `mode: "async"`: refill fires in the background once the queue has this many or fewer actions left. Unused by `sequential`. Leave unset unless you have a specific reason to override — see Performance for why the derived default is deliberately the largest value that ever makes sense. |
-| `starvation_grace_ticks` | integer | `3` | Two related bounds sharing one field: (1) consecutive tick *failures* tolerated (when `safety.stop_on_error` is `false`) before the loop halts regardless; (2) under `mode: "async"`, consecutive *empty* ticks (queue drained, inference still in flight) tolerated before the loop halts unconditionally — not gated by `stop_on_error`, since an empty tick is not a failure to skip. |
+| `mode` | `auto` \| `sequential` \| `async` \| `rtc` | `"auto"` | `auto` resolves to `sequential`. Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). `rtc` is not implemented; configuring it fails at `start`. |
+| `queue_threshold` | integer | derived (`n_action_steps - 1`) | `mode: "async"` only: refill fires once the queue has this many actions left. Leave unset — the derived default is the highest useful value. See [Performance](#performance). |
+| `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
-| `state_units` | `degrees` \| `radians` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see Limitations. |
+| `state_units` | `degrees` \| `radians` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). |
 | `action_units` | `degrees` \| `radians` | `"degrees"` | Unit the policy's action is expressed in. |
 | `image_encoding` | `jpeg` \| `png` \| `raw` | `"jpeg"` | A debugging knob (JPEG artifacts vs. the training distribution), not a tuning one. |
 | `jpeg_quality` | integer, 0–100 | `90` | |
+| `image_fit` | `pad` \| `stretch` | `"pad"` | How a camera frame is resized onto the checkpoint's declared `(h, w)` whenever the frame's shape differs from it — see below. |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
-| `safety.max_joint_delta_degs` | number | `8.0` | Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see Safety. |
+| `safety.max_joint_delta_degs` | number | `8.0` | Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
 | `safety.max_start_delta_degs` | number | `15.0` | `start` refuses outright if the first predicted action is farther than this from the current pose. |
-| `safety.max_vel_degs_per_sec` | number | — | Operator-facing velocity knob — see Safety. |
-| `safety.joint_limits_degs` | array of `[min, max]` | — | One pair per action-vector dimension, **in action-vector order** (not Viam joint order) — see Safety. |
+| `safety.max_vel_degs_per_sec` | number | — | Operator-facing velocity knob — see [Safety](#safety). |
+| `safety.joint_limits_degs` | array of `[min, max]` | — | One pair per action-vector dimension, **in action-vector order** (not Viam joint order) — see [Safety](#safety). |
 | `safety.stop_on_error` | boolean | `true` | Whether a failure producing the next action (camera read, observation assembly, the policy call) halts the loop, or is logged and the tick skipped. |
+
+### `image_fit`
+
+**Leave this at `"pad"`.** Most Viam cameras stream 16:9 while checkpoints often declare a
+square resolution, so a frame nearly always has to be reshaped. `"pad"` scales by
+`ratio = max(cur_w / target_w, cur_h / target_h)` and fills the remainder with black on
+the **left and top** — matching lerobot's own `resize_with_pad`
+(`lerobot/policies/common/vla_utils.py:219`), which is smolvla's training-time convention,
+not the centered variant lerobot also ships for openpi. Aspect ratio and padding side both
+end up where the checkpoint saw them in training.
+
+`"stretch"` is the plain `Image.resize` this module used before, kept only so an existing
+deployment can reproduce its old output byte-for-byte. It squashes a 16:9 frame into a
+square, distorting every object's proportions in a way no checkpoint trained on. Measured
+against training geometry: **~8.3°** divergence over a 50-step chunk versus **~3.2–4.1°**
+for any aspect-preserving fit, about 2.5x worse. (Synthetic texture, so read those as an
+ordering rather than a precise bound.)
 
 ### DoCommand
 
-| Command | Input | Output |
-|---|---|---|
-| `start` | optional `task`, overriding the configured default | `{"ok": true}` — returns immediately; does not wait for the policy or the loop to actually be running |
-| `stop` | — | `{"ok": true}` |
-| `status` | — | `state` (`idle` \| `waiting_for_policy` \| `running` \| `stopped` \| `error`), `mode`, `queue_size`, `avg_latency_s`, `measured_fps`, `clamp_counts`, `starved_ticks` (cumulative; `mode: "async"` only, see Performance), `last_error` |
+Every request names its command in a `"command"` field.
+
+#### `start`
+
+Begins the control loop. Returns immediately — it does not wait for the policy to be
+ready or for the arm to move, so poll `status` to see what actually happened.
+
+```json
+{ "command": "start", "task": "open box flaps" }
+```
+
+```json
+{ "ok": true }
+```
+
+`task` is optional and overrides the configured default for this run.
+
+#### `stop`
+
+Halts the loop. The arm stays where it is.
+
+```json
+{ "command": "stop" }
+```
+
+```json
+{ "ok": true }
+```
+
+#### `status`
+
+The one command to watch while a loop runs.
+
+```json
+{ "command": "status" }
+```
+
+```json
+{
+  "state": "running",
+  "mode": "sequential",
+  "queue_size": 43,
+  "avg_latency_s": 0.32,
+  "measured_fps": 9.94,
+  "clamp_counts": { "delta": 0, "limit": 0, "gripper": 0 },
+  "starved_ticks": 0,
+  "last_error": ""
+}
+```
+
+What to read it for:
+
+- `state` — `idle`, `waiting_for_policy`, `running`, `stopped`, or `error`.
+- `clamp_counts` — **the field to check first.** Counts should stay near zero. A steadily
+  climbing `delta` or `limit` almost always means wrong units or wrong joint order, not a
+  safety margin doing its job. See [Safety](#safety).
+- `measured_fps` — should track configured `fps`. Well below it means inference is not
+  keeping up; see [Performance](#performance).
+- `starved_ticks` — ticks the loop held position with an empty queue. Only possible under
+  `mode: "async"`, and a persistently rising value means `queue_threshold` is too low.
+- `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
+  the loop kept going.
 
 ### Gripper variants
 
@@ -229,7 +479,7 @@ open), matching how LeRobot datasets typically encode a gripper channel.
 
 Note that `safety.max_joint_delta_degs` is **omitted**, not given some independent
 number: it is derived from `max_vel_degs_per_sec / fps` (`60.0 / 10.0 = 6.0` deg/tick
-here). If both are given, they must agree, or configuration fails loudly — see Safety.
+here). If both are given, they must agree, or configuration fails loudly — see [Safety](#safety).
 
 ## Units
 
@@ -237,7 +487,7 @@ here). If both are given, they must agree, or configuration fails loudly — see
 accept **degrees** (`JointPositions.values`). A LeRobot checkpoint was trained on
 whatever units the recording robot used, which is frequently *not* degrees — SO-100
 datasets in particular are commonly recorded in radians, or as normalized joint
-positions (this module supports the first two; see Limitations for `normalized`).
+positions (this module supports the first two; see [Limitations](#limitations) for `normalized`).
 
 `state_units` and `action_units` tell the controller which unit the checkpoint expects
 on each side of inference — the arm's degrees are converted before being sent to the
@@ -267,7 +517,7 @@ still lands the arm at the position it actually meant.
 Getting this wrong does not usually crash anything — it produces motion that is off by
 a factor of ~57 (degrees vs. radians) or wildly rescaled (normalized vs. either), which
 the safety layer's delta clamp will silently absorb into constant clamping. That is
-exactly why `clamp_counts` exists: see Safety below.
+exactly why `clamp_counts` exists: see [Safety](#safety) below.
 
 ## Safety
 
@@ -416,7 +666,7 @@ threshold fires the refill later, off a more recent — but riskier — observat
   plausible-looking but wrong motion. Sequential mode is unaffected.
 - **No driver-side velocity/acceleration ceilings.** `move_through_joint_positions` (the
   only method that consumes `MoveOptions`) ships in no released `viam-sdk`. The velocity
-  bound lives entirely in the safety layer's delta clamp (see Safety); acceleration and
+  bound lives entirely in the safety layer's delta clamp (see [Safety](#safety)); acceleration and
   TCP-speed limiting have no enforcement path at all right now.
 - **`dtype` is parsed and validated but not applied.** Casting weights with
   `policy.to(dtype=...)` breaks inference on at least one target (the deserialized
