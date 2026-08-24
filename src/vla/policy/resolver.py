@@ -35,6 +35,28 @@ REQUIRED_FILES = ("config.json", "model.safetensors")
 # half of the request, so this module has nothing to pass for it.
 _ETAG_TIMEOUT_SECONDS = 10
 
+# A denylist, deliberately, not an allowlist. `lerobot-train` writes its
+# intermediate checkpoints to `output_dir/checkpoints/NNNNNN/` -- each one a
+# full `pretrained_model/` copy plus a `training_state/` with an optimizer
+# snapshot roughly half the size of the weights again -- and `push_to_hub`
+# uploads the lot. Measured on viamrobotics/smolvla-box-bot: 9.2 GB in the
+# repo for a checkpoint whose root files are 868 MB, i.e. ~10x, all of it
+# training bookkeeping no inference path ever opens.
+#
+# An allowlist would download less still, but this module is generic over
+# any LeRobot-registered policy (`policy_type` comes from the checkpoint,
+# never from config), so an allowlist missing one file a policy we have not
+# inspected actually needs turns into a load failure on someone's robot.
+# These three patterns are lerobot's own output-directory convention rather
+# than a guess about file naming, and getting them wrong costs only
+# bandwidth. Note `model.safetensors` at the repo root is never matched by
+# `checkpoints/**`, so the flat single-directory layout is untouched.
+_IGNORE_PATTERNS = (
+    "checkpoints/**",
+    "**/training_state/**",
+    "*optimizer*",
+)
+
 
 class ResolveError(VLAError, RuntimeError):
     """Raised when a checkpoint cannot be resolved."""
@@ -176,6 +198,7 @@ def resolve_checkpoint(
             cache_dir=cache_dir,
             token=token,
             etag_timeout=_ETAG_TIMEOUT_SECONDS,
+            ignore_patterns=_IGNORE_PATTERNS,
         )
     except OSError as exc:
         raise ResolveError(

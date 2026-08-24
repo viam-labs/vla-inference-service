@@ -554,3 +554,35 @@ def test_dangling_symlink_gets_distinct_error(tmp_path):
     message = str(excinfo.value)
     assert "symlink" in message.lower()
     assert "checkpoint directory does not exist" not in message
+
+
+def test_hub_download_skips_lerobot_train_intermediate_checkpoints(tmp_path, monkeypatch):
+    """A `push_to_hub` fine-tune carries `lerobot-train`'s intermediate
+    checkpoints -- a full weights copy plus an optimizer snapshot per save.
+    Measured on viamrobotics/smolvla-box-bot: 9.2 GB in the repo for 868 MB
+    of root files. This is a denylist rather than an allowlist on purpose
+    (see `_IGNORE_PATTERNS`), so the assertion is that the patterns are
+    actually passed through -- not that the download is minimal.
+    """
+    monkeypatch.setenv("VIAM_MODULE_DATA", str(tmp_path))
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        return str(_make_checkpoint(tmp_path / "dl"))
+
+    cfg = PolicyConfig.parse({"model_hub_id": "viamrobotics/smolvla-box-bot"})
+    (tmp_path / "dl").mkdir()
+    resolve_checkpoint(cfg, snapshot_download=fake_snapshot_download)
+
+    patterns = list(captured["ignore_patterns"])
+    assert "checkpoints/**" in patterns
+    assert any("training_state" in p for p in patterns)
+    assert any("optimizer" in p for p in patterns)
+    # The flat single-directory layout must survive untouched: a root
+    # model.safetensors is what `_verify` requires, and no pattern here may
+    # match it.
+    import fnmatch
+
+    for required in ("config.json", "model.safetensors"):
+        assert not any(fnmatch.fnmatch(required, p) for p in patterns)
