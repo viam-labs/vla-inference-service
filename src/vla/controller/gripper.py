@@ -97,6 +97,27 @@ def _clamp_unit(value: float) -> float:
     return min(1.0, max(0.0, float(value)))
 
 
+async def _read_first_input(gripper: Any, name: str | None) -> float:
+    """Read a gripper's aperture out of its frame-system inputs.
+
+    ``get_current_inputs`` is a *frame system* interface, not an aperture
+    channel: it returns one value per kinematic DOF, in radians or meters
+    (``framesystem.InputEnabled`` in the RDK: "Input units are always in
+    meters or radians"). ``gripper.MakeModel`` builds a zero-DOF model, so for
+    most drivers the list is empty and carries no aperture at all. This used
+    to fall back to 0.0, which reports a gripper permanently held fully open
+    -- wrong, and invisible, for the entire life of the session.
+    """
+    values = await gripper.get_current_inputs()
+    if not values:
+        raise GripperRuntimeError(
+            f"gripper {name!r} reports no kinematic DOF, so get_current_inputs() "
+            "carries no aperture value; if the driver exposes a proportional "
+            'DoCommand, use gripper.type="do_command"'
+        )
+    return float(values[0])
+
+
 class GripperAdapter(abc.ABC):
     """Base for every gripper variant.
 
@@ -171,8 +192,7 @@ class InputsGripper(GripperAdapter):
         self._gripper = gripper
 
     async def read(self) -> float:
-        values = await self._gripper.get_current_inputs()
-        return float(values[0]) if values else 0.0
+        return await _read_first_input(self._gripper, self.dependency_name)
 
     async def write(self, value: float) -> None:
         try:
@@ -197,8 +217,7 @@ class ThresholdGripper(GripperAdapter):
         self._closed: bool | None = None
 
     async def read(self) -> float:
-        values = await self._gripper.get_current_inputs()
-        return float(values[0]) if values else 0.0
+        return await _read_first_input(self._gripper, self.dependency_name)
 
     async def write(self, value: float) -> None:
         should_close = float(value) >= self._threshold

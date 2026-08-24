@@ -409,3 +409,39 @@ def test_fake_gripper_preserves_an_explicitly_empty_inputs_list():
     """
     assert FakeGripper(inputs=[]).inputs == []
     assert FakeGripper().inputs == [0.0]  # default unchanged
+
+
+# ---------------------------------------------------------------------------
+# zero-DOF get_current_inputs() refusal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "gripper", "name": "g", "mode": "inputs"},
+        {"type": "gripper", "name": "g", "mode": "threshold"},
+    ],
+    ids=["inputs", "threshold"],
+)
+async def test_zero_dof_gripper_read_refuses_instead_of_reporting_zero(block):
+    """A zero-DOF gripper model reports no inputs at all, so there is no
+    aperture to read. Reporting 0.0 looks like a gripper held fully open."""
+    adapter = make_gripper_adapter(block, {"g": FakeGripper(inputs=[])})
+    with pytest.raises(GripperRuntimeError, match="no kinematic DOF"):
+        await adapter.read()
+
+
+async def test_zero_dof_refusal_names_the_working_alternative():
+    adapter = make_gripper_adapter(
+        {"type": "gripper", "name": "g", "mode": "inputs"}, {"g": FakeGripper(inputs=[])}
+    )
+    with pytest.raises(GripperRuntimeError, match='gripper.type="do_command"'):
+        await adapter.read()
+
+
+async def test_nonempty_inputs_still_read_normally():
+    adapter = make_gripper_adapter(
+        {"type": "gripper", "name": "g", "mode": "inputs"}, {"g": FakeGripper(inputs=[0.25])}
+    )
+    assert await adapter.read() == pytest.approx(0.25)
