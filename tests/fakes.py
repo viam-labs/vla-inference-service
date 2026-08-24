@@ -168,3 +168,37 @@ class FakeGripper:
     async def grab(self, **kwargs):
         self.grabbed += 1
         return True
+
+
+class FakeDoCommandGripper:
+    """A gripper whose only proportional control is through ``DoCommand``.
+
+    Mirrors the contract both `devrel:so101:gripper` and
+    `viam:ufactory:gripper` implement: ``{"get": True}`` returns the current
+    position under some key, ``{"set": n}`` commands a new one. Deliberately
+    has no `get_current_inputs`/`go_to_inputs` -- that is the whole reason
+    this variant exists, and omitting them keeps a test that reaches for the
+    wrong API failing loudly.
+    """
+
+    def __init__(self, position=0.0, read_key="position", omit_read_key=False, read_value=None):
+        self.position = position
+        self.read_key = read_key
+        # `omit_read_key` and `read_value` exist to drive the two malformed-response
+        # paths: a driver whose key differs from the configured one, and a driver
+        # returning a non-numeric value under the right key.
+        self.omit_read_key = omit_read_key
+        self.read_value = read_value
+        self.commands = []
+
+    async def do_command(self, command, **kwargs):
+        self.commands.append(dict(command))
+        if command.get("get") is True:
+            if self.omit_read_key:
+                return {"some_other_key": 1.0}
+            value = self.position if self.read_value is None else self.read_value
+            return {self.read_key: value}
+        if "set" in command:
+            self.position = command["set"]
+            return {"position": self.position}
+        raise AssertionError(f"unexpected command {command!r}")

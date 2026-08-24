@@ -8,7 +8,7 @@ from vla.controller.gripper import (
     GripperRuntimeError,
     make_gripper_adapter,
 )
-from tests.fakes import FakeGripper, FakeServo
+from tests.fakes import FakeDoCommandGripper, FakeGripper, FakeServo
 
 # ---------------------------------------------------------------------------
 # none
@@ -447,3 +447,16 @@ async def test_nonempty_inputs_still_read_normally():
         {"type": "gripper", "name": "g", "mode": "inputs"}, {"g": FakeGripper(inputs=[0.25])}
     )
     assert await adapter.read() == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# do_command
+# ---------------------------------------------------------------------------
+
+
+async def test_fake_do_command_gripper_round_trips():
+    g = FakeDoCommandGripper(position=42.0)
+    assert await g.do_command({"get": True}) == {"position": 42.0}
+    await g.do_command({"set": 7.0})
+    assert g.commands == [{"get": True}, {"set": 7.0}]
+    assert await g.do_command({"get": True}) == {"position": 7.0}
