@@ -217,8 +217,15 @@ class ObservationBuilder:
                     Image.fromarray(arr).resize((target_w, target_h), Image.BILINEAR),
                     dtype=np.uint8,
                 )
-            else:
+            elif self._fit == "pad":
                 arr = self._resize_with_pad(arr, target_h, target_w)
+            else:
+                # Unreachable via config (as_choice over IMAGE_FITS gates
+                # it), but spelled out rather than left as an `else: pad`
+                # fallthrough: a third mode added to IMAGE_FITS later would
+                # otherwise silently inherit padding instead of failing
+                # until someone noticed the geometry was wrong.
+                raise ObservationError(f"unrecognized image_fit {self._fit!r}")
         try:
             return encode_image(arr, encoding=self._encoding, quality=self._quality)
         except WireError as exc:

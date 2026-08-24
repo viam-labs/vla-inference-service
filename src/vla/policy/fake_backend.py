@@ -61,7 +61,11 @@ class FakePolicyBackend(PolicyBackend):
         h, w = self._image_size
         input_features: dict[str, list[int]] = {key: [3, h, w] for key in self._camera_keys}
         input_features["observation.state"] = [self._state_dim]
-        declared_image_keys = list(self._camera_keys)
+        # sorted(), matching LeRobotBackend's `sorted(cfg.image_features)`
+        # rather than preserving constructor order: nothing depends on the
+        # order today, but a fake that orders keys differently from the real
+        # backend cannot catch an ordering assumption that creeps into it.
+        declared_image_keys = sorted(self._camera_keys)
         # Same validation as LeRobotBackend, via the same shared helper --
         # this is what lets a controller test exercise "checkpoint declares
         # more cameras than it consumes" with no torch/lerobot installed.

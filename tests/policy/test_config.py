@@ -445,3 +445,28 @@ def test_repr_includes_unused_image_features():
         {"model_path": "/m", "unused_image_features": ["observation.images.camera3"]}
     )
     assert "unused_image_features=('observation.images.camera3',)" in repr(cfg)
+
+
+def test_unused_image_features_strips_surrounding_whitespace():
+    cfg = PolicyConfig.parse(
+        {
+            "model_path": "/tmp/ckpt",
+            "unused_image_features": ["  observation.images.camera3  "],
+        }
+    )
+    # Untrimmed, this would parse cleanly and then fail at load with
+    # "checkpoint does not declare", naming a key that reads as correct.
+    assert cfg.unused_image_features == ("observation.images.camera3",)
+
+
+def test_unused_image_features_treats_whitespace_padded_duplicates_as_duplicates():
+    with pytest.raises(ConfigError, match="duplicate"):
+        PolicyConfig.parse(
+            {
+                "model_path": "/tmp/ckpt",
+                "unused_image_features": [
+                    "observation.images.camera3",
+                    " observation.images.camera3 ",
+                ],
+            }
+        )

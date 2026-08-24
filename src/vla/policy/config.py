@@ -207,6 +207,12 @@ def _parse_unused_image_features(raw: Any) -> tuple[str, ...]:
             raise ConfigError(
                 f"unused_image_features[{i}] must not be empty or whitespace-only, got {value!r}"
             )
+        # Strip, having just rejected whitespace-only: caring about stray
+        # whitespace enough to reject an all-blank entry but not enough to
+        # trim a padded one would send `" observation.images.camera3 "`
+        # through parsing only to fail later at load with "checkpoint does
+        # not declare", naming a key that looks correct in the error.
+        value = value.strip()
         if value in seen:
             raise ConfigError(f"unused_image_features contains a duplicate entry: {value!r}")
         seen.add(value)

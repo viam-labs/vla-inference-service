@@ -95,6 +95,12 @@ operator can see what a checkpoint originally declared even after some of it has
 dropped. The controller needs no awareness of this at all — it only ever sees the
 already-reduced `image_feature_keys`.
 
+One caveat for anything else reading `specs`: `input_features` still carries the dropped
+key and its shape, because it reports what the checkpoint declares. `image_feature_keys`
+is the only field that answers "which cameras does this policy actually want fed" —
+enumerating cameras from `input_features` instead would reintroduce exactly the problem
+this field exists to solve.
+
 As a nudge rather than a second enforcement layer, the policy also logs one advisory
 warning at load time for any declared image feature that looks unused but was *not*
 listed: no entry in the preprocessor's normalizer stats, and not a rename target of a
