@@ -26,6 +26,7 @@ class FakeArm:
     def __init__(self, positions=None):
         self.positions = list(positions or [0.0] * 6)
         self.moves = []
+        self.move_extras = []
         self.stopped = 0
         self.fail_next_move = False
 
@@ -38,6 +39,7 @@ class FakeArm:
         if self.fail_next_move:
             raise RuntimeError("arm move failed")
         self.moves.append(positions)
+        self.move_extras.append(extra)
         # Write into the existing vector rather than replacing it: a commanded
         # action can be narrower than the arm's joint count (gripper on its own
         # component), and replacing would silently shrink the arm.
@@ -68,6 +70,7 @@ class StalledArm(FakeArm):
         if self.fail_next_move:
             raise RuntimeError("arm move failed")
         self.moves.append(positions)
+        self.move_extras.append(extra)
         # Deliberately does NOT update self.positions -- the whole point.
 
 
@@ -141,7 +144,10 @@ class FakeServo:
 
 class FakeGripper:
     def __init__(self, inputs=None, supports_inputs=True):
-        self.inputs = list(inputs or [0.0])
+        # `if inputs is None`, not `inputs or [...]`: an explicitly empty list is
+        # a meaningful fixture -- it is what a zero-DOF gripper model reports --
+        # and `or` collapsed it to the default, hiding the case entirely.
+        self.inputs = list([0.0] if inputs is None else inputs)
         self.supports_inputs = supports_inputs
         self.opened = 0
         self.grabbed = 0

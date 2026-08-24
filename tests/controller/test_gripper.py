@@ -393,3 +393,19 @@ def test_gripper_config_error_is_a_vla_error():
 def test_gripper_runtime_error_is_a_vla_error():
     assert issubclass(GripperRuntimeError, VLAError)
     assert issubclass(GripperRuntimeError, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# fixture guards -- these two fakes silently swallowed the exact inputs the
+# tests below depend on, so they are pinned here.
+# ---------------------------------------------------------------------------
+
+
+def test_fake_gripper_preserves_an_explicitly_empty_inputs_list():
+    """A zero-DOF gripper model reports `[]`, which is a meaningful fixture.
+
+    `list(inputs or [0.0])` collapsed it to `[0.0]`, making the empty-inputs
+    refusal in `InputsGripper`/`ThresholdGripper` untestable.
+    """
+    assert FakeGripper(inputs=[]).inputs == []
+    assert FakeGripper().inputs == [0.0]  # default unchanged
