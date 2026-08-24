@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from vla.config_util import VLAError
@@ -436,7 +438,7 @@ async def test_zero_dof_refusal_names_the_working_alternative():
     adapter = make_gripper_adapter(
         {"type": "gripper", "name": "g", "mode": "inputs"}, {"g": FakeGripper(inputs=[])}
     )
-    with pytest.raises(GripperRuntimeError, match='gripper.type="do_command"'):
+    with pytest.raises(GripperRuntimeError, match=re.escape('gripper.type="do_command"')):
         await adapter.read()
 
 

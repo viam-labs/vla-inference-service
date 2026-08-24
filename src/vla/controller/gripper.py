@@ -9,19 +9,30 @@ explicitly:
   servo      get_position()/move(angle); both int degrees, so the adapter
              maps normalized 0..1 onto min_deg..max_deg at 1-degree
              resolution.
-  gripper + mode=inputs      get_current_inputs()/go_to_inputs(); normalized
-                              0..1, proportional. Preferred when the driver
-                              implements both -- they are abstract in the SDK,
-                              so not every driver does.
-  gripper + mode=threshold   read via get_current_inputs(), write by
-                              thresholding the normalized value to
+  gripper + mode=inputs      get_current_inputs()/go_to_inputs(). Both are a
+                              *frame-system* interface, not an aperture
+                              channel: one value per kinematic DOF, in
+                              radians or meters. That only carries a usable
+                              aperture when the driver's gripper model is
+                              jointed -- most gripper models (built by
+                              ``gripper.MakeModel``) are zero-DOF, so this
+                              mode does not work against them. Preferred when
+                              the driver implements both -- they are abstract
+                              in the SDK, so not every driver does.
+  gripper + mode=threshold   read via get_current_inputs() (same
+                              frame-system/zero-DOF caveat as above), write
+                              by thresholding the normalized value to
                               open()/grab(). Binary fallback for drivers that
                               do not implement go_to_inputs.
   none       no gripper channel.
 
 Unit convention: ``arm_joint`` is in degrees (or whatever ``action_units``
 is); every other variant is normalized 0.0-1.0, 0 = fully open, matching how
-LeRobot datasets typically encode a gripper channel.
+LeRobot datasets typically encode a gripper channel. That convention
+describes what each *adapter* hands the controller -- a separate claim from
+what the underlying driver call hands the adapter, which for
+``get_current_inputs()``/``go_to_inputs()`` is the frame-system DOF vector
+described above, not a normalized aperture.
 """
 
 from __future__ import annotations
@@ -85,11 +96,19 @@ class GripperRuntimeError(VLAError, RuntimeError):
     """Raised when a gripper adapter cannot perform a requested operation
     at runtime -- as opposed to a config-time mistake.
 
-    The one case this covers today: a driver whose ``go_to_inputs`` is
-    unimplemented (it is an abstract SDK method, so this is a real
-    possibility, not a hypothetical). A bare `NotImplementedError` bubbling
-    up from deep inside the SDK is not an actionable error message; this
-    wraps it with the fix.
+    Two cases today: a driver whose ``go_to_inputs`` is unimplemented (it is
+    an abstract SDK method, so this is a real possibility, not a
+    hypothetical) -- a bare `NotImplementedError` bubbling up from deep
+    inside the SDK is not an actionable error message, so this wraps it with
+    the fix; and an empty ``get_current_inputs()`` from a zero-DOF gripper
+    model, which carries no aperture to read at all.
+
+    The second case is really a *static* property of the driver's kinematic
+    model -- it will never spontaneously start working once seen -- but it
+    can only be discovered at runtime, on the first ``await``ed read:
+    ``make_gripper_adapter`` is synchronous and is handed the resolved
+    component, not its DOF count, so nothing short of an actual call can
+    tell config time apart from a working driver.
     """
 
 
@@ -106,7 +125,11 @@ async def _read_first_input(gripper: Any, name: str | None) -> float:
     meters or radians"). ``gripper.MakeModel`` builds a zero-DOF model, so for
     most drivers the list is empty and carries no aperture at all. This used
     to fall back to 0.0, which reports a gripper permanently held fully open
-    -- wrong, and invisible, for the entire life of the session.
+    -- wrong, and invisible, for the entire life of the session. When a
+    driver's model does have DOF, index 0 is the one this module treats as
+    the aperture -- every gripper this file adapts is single-DOF by
+    construction (open/close along one axis), so there is only ever one
+    slot to read.
     """
     values = await gripper.get_current_inputs()
     if not values:
