@@ -111,7 +111,9 @@ Expected: both FAIL. The first with `assert [0.0] == []`; the second with `Attri
 
 - [ ] **Step 3: Fix both fakes**
 
-In `tests/fakes.py`, `FakeGripper.__init__` (line 143):
+In `tests/fakes.py`, replace **only line 144** — the `self.inputs = ...` assignment inside `FakeGripper.__init__`. Leave the other four assignments (`supports_inputs`, `opened`, `grabbed`, `sent`) exactly as they are; deleting them breaks `test_gripper_incompatible_mode_is_caught_before_any_arm_motion` and every `open()`/`grab()`/`sent` assertion in `test_gripper.py`.
+
+The method should read, in full, afterward:
 
 ```python
     def __init__(self, inputs=None, supports_inputs=True):
@@ -119,6 +121,10 @@ In `tests/fakes.py`, `FakeGripper.__init__` (line 143):
         # a meaningful fixture -- it is what a zero-DOF gripper model reports --
         # and `or` collapsed it to the default, hiding the case entirely.
         self.inputs = list([0.0] if inputs is None else inputs)
+        self.supports_inputs = supports_inputs
+        self.opened = 0
+        self.grabbed = 0
+        self.sent = []
 ```
 
 In `tests/fakes.py`, `FakeArm.__init__`, add alongside `self.moves = []`:
@@ -618,7 +624,7 @@ async def test_do_command_read_emits_the_get_command():
 uv run pytest tests/controller/test_gripper.py -k "do_command_read" -v
 ```
 
-Expected: all FAIL with `NotImplementedError` (inherited from `GripperAdapter.read`).
+Expected: all FAIL. The value tests raise `NotImplementedError` (inherited from `GripperAdapter.read`); the three error-path tests fail because `pytest.raises(GripperRuntimeError)` does not catch that `NotImplementedError`.
 
 - [ ] **Step 3: Implement `read`**
 
@@ -782,6 +788,8 @@ Without this the configured resource is never requested, so `dependencies.get(na
 - Modify: `src/vla/controller/config.py:329`
 - Test: `tests/controller/test_config.py`
 
+> The spec's §5 lists the `write_args` and bounds rejections under `test_config.py`; this plan puts them in `test_gripper.py` (Tasks 4 and 6) instead. That is deliberate, not dropped coverage: `ControllerConfig.parse` validates only `gripper.type` against `GRIPPER_TYPES`, and every other gripper field is validated inside `make_gripper_adapter` — which is where the spec's §1 says these surface.
+
 - [ ] **Step 1: Write the failing tests**
 
 ```python
@@ -895,7 +903,11 @@ async def test_do_command_gripper_is_driven_through_a_real_tick():
     )
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
-    status = await svc.do_command({"command": "stop"})
+    # Status BEFORE stop, and via its own command: `stop` returns {"ok": True}
+    # (service.py:171-172), so reading last_error off its result is a KeyError.
+    # This is the established pattern -- see test_service.py:455.
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
     assert status["last_error"] == ""
     # A policy action of 1.0 is fully closed, which on this driver's scale is 0.0.
     sets = [c["set"] for c in g.commands if "set" in c]
