@@ -14,9 +14,9 @@ onto `devrel:so101:gripper`:
 
 | Variant | Why it fails against `devrel:so101:gripper` |
 | --- | --- |
-| `arm_joint` | `devrel:so101:arm` drives servos 1–5 only. There is no joint index 5 in its joint vector, so `_check_joint_indices` (`src/vla/controller/service.py:399`) refuses at startup. Widening the arm's `servo_ids` to `[1..6]` does not help: `calculateJointLimits` (`components/arm/motion.go:20`) sizes its limit array by `len(armServoIDs)` but only fills five entries from a hardcoded five-element `jointCals`, leaving joint 6 pinned to `{0, 0}`, and the embedded kinematic model is 5-DOF. |
+| `arm_joint` | `devrel:so101:arm` drives servos 1–5 only. There is no joint index 5 in its joint vector, so `_check_joint_indices` (`src/vla/controller/service.py:399`) refuses at startup. Widening the arm's `servo_ids` to `[1..6]` is not available either: `components/arm/arm.go:136-140` rejects any ID outside 1–5 outright (`"arm servo IDs must be 1-5, got %d"`), so the arm never constructs. The embedded kinematic model is 5-DOF regardless (`internal/geometry/so101.json` declares joints 1–5). |
 | `servo` | The so-101 module registers no `rdk:component:servo` model. Servo 6 is reachable only through DoCommand. |
-| `gripper` / `inputs` | `CurrentInputs` and `GoToInputs` both `return errors.ErrUnsupported` (`components/gripper/gripper.go:480-486`). The pre-flight probe fails on the *read*, before `write` is reached. |
+| `gripper` / `inputs` | `CurrentInputs` and `GoToInputs` both `return errors.ErrUnsupported` (`components/gripper/gripper.go:497-502`). The pre-flight probe fails on the *read*, before `write` is reached. |
 | `gripper` / `threshold` | Same — `ThresholdGripper.read()` also goes through `get_current_inputs()`. `open()`/`grab()` work; the read side does not. |
 
 What `devrel:so101:gripper` *does* expose is proportional control, via
@@ -25,10 +25,15 @@ DoCommand rather than the typed API (`components/gripper/gripper.go:366-387`):
 - read: `{"get": true}` → `{"position": <float percent>}`
 - write: `{"set": <float percent>}` → `{"position": <float percent>}`
 
-`viam:ufactory:gripper` (`viam-ufactory-xarm/arm/gripper.go:384-400`) exposes
-the *same request shape*, differing only in the response key (`pos`) and the
-value range (raw units, roughly 0–850, versus 0–100 percent). One variant
-therefore covers both drivers with no templating and no per-driver presets.
+`viam:ufactory:gripper` (`viam-ufactory-xarm/arm/gripper.go:383-402`) exposes
+the *same request shape*, differing only in the **read** response key (`pos`,
+at `:389`) and the value range (raw units, roughly 0–850, versus 0–100
+percent). One variant therefore covers both drivers with no templating and no
+per-driver presets.
+
+Only the read key differs, because only the read key is consumed: xarm's *write*
+returns `{"position": …}` (`:401`), the same key so-101 uses, and both are
+discarded.
 
 ## Contract
 
@@ -59,18 +64,32 @@ A fifth entry in `GRIPPER_TYPES` (`src/vla/controller/gripper.py`):
 | `open_value` | **yes** | — | The driver-native value at fully open. |
 | `closed_value` | **yes** | — | The driver-native value at fully closed. |
 | `read_key` | no | `"position"` | Key to pull from the `{"get": true}` response. |
-| `write_args` | no | `{}` | Extra pairs merged into the `set` command. |
+| `write_args` | no | `{}` | Extra pairs merged into the `set` command. Must be a mapping, and must not contain a `set` key. |
 
 `open_value` and `closed_value` are **required, not defaulted**. A percentage
 default (`100`/`0`) would silently saturate a 0–850 driver like xarm at the
 first percent of its travel — wrong but plausible, and invisible at runtime.
-Requiring them makes a mismatched range a startup `ConfigError` instead.
-Equal values are also rejected (division by zero in the read mapping).
+Requiring them makes a mismatched range a `ConfigError` instead. Equal values
+are also rejected (division by zero in the read mapping).
 
 `write_args` defaults to `{}` so no driver-specific behavior is baked into
 this module. The so-101 README example sets `{"wait": false}` once the
 companion so-101 change lands; xarm ignores an unrecognized key, as does any
 driver that does not read it.
+
+Two validations on `write_args` are load-bearing rather than defensive. It must
+be rejected if it is not a mapping, and rejected if it contains a `set` key:
+the write merges as `{"set": raw, **write_args}`, so a `set` entry in
+`write_args` would silently *replace* the setpoint the adapter just computed
+from the policy's action. That failure is invisible — the gripper simply parks
+at a constant — so it has to be a config error, not a runtime surprise.
+
+**On timing:** these are `ConfigError`s, but they do not surface at
+`validate_config`/`reconfigure`. `make_gripper_adapter` runs inside `_run()`
+(`service.py:454`), *after* `_await_policy()`, so a bad gripper block surfaces
+on the `start` command and potentially after a long policy wait. This matches
+how `servo`'s `min_deg`/`max_deg` behave today, so it is consistent — but the
+implementation plan must not promise config-time validation.
 
 **Rejected: a `timeout_s` key.** Gripper write failures are unconditionally
 fatal by design (`service.py:656-662`), and a timed-out DoCommand leaves the
@@ -84,7 +103,10 @@ uniform across both drivers, neither mechanism earns its complexity.
 
 ## 2. `DoCommandGripper`
 
-New adapter in `src/vla/controller/gripper.py`, alongside the existing four.
+New adapter class in `src/vla/controller/gripper.py`, alongside the five that
+already live there (`NoGripper`, `ArmJointGripper`, `ServoGripper`,
+`InputsGripper`, `ThresholdGripper` — five classes serving four type strings,
+because `gripper` dispatches on `mode`).
 
 ```
 read():
@@ -125,7 +147,12 @@ Attributes: `in_state = True`, `uses_degrees = False`, `dependency_name = name`,
 - `_check_action_dim` (`service.py:359`) expects `len(state_joint_indices) + 1`.
 - `_preflight_gripper` (`service.py:405`) already probes read-then-write-back
   before any arm motion, because `in_state` is true and `arm_joint_index` is
-  `None`.
+  `None`. Note the probe is **not** a no-op for this variant: with so-101's
+  `open_value=95` and a raw reading of 98, read→write-back commands the jaw to
+  95. Small, and precedented (`ThresholdGripper` also actuates on preflight),
+  but `_preflight_gripper`'s docstring (`service.py:414-419`) currently claims
+  the probe lands proportional adapters "on the same value already reported" —
+  which the read clamp makes untrue here. One sentence there keeps it honest.
 - `safety.joint_limits_degs` length checking (`config.py:279`) keys off
   `gripper_type == "arm_joint"`, so no trailing limit pair is expected.
 
@@ -143,7 +170,7 @@ Independent of so-101: both variants are built on a wrong reading of the SDK.
 
 `framesystem.InputEnabled` (`rdk@v1.0.0/robot/framesystem/framesystem.go:36-43`)
 documents *"Input units are always in meters or radians"*, and the input list
-length equals the kinematic model's DOF count — `fake/gripper.go:95` sizes its
+length equals the kinematic model's DOF count — `fake/gripper.go:96` sizes its
 slice as `make([]referenceframe.Input, len(g.model.DoF()))`. `gripper.MakeModel`
 is documented as creating *"a zero DoF Model"*, which is the common case for a
 gripper. So `get_current_inputs()` on a typical gripper returns an **empty
@@ -160,20 +187,36 @@ values = await self._gripper.get_current_inputs()
 if not values:
     raise GripperRuntimeError(
         f"gripper {self.dependency_name!r} reports no kinematic DOF, so "
-        "get_current_inputs() carries no aperture value; use "
-        'gripper.type="do_command" instead'
+        "get_current_inputs() carries no aperture value; if the driver "
+        'exposes a proportional DoCommand, use gripper.type="do_command"'
     )
 ```
 
 Because `_preflight_gripper` reads before any arm motion, this surfaces at
 startup rather than mid-episode.
 
-Docs corrected in the same change — the module docstring in `gripper.py` and
-README §"Gripper variants" both currently describe `inputs` as "normalized
-0..1", which is the error this fix exists to correct. New wording: inputs are
-one value per kinematic DOF in radians or meters, so `inputs` works only
-against a driver whose gripper model is *jointed*; most gripper models,
-including `devrel:so101:gripper`, are zero-DOF.
+The wording is conditional deliberately. For a driver that implements only
+`open()`/`grab()` and has no `get`/`set` DoCommand, this refusal leaves **no**
+working variant — `threshold`'s *write* path was fine, and only its read was
+broken. Pointing such an operator at `do_command` unconditionally would send
+them after a variant their driver cannot satisfy. Accepting that gap rather
+than building a last-commanded-value fallback is a deliberate YAGNI call: no
+driver we have exhibits it (so-101 and xarm both expose `get`/`set`), and a
+fallback that reports the commanded value as if it were measured would feed the
+policy a fiction — the same class of bug this section exists to remove.
+
+Docs corrected in the same change, at **three** sites:
+
+1. the module docstring in `gripper.py:12-13`, which describes `inputs` as
+   "normalized 0..1" — the error this fix exists to correct;
+2. README §"Gripper variants", per §6 below;
+3. `safety.py:27-31`, which enumerates the normalized variants by name
+   (`servo`, `gripper/inputs`, `gripper/threshold`) and needs `do_command`
+   added to that list.
+
+New wording: inputs are one value per kinematic DOF in radians or meters, so
+`inputs` works only against a driver whose gripper model is *jointed*; most
+gripper models, including `devrel:so101:gripper`, are zero-DOF.
 
 Also worth recording in the README: `InputsGripper.write` catches only
 `NotImplementedError`, but a Go `errors.ErrUnsupported` arrives in Python as a
@@ -217,8 +260,25 @@ the command map (`write_args`) rather than beside it.
 - `read_key` defaulting to `"position"`, and overridden to `"pos"`
 - `write_args` merged into the emitted command, and `{}` emitting `{"set": v}` alone
 
-`tests/fakes.py`: a `FakeDoCommandGripper` recording every command it receives,
-with configurable response key and a switch to omit the key entirely.
+`tests/fakes.py` — three changes, two of which are prerequisites rather than
+additions:
+
+- a new `FakeDoCommandGripper` recording every command it receives, with a
+  configurable response key and a switch to omit the key entirely.
+- **`FakeGripper.__init__` (`tests/fakes.py:143`) must be fixed first.** It does
+  `self.inputs = list(inputs or [0.0])`, so `FakeGripper(inputs=[])` silently
+  becomes `[0.0]` — the empty-inputs tests below are unwritable until that `or`
+  becomes an explicit `if inputs is None` check.
+- **`FakeArm.move_to_joint_positions` (`tests/fakes.py:37`) must record `extra`.**
+  It currently accepts the kwarg and discards it, so the `wait: False` assertion
+  has nothing to assert against.
+
+`tests/controller/test_config.py`: the existing suite has a dependency test per
+variant (`test_servo_gripper_adds_dependency`, `test_gripper_mode_adds_dependency`,
+lines 91-100) and a `@parametrize` over the four type names
+(`test_accepts_every_known_gripper_type`, line 225). Both need a `do_command`
+case, plus coverage for the `write_args` validations and the missing/equal
+bounds rejections.
 
 `tests/controller/test_service.py`:
 
@@ -245,9 +305,16 @@ README §"Gripper variants" gains a `do_command` entry with both worked configs:
   "open_value": 840.0, "closed_value": 2.0 }
 ```
 
-The trailing sentence "Except for `arm_joint`, every variant's value is
-normalized `0.0`–`1.0`" stays true and now covers five variants. The
-`inputs`/`threshold` entries are rewritten per §3.
+The trailing sentence at README:478 — "Except for `arm_joint`, every variant's
+value is normalized `0.0`–`1.0` (`0` = fully open)" — stays true and now covers
+five variants. It describes what each *adapter* hands the controller, which is
+genuinely normalized; §3's correction is about what `get_current_inputs()`
+*returns to the adapter*, which is not. Those are different claims and both
+survive. To stop the next reader conflating them the way this spec's own §3 and
+§6 initially did, the `inputs` entry should say explicitly that its driver-side
+values are radians or meters per DOF and the adapter is what normalizes them.
+
+The `inputs`/`threshold` entries are otherwise rewritten per §3.
 
 The xarm config carries a caveat: `goToPosition`
 (`viam-ufactory-xarm/arm/gripper.go:307-356`) polls until the jaw settles, up

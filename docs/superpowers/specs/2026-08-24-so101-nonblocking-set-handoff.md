@@ -33,16 +33,22 @@ func (g *so101Gripper) moveToPercent(ctx context.Context, percent float64) error
 }
 ```
 
-`gripperSettleTimeoutMs` is 2000. The wait also happens while holding `g.mu`,
-so a concurrent position read blocks behind it. At 10 fps this starves the
-control loop: the caller is about to supersede this setpoint 100 ms from now,
-so waiting for it to physically settle is wasted latency, not safety.
+`gripperSettleTimeoutMs` is 2000. At 10 fps this starves the control loop: the
+caller is about to supersede this setpoint 100 ms from now, so waiting for it
+to physically settle is wasted latency, not safety.
+
+The wait also happens while holding `g.mu` (taken at `gripper.go:377` for the
+`set` branch), which serializes *writes*: successive setpoints queue behind the
+previous one's 2 s wait. Note this does **not** block reads — no read path
+takes `g.mu`. `{"get": true}` (`:366`), `get_position` (`:390`), `IsMoving`
+(`:307`), and `Geometries`/`jawAngle` (`:330`, `:341`) are all lock-free. So
+there is no locking change to make here; removing the wait is sufficient.
 
 The arm component already solved exactly this problem for its own motion path.
 `parseWaitExtra` (`components/arm/motion.go:242-249`) reads `extra["wait"]`,
 defaults to `true`, and threads it into `moveJoints(..., wait bool)`, whose
 settle wait is a plain `if !wait { return nil }` early return
-(`components/arm/motion.go:172-175`). This change asks the gripper to follow
+(`components/arm/motion.go:172-174`). This change asks the gripper to follow
 the pattern the arm already established.
 
 ## The change
@@ -113,9 +119,10 @@ if percentPos, ok := cmd["set"].(float64); ok {
 }
 ```
 
-`components/gripper/gripper.go:389` — the `command: "set_position"` path, same
-treatment, on the `targetPercent` branch that calls `moveToPercent`. Leave the
-`servo_position` (raw ticks) branch alone: it never waited in the first place.
+`components/gripper/gripper.go:405` — the `case "set_position":` label; the
+`targetPercent` branch that calls `moveToPercent` is at `:419-424`. Same
+treatment there. Leave the `servo_position` (raw ticks) branch (`:414-417`)
+alone: it never waited in the first place.
 
 ### 4. `Open` and `Grab` keep waiting
 
@@ -128,6 +135,16 @@ after the move to decide its boolean return
 wait that read samples a jaw still in flight and the grab detection breaks.
 This is the one place where the wait is load-bearing rather than latency.
 
+### 5. `isMoving` under `wait: false`
+
+No change needed, but worth knowing before you wonder: `defer g.isMoving.Store(false)`
+fires as soon as the command is issued, so with `wait: false` `IsMoving` falls
+through to the hardware `servo_moving` query. On a remote arm too old to
+support that query the fallback (`:315-319`) reports `false` while the jaw is
+still traveling. This is identical to the arm's existing `wait: false`
+semantics, so it is consistent rather than a new wart — do not add flag-holding
+logic to "fix" it.
+
 ## Back-compatibility
 
 Everything defaults to `true`, so:
@@ -138,11 +155,14 @@ Everything defaults to `true`, so:
 - The `simulated-gripper` model, the `devrel:so101:teleop` service, and the
   setup app all keep their current behavior without edits.
 
-Only a caller that explicitly passes `"wait": false` sees the new path. Worth
-grepping for existing `set_position` / `set` callers in-repo to confirm none of
-them wants the new default — the teleop service is the most likely candidate to
-*benefit* from `wait: false` at 30–50 Hz, but changing it is a separate
-decision and out of scope here.
+Only a caller that explicitly passes `"wait": false` sees the new path. The
+in-repo callers have been checked: `services/teleop/teleop.go:189-190` sends
+`{"command": "set_position", "percentage": …}` with no `wait` key and so keeps
+blocking, and the `{"set": v}` shorthand has *zero* in-repo callers. The teleop
+service is the most likely candidate to *benefit* from `wait: false` — its
+default rate is 20 Hz (`defaultTeleopRateHz`, `services/teleop/teleop.go:21`),
+configurable far higher — but changing it is a separate decision and out of
+scope here.
 
 ## Tests
 
@@ -160,9 +180,15 @@ Add:
    `CmdServoMove` and no `CmdServoWaitStop`.
 4. `Open` still issues `CmdServoWaitStop` (extend or assert alongside the
    existing test at line 223).
-5. `Grab` still waits, so its position read-back still classifies correctly —
-   `TestGrabReportsHeldWhenTheJawStopsShortOfClosed` (line 401) should keep
-   passing untouched, which is the real assertion here.
+5. `Grab` still issues `CmdServoWaitStop` — a direct assertion via
+   `fa.lastCommand(servocmd.CmdServoWaitStop)`, mirroring item 4.
+
+   Do **not** try to guard this through the existing grab-classification tests.
+   `TestGrabReportsHeldWhenTheJawStopsShortOfClosed` (line 401) cannot detect a
+   missing wait: `fakeServoArm` returns a static `f.percent` for
+   `CmdServoPosition` (`gripper_test.go:109-135`) and `CmdServoMove` never
+   changes it, so that test passes identically whether `Grab` waits or not.
+   Assert on the emitted command, not on the classification.
 6. A non-bool `wait` (e.g. `{"set": 42.0, "wait": "false"}`) falls back to
    waiting rather than silently skipping. The type assertion in
    `gripperWaitExtra` already gives this; the test pins it, because a JSON
@@ -177,6 +203,13 @@ setpoints faster than the jaw travels. Note the contrast with the arm, where
 the same flag rides in `extra` rather than in the command map, and say why
 (`Gripper.DoCommand` has no `extra` parameter).
 
+Note that `docs/gripper.md` currently documents only the `command:`-style calls
+(`### Set Gripper Position`, line 96, uses `command: "set_position"`); the
+`{"get": true}` / `{"set": v}` shorthand — the exact form the VLA module uses —
+is undocumented there. **Please document the shorthand as part of this change**,
+including its new `wait` key. An undocumented shorthand that an external module
+now depends on is the more likely thing to get refactored away by accident.
+
 ## Explicitly out of scope
 
 **Making the gripper's kinematic model 1-DOF so `CurrentInputs`/`GoToInputs`
@@ -188,7 +221,7 @@ the jaw mesh baked at `GripperJointMin`. `framesystem.InputEnabled`
 (`rdk@v1.0.0/robot/framesystem/framesystem.go:36-43`) specifies inputs as one
 value per model DOF in meters or radians, so a zero-DOF model correctly reports
 an empty input list; that is why `ErrUnsupported`
-(`components/gripper/gripper.go:480-486`) is not actually wrong today. Making
+(`components/gripper/gripper.go:497-502`) is not actually wrong today. Making
 the pair meaningful would require a revolute joint in the model, posing the
 mesh from the joint value instead of baking it, mirroring all of it in
 `simulated-gripper`, and accepting the jaw as a planning DOF that the frame
