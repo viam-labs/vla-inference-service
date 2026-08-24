@@ -126,10 +126,19 @@ async def _read_first_input(gripper: Any, name: str | None) -> float:
     most drivers the list is empty and carries no aperture at all. This used
     to fall back to 0.0, which reports a gripper permanently held fully open
     -- wrong, and invisible, for the entire life of the session. When a
-    driver's model does have DOF, index 0 is the one this module treats as
-    the aperture -- every gripper this file adapts is single-DOF by
-    construction (open/close along one axis), so there is only ever one
-    slot to read.
+    driver's model does have DOF, this module assumes index 0 is the
+    aperture; a driver whose gripper model has more than one joint would
+    have other slots that `values[0]` silently ignores.
+
+    Known limitation: the value returned here is the driver's raw
+    frame-system value, in radians or meters -- it is NOT normalized to
+    0.0-1.0 the way every other adapter's `read()` is, even though
+    `InputsGripper.write()` sends a normalized 0.0-1.0 value into this same
+    channel. Fixing that would require configured radian/meter bounds for
+    the joint; that was considered and declined because no driver we support
+    actually has a jointed gripper model, so the surface would be
+    speculative. `do_command` is the variant that normalizes honestly for a
+    jointed driver.
     """
     values = await gripper.get_current_inputs()
     if not values:
