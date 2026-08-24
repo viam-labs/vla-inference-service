@@ -1812,11 +1812,21 @@ async def test_async_mode_warns_when_queue_threshold_too_low_for_observed_latenc
     assert any("queue_threshold=0" in m and "queue_threshold>=" in m for m in messages), messages
 
 
-async def test_fake_arm_records_the_extra_it_was_called_with():
+@pytest.mark.parametrize("cls", [FakeArm, StalledArm])
+async def test_fake_arm_records_the_extra_it_was_called_with(cls):
     """`extra` carries the driver-facing wait flag, so a fake that discards it
-    cannot verify what the controller actually sent."""
+    cannot verify what the controller actually sent. Both arm fakes record it:
+    `StalledArm` overrides the method wholesale, so its copy of the append is
+    the one an edit will forget.
+    """
     from viam.proto.component.arm import JointPositions
 
-    arm = FakeArm(positions=[0.0] * 6)
+    arm = cls(positions=[0.0] * 6)
     await arm.move_to_joint_positions(JointPositions(values=[0.0] * 6), extra={"wait": False})
     assert arm.move_extras == [{"wait": False}]
+    assert len(arm.moves) == len(arm.move_extras)
+
+    arm2 = cls(positions=[0.0] * 6)
+    await arm2.move_to_joint_positions(JointPositions(values=[0.0] * 6))
+    assert arm2.move_extras == [None]
+    assert len(arm2.moves) == len(arm2.move_extras)
