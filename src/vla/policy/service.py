@@ -159,7 +159,14 @@ class VLAPolicy(Generic, EasyResource):
         """The part of `_load` bounded by `cfg.load_timeout_s`."""
         checkpoint = await asyncio.to_thread(resolve_checkpoint, cfg)
         rtc = cfg.rtc if cfg.rtc.enabled else None
-        await asyncio.to_thread(backend.load, checkpoint, device=cfg.device, dtype=cfg.dtype, rtc=rtc)
+        await asyncio.to_thread(
+            backend.load,
+            checkpoint,
+            device=cfg.device,
+            dtype=cfg.dtype,
+            rtc=rtc,
+            unused_image_features=frozenset(cfg.unused_image_features),
+        )
         for _ in range(cfg.warmup_inferences):
             await asyncio.to_thread(self._warmup_once, backend)
 

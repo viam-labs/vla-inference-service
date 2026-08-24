@@ -27,6 +27,8 @@ from viam.proto.app.robot import ServiceConfig
 
 from tests.fakes import FakeArm, FakeCamera, FakeGripper, StalledArm
 from vla.controller.service import VLAController
+from vla.policy.fake_backend import FakePolicyBackend
+from vla.policy.service import VLAPolicy
 from vla.wire import encode_matrix
 
 pytestmark = pytest.mark.asyncio
@@ -1448,6 +1450,74 @@ async def test_async_mode_end_to_end_commands_the_arm_and_reports_mode():
     await svc.do_command({"command": "stop"})
     assert len(arm.moves) >= 1
     assert policy.infer_calls >= 1
+
+
+# ---------------------------------------------------------------------------
+# unused_image_features (Task: smolvla_base inheritance) end-to-end: the
+# REAL policy service (vla.policy.service.VLAPolicy) over FakePolicyBackend
+# stands in for "p" here, not the duck-typed FakePolicyClient every other
+# test in this file uses -- the point is to prove the actual
+# PolicyConfig.unused_image_features -> LeRobotBackend/FakePolicyBackend ->
+# specs.image_feature_keys pipeline, not a hand-rolled stand-in for it. No
+# torch/lerobot required: FakePolicyBackend exists precisely so this is
+# exercisable without either.
+# ---------------------------------------------------------------------------
+
+
+async def test_controller_runs_when_policy_declares_more_cameras_than_are_mapped(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors").write_text("{}")
+
+    declared_cameras = (
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+    )
+    policy = VLAPolicy("p")
+    policy._backend_factory = lambda: FakePolicyBackend(
+        action_dim=5, n_action_steps=4, camera_keys=declared_cameras
+    )
+    policy_attrs = Struct()
+    policy_attrs.update({
+        "model_path": str(tmp_path),
+        # camera3 is a checkpoint artifact this robot never wires up --
+        # exactly the smolvla_base 3-camera inheritance case.
+        "unused_image_features": ["observation.images.camera3"],
+    })
+    policy.reconfigure(
+        ServiceConfig(
+            name="p",
+            api="rdk:service:generic",
+            model="viam-labs:vla:policy",
+            attributes=policy_attrs,
+        ),
+        {},
+    )
+    await policy.await_ready()
+
+    arm = FakeArm(positions=[0.0] * 5)
+    svc = _svc(
+        config=_config(
+            cameras={
+                "observation.images.camera1": "cam1",
+                "observation.images.camera2": "cam2",
+                # camera3 is deliberately unmapped: the controller must
+                # never need to know it exists, let alone read/encode it.
+            },
+            state_joint_indices=[0, 1, 2, 3, 4],
+        ),
+        deps=_deps(
+            policy=policy,
+            arm=arm,
+            cam1=FakeCamera(),
+            cam2=FakeCamera(),
+        ),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "running", "error")
+    await svc.do_command({"command": "stop"})
+    assert status["state"] == "running"
+    assert len(arm.moves) >= 1
 
 
 async def test_async_mode_starvation_escalates_when_inference_stalls():

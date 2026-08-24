@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from viam.utils import dict_to_struct, struct_to_dict
 
+from vla.config_util import ConfigError
 from vla.policy.backend import PolicyBackend, PolicySpecs
 from vla.policy.fake_backend import FakePolicyBackend
 
@@ -417,3 +418,69 @@ def test_backend_implementing_all_abstract_methods_can_be_instantiated():
     # Must not raise -- proves the failures above are due to missing
     # abstract methods specifically, not some unrelated constructor issue.
     Complete()
+
+
+# ---------------------------------------------------------------------------
+# unused_image_features: exercises the checkpoint-declares-more-than-it-
+# consumes case (the lerobot/smolvla_base inheritance in
+# PolicyConfig.unused_image_features) with no torch/lerobot installed.
+# ---------------------------------------------------------------------------
+
+
+def test_declared_image_feature_keys_defaults_to_full_camera_set():
+    keys = (
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+    )
+    b = FakePolicyBackend(camera_keys=keys)
+    b.load("/fake", device="cpu", dtype="float32", rtc=None)
+    assert b.specs.declared_image_feature_keys == list(keys)
+    assert b.specs.image_feature_keys == list(keys)
+
+
+def test_unused_image_features_reduces_image_feature_keys_but_not_declared():
+    keys = (
+        "observation.images.camera1",
+        "observation.images.camera2",
+        "observation.images.camera3",
+    )
+    b = FakePolicyBackend(camera_keys=keys)
+    b.load(
+        "/fake",
+        device="cpu",
+        dtype="float32",
+        rtc=None,
+        unused_image_features=frozenset({"observation.images.camera3"}),
+    )
+    specs = b.specs
+    assert specs.image_feature_keys == [
+        "observation.images.camera1",
+        "observation.images.camera2",
+    ]
+    assert specs.declared_image_feature_keys == list(keys)
+
+
+def test_unused_image_features_rejects_a_key_the_checkpoint_never_declared():
+    b = FakePolicyBackend(camera_keys=("observation.images.top",))
+    with pytest.raises(ConfigError, match="observation.images.nonexistent"):
+        b.load(
+            "/fake",
+            device="cpu",
+            dtype="float32",
+            rtc=None,
+            unused_image_features=frozenset({"observation.images.nonexistent"}),
+        )
+
+
+def test_unused_image_features_rejects_listing_every_declared_feature():
+    keys = ("observation.images.camera1", "observation.images.camera2")
+    b = FakePolicyBackend(camera_keys=keys)
+    with pytest.raises(ConfigError, match="every image feature"):
+        b.load(
+            "/fake",
+            device="cpu",
+            dtype="float32",
+            rtc=None,
+            unused_image_features=frozenset(keys),
+        )

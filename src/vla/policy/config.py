@@ -45,6 +45,21 @@ _MIN_LOAD_TIMEOUT_S = 0.001
 _MAX_LOAD_TIMEOUT_S = 86400.0
 _DEFAULT_LOAD_TIMEOUT_S = 1800.0
 
+# unused_image_features exists because of a checkpoint-training quirk, not a
+# runtime one: lerobot/configs/train.py:285 refuses a `rename_map` unless a
+# pretrained checkpoint is given, so fine-tuning lerobot/smolvla_base (which
+# declares observation.images.camera1/2/3) inherits all three image
+# features verbatim into the new checkpoint's own config.json even when the
+# actual training dataset only recorded one or two cameras. The resulting
+# checkpoint declares an image feature it never consumed during training,
+# and there is no harmless value to feed that slot at inference time --
+# feeding anything (black, gray, a duplicate of another camera) measurably
+# shifts the predicted chunk, while omitting the key entirely reproduces
+# upstream lerobot's own behavior exactly (modeling_smolvla.py:340-346 drops
+# any image key missing from the batch and only raises if none are
+# present). This field tells the policy which of the checkpoint's declared
+# image features to drop before validating/serving `image_feature_keys`.
+
 
 @dataclass(frozen=True)
 class RTCSettings:
@@ -102,6 +117,10 @@ class PolicyConfig:
     warmup_inferences: int = 2
     load_timeout_s: float = _DEFAULT_LOAD_TIMEOUT_S
     rtc: RTCSettings = field(default_factory=RTCSettings)
+    # Tuple, not list -- this dataclass is frozen, and a mutable default
+    # would be shared across every PolicyConfig instance that doesn't
+    # override it.
+    unused_image_features: tuple[str, ...] = ()
 
     def __repr__(self) -> str:
         token_repr = "None" if self.hf_token_env is None else redact_secret(self.hf_token_env)
@@ -115,7 +134,8 @@ class PolicyConfig:
             f"dtype={self.dtype!r}, "
             f"warmup_inferences={self.warmup_inferences!r}, "
             f"load_timeout_s={self.load_timeout_s!r}, "
-            f"rtc={self.rtc!r})"
+            f"rtc={self.rtc!r}, "
+            f"unused_image_features={self.unused_image_features!r})"
         )
 
     @staticmethod
@@ -167,4 +187,28 @@ class PolicyConfig:
             warmup_inferences=warmup,
             load_timeout_s=load_timeout_s,
             rtc=RTCSettings.parse({} if rtc_raw is None else rtc_raw),
+            unused_image_features=_parse_unused_image_features(raw.get("unused_image_features")),
         )
+
+
+def _parse_unused_image_features(raw: Any) -> tuple[str, ...]:
+    # Absent key -> (): most checkpoints declare exactly the cameras they
+    # consume and never need this field at all.
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"unused_image_features must be a list, got {raw!r}")
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(raw):
+        value = as_str(entry, f"unused_image_features[{i}]")
+        if not value.strip():
+            raise ConfigError(
+                f"unused_image_features[{i}] must not be empty or whitespace-only, got {value!r}"
+            )
+        if value in seen:
+            raise ConfigError(f"unused_image_features contains a duplicate entry: {value!r}")
+        seen.add(value)
+        parsed.append(value)
+    return tuple(parsed)
