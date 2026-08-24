@@ -328,28 +328,22 @@ class FakeDoCommandGripper:
     wrong API failing loudly.
     """
 
-    def __init__(self, position=0.0, read_key="position", omit_read_key=False, read_value=None):
+    def __init__(self, position=0.0, read_key="position"):
         self.position = position
         self.read_key = read_key
-        # `omit_read_key` and `read_value` exist to drive the two malformed-response
-        # paths: a driver whose key differs from the configured one, and a driver
-        # returning a non-numeric value under the right key.
-        self.omit_read_key = omit_read_key
-        self.read_value = read_value
         self.commands = []
 
-    async def do_command(self, command, **kwargs):
+    async def do_command(self, command, *, timeout=None, **kwargs):
         self.commands.append(dict(command))
         if command.get("get") is True:
-            if self.omit_read_key:
-                return {"some_other_key": 1.0}
-            value = self.position if self.read_value is None else self.read_value
-            return {self.read_key: value}
+            return {self.read_key: self.position}
         if "set" in command:
             self.position = command["set"]
-            return {"position": self.position}
+            return {self.read_key: self.position}
         raise AssertionError(f"unexpected command {command!r}")
 ```
+
+> **Two knobs deliberately absent.** An earlier draft carried `omit_read_key=True` and `read_value=X`. Both were redundant: a driver returning the wrong key is `read_key="some_other_key"`, and a driver returning a non-numeric value is `position="halfway"` (or `position=True`, or `position=None` for JSON null) — because `position` is untyped and simply echoed. Removing them keeps the malformed-key literal inside the test that asserts on it, drops an undocumented precedence rule (`omit_read_key` silently shadowed `read_value`), and makes the JSON-null case expressible, which the old shape could not do. Do not reintroduce them.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -593,21 +587,21 @@ async def test_do_command_read_uses_the_configured_read_key():
 
 
 async def test_do_command_read_errors_when_the_key_is_absent():
-    adapter = _do_cmd(FakeDoCommandGripper(omit_read_key=True))
+    """The fake answers under `some_other_key`; the adapter is configured for
+    the default `position`, so the key it wants is missing."""
+    adapter = _do_cmd(FakeDoCommandGripper(read_key="some_other_key"))
     with pytest.raises(GripperRuntimeError, match="some_other_key"):
         await adapter.read()
 
 
-async def test_do_command_read_errors_on_a_non_numeric_value():
-    adapter = _do_cmd(FakeDoCommandGripper(read_value="halfway"))
-    with pytest.raises(GripperRuntimeError, match="non-numeric"):
-        await adapter.read()
-
-
-async def test_do_command_read_rejects_a_bool_as_non_numeric():
-    """`isinstance(True, int)` is True in Python, so bool needs excluding
-    explicitly or a driver returning True reads as fully closed."""
-    adapter = _do_cmd(FakeDoCommandGripper(read_value=True))
+@pytest.mark.parametrize(
+    "raw", ["halfway", True, None], ids=["string", "bool", "json-null"]
+)
+async def test_do_command_read_errors_on_a_non_numeric_value(raw):
+    """`bool` needs excluding explicitly -- `isinstance(True, int)` is True in
+    Python, so a driver returning True would otherwise read as fully closed.
+    `None` is the likeliest real malformed response (JSON null)."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
     with pytest.raises(GripperRuntimeError, match="non-numeric"):
         await adapter.read()
 
@@ -659,7 +653,7 @@ Add to `DoCommandGripper`:
 uv run pytest tests/controller/test_gripper.py -k "do_command_read" -v
 ```
 
-Expected: 13 passed.
+Expected: 14 passed — 3 (inverted scale) + 3 (xarm units) + 2 (clamp rails) + 1 (configured key) + 1 (absent key) + 3 (non-numeric: string, bool, json-null) + 1 (emits get).
 
 - [ ] **Step 5: Commit**
 
@@ -960,7 +954,7 @@ async def test_do_command_malformed_read_is_caught_before_any_arm_motion():
     """`_preflight_gripper` reads then writes back, so a driver whose response
     key does not match `read_key` fails before the arm is ever commanded."""
     arm = FakeArm(positions=[0.0] * 5)
-    g = FakeDoCommandGripper(omit_read_key=True)
+    g = FakeDoCommandGripper(read_key="some_other_key")
     # action_dim=6 matters: with 5 state_joint_indices and in_state=True the
     # expected dim is 6, and a mismatch would raise in _check_action_dim
     # *before* the preflight probe -- passing the arm-motion assertion for
