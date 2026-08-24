@@ -80,10 +80,19 @@ from .gripper import GRIPPER_TYPES
 from .observation import DEFAULT_DURATION_WARN_S, STALE_FRAME_WARN_S
 from .units import SUPPORTED_UNITS
 
-__all__ = ["ConfigError", "SafetyConfig", "ControllerConfig", "MODES", "ENCODINGS"]
+__all__ = ["ConfigError", "SafetyConfig", "ControllerConfig", "MODES", "ENCODINGS", "IMAGE_FITS"]
 
 MODES = ("auto", "sequential", "rtc", "async")
 ENCODINGS = ("jpeg", "png", "raw")
+# "pad" mirrors smolvla's own training-time convention (resize_with_pad,
+# lerobot/policies/common/vla_utils.py:219): scale to fit inside the
+# declared (h, w) preserving aspect ratio, then pad black on the LEFT and
+# TOP. "stretch" is the plain `Image.resize` this module used before that
+# convention was matched -- kept, as the non-default choice, so an existing
+# deployment can still reproduce its pre-fix output byte-for-byte if it
+# needs to. See observation.py's `_encode` and the README's `#controller`
+# section for the measured divergence between the two.
+IMAGE_FITS = ("pad", "stretch")
 
 # Bounds chosen as sanity ceilings/floors, not physical limits: they exist
 # to turn an obvious typo (a negative fps, a fractional queue_threshold)
@@ -212,6 +221,7 @@ class ControllerConfig:
     action_units: str = "degrees"
     image_encoding: str = "jpeg"
     jpeg_quality: int = 90
+    image_fit: str = "pad"
     duration_warn_s: float = DEFAULT_DURATION_WARN_S
     stale_frame_warn_s: float = STALE_FRAME_WARN_S
     safety: SafetyConfig = field(default_factory=SafetyConfig)
@@ -249,6 +259,7 @@ class ControllerConfig:
         mode = as_choice(raw.get("mode", "auto"), "mode", MODES)
         fps = as_float(raw.get("fps", 10.0), "fps", minimum=_MIN_FPS, maximum=_MAX_FPS)
         encoding = as_choice(raw.get("image_encoding", "jpeg"), "image_encoding", ENCODINGS)
+        image_fit = as_choice(raw.get("image_fit", "pad"), "image_fit", IMAGE_FITS)
         state_units = as_choice(raw.get("state_units", "degrees"), "state_units", SUPPORTED_UNITS)
         action_units = as_choice(
             raw.get("action_units", "degrees"), "action_units", SUPPORTED_UNITS
@@ -298,6 +309,7 @@ class ControllerConfig:
             action_units=action_units,
             image_encoding=encoding,
             jpeg_quality=as_int(raw.get("jpeg_quality", 90), "jpeg_quality", minimum=0, maximum=100),
+            image_fit=image_fit,
             duration_warn_s=as_float(
                 raw.get("duration_warn_s", DEFAULT_DURATION_WARN_S),
                 "duration_warn_s",

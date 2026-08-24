@@ -139,6 +139,131 @@ async def test_unknown_image_encoding_raises_observation_error_not_wire_error():
 
 
 # ---------------------------------------------------------------------------
+# image_fit: aspect-preserving "pad" (default, smolvla's own
+# resize_with_pad convention -- lerobot/policies/common/vla_utils.py:219)
+# vs. the legacy "stretch" this module used before. FakeCamera always
+# serves a solid-black frame, which can't distinguish "stretched" from
+# "padded" by pixel content -- so `_ColorCamera` below serves a solid
+# non-black frame over lossless PNG, and these tests use
+# image_encoding="raw" so the assembled payload is also lossless, letting
+# padding math be checked against exact pixel values.
+# ---------------------------------------------------------------------------
+
+
+class _ColorCamera(FakeCamera):
+    async def get_images(self, *args, **kwargs):
+        from viam.media.video import NamedImage, CameraMimeType
+        from viam.proto.common import ResponseMetadata
+        from google.protobuf.timestamp_pb2 import Timestamp
+        import io
+        from PIL import Image
+
+        self.reads += 1
+        metadata = ResponseMetadata()
+        ts = Timestamp()
+        ts.GetCurrentTime()
+        metadata.captured_at.CopyFrom(ts)
+
+        h, w = self.size
+        arr = np.full((h, w, 3), 255, dtype=np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        image = NamedImage("image", buf.getvalue(), CameraMimeType.PNG)
+        return [image], metadata
+
+
+async def test_pad_preserves_aspect_ratio_and_pads_black_on_left_and_top():
+    # 16:9-ish source into a square target: stretching would distort it to
+    # 1:1 (see the "stretch" test below); "pad" must not.
+    cam = _ColorCamera(size=(180, 320))
+    obs = await _builder(
+        cameras={"observation.images.top": cam},
+        image_sizes={"observation.images.top": (256, 256)},
+        image_fit="pad",
+        image_encoding="raw",
+    ).build()
+    arr = decode_image(obs.images["observation.images.top"])
+    assert arr.shape == (256, 256, 3)
+
+    # ratio = max(320/256, 180/256) = 1.25 -> resized to (144, 256), so all
+    # the padding lands in the height dimension, on top.
+    resized_h = 144
+    pad_h = 256 - resized_h
+    assert pad_h > 0
+    assert np.all(arr[:pad_h] == 0), "padding band must be black"
+    assert np.all(arr[pad_h:] == 255), "the source's content must reach the bottom edge, unpadded"
+
+
+async def test_pad_of_a_portrait_source_pads_on_the_left_not_the_right():
+    """The companion to the test above, and not redundant with it: a
+    landscape source into a square target pads only in *height*, so every
+    landscape case leaves `pad_w == 0` and cannot tell left-padding from
+    right-padding. Only a portrait source exercises the width half of the
+    padding math -- without this, flipping `_resize_with_pad` to pad on the
+    right passes the entire suite, even though `_encode`'s own docstring
+    argues that padding the wrong side is as wrong as stretching.
+    """
+    cam = _ColorCamera(size=(320, 180))
+    obs = await _builder(
+        cameras={"observation.images.top": cam},
+        image_sizes={"observation.images.top": (256, 256)},
+        image_fit="pad",
+        image_encoding="raw",
+    ).build()
+    arr = decode_image(obs.images["observation.images.top"])
+    assert arr.shape == (256, 256, 3)
+
+    # ratio = max(180/256, 320/256) = 1.25 -> resized to (256, 144), so all
+    # the padding lands in the width dimension, on the left.
+    pad_w = 256 - 144
+    assert np.all(arr[:, :pad_w] == 0), "padding must land on the LEFT, not the right"
+    assert np.all(arr[:, pad_w:] == 255), "the source's content must reach the right edge, unpadded"
+
+
+async def test_pad_leaves_a_frame_already_at_target_size_untouched():
+    cam = _ColorCamera(size=(224, 224))
+    obs = await _builder(
+        cameras={"observation.images.top": cam},
+        image_sizes={"observation.images.top": (224, 224)},
+        image_fit="pad",
+        image_encoding="raw",
+    ).build()
+    arr = decode_image(obs.images["observation.images.top"])
+    assert arr.shape == (224, 224, 3)
+    assert np.all(arr == 255)
+
+
+async def test_pad_handles_upscaling_a_source_smaller_than_the_target():
+    cam = _ColorCamera(size=(64, 64))
+    obs = await _builder(
+        cameras={"observation.images.top": cam},
+        image_sizes={"observation.images.top": (224, 224)},
+        image_fit="pad",
+        image_encoding="raw",
+    ).build()
+    arr = decode_image(obs.images["observation.images.top"])
+    assert arr.shape == (224, 224, 3)
+    # Square source into a square target -- ratio is 1 in both dimensions,
+    # so the whole frame is content with no padding at all.
+    assert np.all(arr == 255)
+
+
+async def test_stretch_reproduces_the_old_full_frame_distorting_behavior():
+    cam = _ColorCamera(size=(180, 320))
+    obs = await _builder(
+        cameras={"observation.images.top": cam},
+        image_sizes={"observation.images.top": (256, 256)},
+        image_fit="stretch",
+        image_encoding="raw",
+    ).build()
+    arr = decode_image(obs.images["observation.images.top"])
+    assert arr.shape == (256, 256, 3)
+    # A uniform source stretched (rather than padded) fills the ENTIRE
+    # target -- there is no black band anywhere, unlike the "pad" case.
+    assert np.all(arr == 255)
+
+
+# ---------------------------------------------------------------------------
 # camera failure / emptiness
 # ---------------------------------------------------------------------------
 
