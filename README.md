@@ -337,6 +337,37 @@ against training geometry: **~8.3°** divergence over a 50-step chunk versus **~
 for any aspect-preserving fit, about 2.5x worse. (Synthetic texture, so read those as an
 ordering rather than a precise bound.)
 
+#### The declared resolution may not describe your cameras
+
+The controller takes its wire resolution from `specs.input_features[key]`, which is only
+as trustworthy as the checkpoint's own declaration. A fine-tune of `lerobot/smolvla_base`
+inherits the base's `[3, 256, 256]` — the same inheritance behind
+[`unused_image_features`](#unused_image_features) — so a checkpoint recorded from 1080p
+cameras can still claim 256x256. Frames then get downsampled harder than training
+downsampled them, on top of whatever `image_fit` does about aspect ratio.
+
+`"pad"` is the fix for the geometry half of that, and it is the half that matters more.
+The remaining resolution loss has no config knob: there is deliberately no override for
+the declared shape, because the declaration is the right place to fix this.
+
+**Train with `--policy.input_features=null` and no `--rename_map`** and the problem does
+not arise: lerobot derives the features from the dataset, so `config.json` records your
+cameras' real names and native resolutions. Verified on `viamrobotics/box-opener`, that
+yields `observation.images.realsense_cam [3, 720, 1280]` and
+`observation.images.camera_transform [3, 1920, 1080]` — two cameras at full resolution
+instead of three at 256x256. The controller then sends full-resolution frames with no
+extra downsample, and `image_fit` becomes close to a no-op because the aspect already
+matches.
+
+Two things to know if you do that:
+
+- **Keep `image_encoding` on `jpeg`** (the default). A raw 1080p frame base64-encodes to
+  roughly 8 MB and will hit gRPC message limits; at `jpeg_quality: 90` the same frame is a
+  few hundred KB.
+- **`fps` budget.** Encoding and shipping a 1080p frame per camera per tick is real work.
+  Watch `status.measured_fps` against configured `fps`, and `duration_warn_s` will log
+  when observation assembly overruns the tick.
+
 ### DoCommand
 
 Every request names its command in a `"command"` field.
