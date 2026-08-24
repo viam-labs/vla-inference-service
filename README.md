@@ -52,17 +52,72 @@ Has no dependencies; `validate_config` always returns `([], [])`.
 | `rtc.execution_horizon` | integer, 1–1000 | `10` | Mirrors lerobot's `RTCConfig.execution_horizon`. |
 | `rtc.prefix_attention_schedule` | `linear` \| `exp` \| `ones` \| `zeros` | `"linear"` | Mirrors `RTCConfig`. |
 | `rtc.max_guidance_weight` | number, >0–1000 | `10.0` | Mirrors `RTCConfig`. |
+| `unused_image_features` | array of string | `[]` | Declared image feature keys (from the checkpoint's own `config.json`) to drop before validating/serving `image_feature_keys` — see below. |
 
 `policy_type` is deliberately not configurable — it is read from the checkpoint's own
 `config.json`. Making it a config field would only create a way to contradict the
 checkpoint.
+
+### `unused_image_features`
+
+A fine-tune of `lerobot/smolvla_base` inherits all three of its base image features
+(`observation.images.camera1/2/3`, each `[3, 256, 256]`) into the new checkpoint's own
+`config.json`, regardless of how many cameras the fine-tuning dataset actually had —
+`lerobot/configs/train.py:285` refuses a `rename_map` unless a pretrained checkpoint is
+given, so the inherited features pass through verbatim. The result: a real checkpoint
+trained on one or two cameras can still declare three, and there is no harmless value to
+feed the unused slot at inference time.
+
+The reason to drop the key rather than fill it needs no measurement: dropping it
+reproduces upstream lerobot's own behavior exactly, since
+`lerobot/policies/smolvla/modeling_smolvla.py:340-346` builds its image batch from
+whatever keys are actually present and only raises if none are — so the policy sees
+precisely what it saw in training. Filling it does not. Measured on a real 2-camera
+fine-tune, feeding black, mid-gray, or a duplicate of another camera into the unused slot
+shifts the predicted 50-step chunk by **5.7–7.8°** versus omitting it, with no value
+bringing that to zero.
+
+That measurement requires a **fixed torch seed**: `predict_chunk` does not seed, and
+smolvla's flow-matching sampler draws fresh noise per call, so two calls on byte-identical
+inputs differ by a median of ~15° (up to ~29°) all on their own. Any unseeded
+before/after comparison of this policy's output is measuring the sampler, not the change
+— a mistake worth naming here because the numbers it produces look plausible.
+
+This module is deliberately stricter than lerobot here: `infer` requires the `images`
+payload to match `image_feature_keys` exactly, and the controller's `cameras` config
+must cover every one of them — which makes an unused declared feature otherwise
+unsatisfiable. `unused_image_features` is the escape hatch: list the
+checkpoint's artifact key(s) there, and the policy validates each against what the
+checkpoint actually declares (a typo fails loudly, naming the checkpoint's real declared
+keys) and reports the reduced set as `image_feature_keys`. `specs.declared_image_feature_keys`
+always reports the checkpoint's full, undiminished declaration alongside it, so an
+operator can see what a checkpoint originally declared even after some of it has been
+dropped. The controller needs no awareness of this at all — it only ever sees the
+already-reduced `image_feature_keys`.
+
+As a nudge rather than a second enforcement layer, the policy also logs one advisory
+warning at load time for any declared image feature that looks unused but was *not*
+listed: no entry in the preprocessor's normalizer stats, and not a rename target of a
+`rename_observations_processor` step. This is deliberately advisory, not automatic:
+VISUAL features are identity-normalized in general, so a legitimately-used camera can
+have no stats at all — good enough to point a human at a candidate worth
+double-checking, not good enough to silently drop a camera over.
+
+A checkpoint with **no rename map at all** is skipped rather than warned about. An empty
+map makes the "not a rename target" half of the test vacuously true for every key, so the
+check would degenerate into "warn about every camera without stats" — which fires on all
+three of `lerobot/smolvla_base`'s own cameras, a warning that is 100% false positives on
+the most common base checkpoint. An empty rename map is also precisely the signature of a
+checkpoint that was never fine-tuned with camera renaming, which is exactly where this
+inheritance case cannot arise. On a real fine-tune it names the inherited slot and
+nothing else.
 
 ### DoCommand
 
 | Command | Input | Output |
 |---|---|---|
 | `infer` | `images` (map of feature key → image payload — see below), `state` (`{"values": [f, ...]}`), `task` (string), optional `rtc` (`{"inference_delay": int, "prev_chunk_left_over": {"rows": [[...]]}}`) | `actions` (`{"rows": [[...]]}`, postprocessed, ready for the robot), `raw_actions` (same shape, policy-space — what an RTC caller feeds back as `prev_chunk_left_over`), `latency_s` |
-| `specs` | — | `policy_type`, `action_dim`, `state_dim`, `n_action_steps`, `input_features`, `output_features`, `image_feature_keys`, `supports_rtc`, `rtc_enabled`, `relative_actions`, `device`, `dtype` |
+| `specs` | — | `policy_type`, `action_dim`, `state_dim`, `n_action_steps`, `input_features`, `output_features`, `image_feature_keys`, `declared_image_feature_keys`, `supports_rtc`, `rtc_enabled`, `relative_actions`, `device`, `dtype` |
 | `status` | — | `state` (`idle` \| `loading` \| `ready` \| `failed`), `error` |
 | `reset` | — | `{"ok": true}` — clears any cached backend state |
 
@@ -136,6 +191,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `action_units` | `degrees` \| `radians` | `"degrees"` | Unit the policy's action is expressed in. |
 | `image_encoding` | `jpeg` \| `png` \| `raw` | `"jpeg"` | A debugging knob (JPEG artifacts vs. the training distribution), not a tuning one. |
 | `jpeg_quality` | integer, 0–100 | `90` | |
+| `image_fit` | `pad` \| `stretch` | `"pad"` | How a camera frame is resized onto the checkpoint's declared `(h, w)` whenever the frame's shape differs from it — see below. |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
 | `safety.max_joint_delta_degs` | number | `8.0` | Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see Safety. |
@@ -143,6 +199,26 @@ backoff for up to `policy_ready_timeout_s`.
 | `safety.max_vel_degs_per_sec` | number | — | Operator-facing velocity knob — see Safety. |
 | `safety.joint_limits_degs` | array of `[min, max]` | — | One pair per action-vector dimension, **in action-vector order** (not Viam joint order) — see Safety. |
 | `safety.stop_on_error` | boolean | `true` | Whether a failure producing the next action (camera read, observation assembly, the policy call) halts the loop, or is logged and the tick skipped. |
+
+### `image_fit`
+
+A camera frame rarely arrives already shaped like the checkpoint's declared `(h, w)` —
+most Viam cameras stream 16:9, while a checkpoint frequently declares a square
+resolution. `image_fit: "pad"` (the default) preserves the frame's aspect ratio: scale
+by `ratio = max(cur_w / target_w, cur_h / target_h)`, then pad whatever's left with
+black on the **left and top**. This mirrors lerobot's own `resize_with_pad`
+(`lerobot/policies/common/vla_utils.py:219`) — smolvla and xvla's training-time
+convention, not the centered-padding variant lerobot also ships (openpi's convention) —
+so the geometry a camera frame is squeezed into matches what the checkpoint actually saw
+during training, including which side any padding lands on.
+
+`image_fit: "stretch"` is the plain `Image.resize` this module used before, kept only so
+an existing deployment can reproduce its pre-fix output byte-for-byte. It is not a
+tuning knob to reach for otherwise: stretching a 16:9 frame into a square distorts every
+object's proportions in a way the checkpoint never trained on. Measured against the
+geometry training actually saw (synthetic texture, so treat the numbers as an ordering,
+not a precise bound): stretching diverges by **~8.27°** over a 50-step chunk, versus
+**~3.2–4.1°** for any aspect-preserving alternative — roughly 2.5x worse.
 
 ### DoCommand
 
