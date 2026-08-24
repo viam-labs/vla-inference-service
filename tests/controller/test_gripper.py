@@ -460,3 +460,9 @@ async def test_fake_do_command_gripper_round_trips():
     await g.do_command({"set": 7.0})
     assert g.commands == [{"get": True}, {"set": 7.0}]
     assert await g.do_command({"get": True}) == {"position": 7.0}
+
+
+async def test_fake_do_command_gripper_honors_a_custom_read_key():
+    g = FakeDoCommandGripper(position=3.0, read_key="pos")
+    assert await g.do_command({"get": True}) == {"pos": 3.0}
+    assert await g.do_command({"set": 9.0}) == {"pos": 9.0}

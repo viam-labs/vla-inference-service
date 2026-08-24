@@ -179,26 +179,30 @@ class FakeDoCommandGripper:
     has no `get_current_inputs`/`go_to_inputs` -- that is the whole reason
     this variant exists, and omitting them keeps a test that reaches for the
     wrong API failing loudly.
+
+    `position` is untyped and simply echoed back, so a non-numeric or `None`
+    value (a driver returning a bad payload, or JSON null) reaches the
+    caller unchanged rather than needing a dedicated knob for it. Likewise
+    a driver answering under an unexpected key is just `read_key` set to
+    something other than what the caller configured. An unrecognized
+    command raises `AssertionError` -- kept rather than a bare `assert` so
+    it survives `-O` -- but note that inside the controller tick loop
+    (`src/vla/controller/service.py`), broad `except Exception` handlers
+    launder this into `last_error` text rather than letting it propagate as
+    a stack trace; a service-level test must assert on `last_error` to see
+    it.
     """
 
-    def __init__(self, position=0.0, read_key="position", omit_read_key=False, read_value=None):
+    def __init__(self, position=0.0, read_key="position"):
         self.position = position
         self.read_key = read_key
-        # `omit_read_key` and `read_value` exist to drive the two malformed-response
-        # paths: a driver whose key differs from the configured one, and a driver
-        # returning a non-numeric value under the right key.
-        self.omit_read_key = omit_read_key
-        self.read_value = read_value
         self.commands = []
 
-    async def do_command(self, command, **kwargs):
+    async def do_command(self, command, *, timeout=None, **kwargs):
         self.commands.append(dict(command))
         if command.get("get") is True:
-            if self.omit_read_key:
-                return {"some_other_key": 1.0}
-            value = self.position if self.read_value is None else self.read_value
-            return {self.read_key: value}
+            return {self.read_key: self.position}
         if "set" in command:
             self.position = command["set"]
-            return {"position": self.position}
+            return {self.read_key: self.position}
         raise AssertionError(f"unexpected command {command!r}")
