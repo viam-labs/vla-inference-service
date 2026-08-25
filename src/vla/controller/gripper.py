@@ -358,6 +358,12 @@ class DoCommandGripper(GripperAdapter):
         # measurement slightly outside a declared range, not an error.
         return _clamp_unit(normalized)
 
+    async def write(self, value: float) -> None:
+        raw = self._open_value + _clamp_unit(value) * (
+            self._closed_value - self._open_value
+        )
+        await self._gripper.do_command({"set": raw, **self._write_args})
+
 
 def make_gripper_adapter(
     raw: Mapping[str, Any] | None, dependencies: Mapping[str, Any]
@@ -417,6 +423,16 @@ def make_gripper_adapter(
         closed_value = as_float(raw["closed_value"], "gripper.closed_value")
         read_key = as_str(raw.get("read_key", _DEFAULT_READ_KEY), "gripper.read_key")
         write_args = raw.get("write_args", {})
+        if not isinstance(write_args, Mapping):
+            raise GripperConfigError(
+                f"gripper.write_args must be an object, got {write_args!r}"
+            )
+        if "set" in write_args:
+            raise GripperConfigError(
+                'gripper.write_args must not contain "set": it is merged into the set '
+                "command and would silently replace the setpoint computed from the "
+                "policy's action, parking the gripper at a constant"
+            )
         return DoCommandGripper(
             name,
             dependencies.get(name),

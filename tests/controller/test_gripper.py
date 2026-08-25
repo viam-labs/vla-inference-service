@@ -593,7 +593,7 @@ async def test_do_command_read_errors_on_a_non_mapping_response():
             return None
 
     adapter = _do_cmd(NoneReturningGripper())
-    with pytest.raises(GripperRuntimeError, match="returned"):
+    with pytest.raises(GripperRuntimeError, match="got None"):
         await adapter.read()
 
 
@@ -650,4 +650,64 @@ async def test_do_command_read_handles_a_non_inverted_scale():
     adapter = _do_cmd(
         FakeDoCommandGripper(position=25.0), open_value=0.0, closed_value=100.0
     )
+    assert await adapter.read() == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# do_command: write()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(0.0, 95.0), (1.0, 0.0), (0.5, 47.5)], ids=["open", "closed", "mid"]
+)
+async def test_do_command_write_maps_onto_the_driver_scale(value, expected):
+    g = FakeDoCommandGripper()
+    await _do_cmd(g).write(value)
+    assert g.commands == [{"set": pytest.approx(expected)}]
+
+
+@pytest.mark.parametrize("value,expected", [(-0.2, 95.0), (1.7, 0.0)])
+async def test_do_command_write_clamps_out_of_range_actions(value, expected):
+    g = FakeDoCommandGripper()
+    await _do_cmd(g).write(value)
+    assert g.commands == [{"set": pytest.approx(expected)}]
+
+
+async def test_do_command_write_merges_write_args():
+    g = FakeDoCommandGripper()
+    await _do_cmd(g, write_args={"wait": False}).write(1.0)
+    assert g.commands == [{"set": pytest.approx(0.0), "wait": False}]
+
+
+async def test_do_command_write_omits_extras_by_default():
+    g = FakeDoCommandGripper()
+    await _do_cmd(g).write(1.0)
+    assert list(g.commands[0]) == ["set"]
+
+
+def test_do_command_rejects_a_set_key_in_write_args():
+    """A `set` entry would override the computed setpoint and park the gripper
+    at a constant, with nothing raised anywhere."""
+    with pytest.raises(GripperConfigError, match="write_args"):
+        _do_cmd(FakeDoCommandGripper(), write_args={"set": 12.0})
+
+
+@pytest.mark.parametrize(
+    "bad", [[("wait", False)], [], 0, False, "", "wait", 42], ids=
+    ["pairs-list", "empty-list", "zero", "false", "empty-string", "string", "int"]
+)
+def test_do_command_rejects_non_mapping_write_args(bad):
+    """The falsy cases matter most: an earlier draft used `or {}`, which folded
+    them into `{}` silently, so a misspelled write_args block was dropped with
+    nothing raised."""
+    with pytest.raises(GripperConfigError, match="write_args"):
+        _do_cmd(FakeDoCommandGripper(), write_args=bad)
+
+
+async def test_do_command_round_trips_through_the_driver():
+    """write() then read() should land back on the value written."""
+    g = FakeDoCommandGripper()
+    adapter = _do_cmd(g)
+    await adapter.write(0.25)
     assert await adapter.read() == pytest.approx(0.25)
