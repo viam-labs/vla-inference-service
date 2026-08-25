@@ -1,56 +1,41 @@
 """viam-labs:vla:controller -- the observation/inference/actuation loop.
 
-Two corrections from the plan draft, both load-bearing (see the Task 17
-"BLOCKER RESOLVED" callout in the design plan):
-
-  - The arm is commanded via ``await arm.move_to_joint_positions(JointPositions(
-    values=...))`` -- a single ``JointPositions``, no options. Installed
-    viam-sdk 0.80.0 (the latest on PyPI) has no ``move_through_joint_positions``
-    method, and nothing consumes ``MoveOptions``; both exist only in an
-    unreleased dev checkout. There is no ``_move_options()`` here.
-
-  - The velocity ceiling therefore lives entirely in the safety layer's
-    existing per-tick ``max_joint_delta_degs`` clamp (derived from
-    ``max_vel_degs_per_sec`` by ``ControllerConfig``), not in a ``MoveOptions``
-    the arm has no way to receive. The derived per-tick budget is logged once
-    at ``reconfigure()`` time so an operator can see what their velocity limit
-    actually implies.
+The arm is commanded via ``await arm.move_to_joint_positions(JointPositions(
+values=...))`` -- a single ``JointPositions``, no options. Installed viam-sdk
+0.80.0 (the latest on PyPI) has no ``move_through_joint_positions`` and
+nothing consumes ``MoveOptions``; both exist only in an unreleased dev
+checkout. The velocity ceiling therefore lives entirely in the safety layer's
+per-tick ``max_joint_delta_degs`` clamp (derived from
+``max_vel_degs_per_sec`` by ``ControllerConfig``), logged once at
+``reconfigure()`` so an operator can see what their limit implies.
 
 ``safety.stop_on_error`` governs exactly one boundary: whether a failure while
 *producing the next action* (camera read, observation assembly, or the policy
 call itself) halts the loop and stops the arm (``True``, the default) or is
 logged and the tick skipped, leaving the loop running for the next tick
-(``False``). Every other failure -- a safety refusal (dimension mismatch,
-start-pose refusal), or any failure of an actual arm/gripper command -- is
-unconditionally fatal regardless of this flag: those happen after inference
-already succeeded and are adjacent to physical motion, so there is no
-"skip and try again next tick" that would be safe. This is a deliberate
-reading of the design doc's error-handling table (whose only qualified row is
-inference failure); it is not a retry/backoff mechanism -- skipping a tick is
-exactly the loop's ordinary next iteration, with no attempt counter or delay
-logic added.
+(``False``). Every other failure -- a safety refusal, or any failure of an
+actual arm/gripper command -- is unconditionally fatal regardless of this
+flag: those happen after inference already succeeded and are adjacent to
+physical motion, so there is no "skip and try again next tick" that would be
+safe. Skipping a tick is exactly the loop's ordinary next iteration; there is
+no retry counter or backoff.
 
-``stop_on_error=False`` is bounded, not unconditional: ``starvation_grace_ticks``
-(a config field otherwise unused in this phase -- see ``scheduler.py``) is
-consumed here as a bound on *consecutive* tick failures. More than
-``starvation_grace_ticks`` failures in a row stops the arm and halts
-regardless of ``stop_on_error`` -- a deployment that opts out of per-failure
-halting must still not be able to spin forever reporting ``running`` while
-every tick silently fails and nothing else in the design doc's error table
-(queue starvation, in spirit) ever fires.
+``stop_on_error=False`` is bounded: ``starvation_grace_ticks`` caps
+*consecutive* tick failures, and more than that in a row stops the arm and
+halts regardless of ``stop_on_error``, so a deployment that opts out of
+per-failure halting still cannot spin forever reporting ``running`` while
+every tick silently fails.
 
-The write to the arm is built as a full-width target seeded from the
-*measured* joint positions, not a dense positional list: ``state_joint_
-indices`` is an arbitrary (possibly non-contiguous, possibly reordered) index
-list into the arm's joints, and ``move_to_joint_positions`` has no notion of
-"only these joints" -- a positional write silently maps clamped slot *i* onto
-arm joint *i* rather than arm joint ``state_joint_indices[i]``, which both
-scrambles the joint mapping and voids the delta clamp for any configuration
-where the two differ (e.g. a 5-DoF policy on a 6-joint arm whose base it
-does not drive). ``state_joint_indices`` (and ``gripper.joint_index``, for
-``arm_joint``) are validated against the arm's actual joint count once, at
-``_run()`` setup, before any motion -- config parsing alone cannot check this,
-since it has no access to the arm.
+The write to the arm is a full-width target seeded from the *measured* joint
+positions, not a dense positional list: ``state_joint_indices`` is an
+arbitrary (possibly non-contiguous, possibly reordered) index list, and
+``move_to_joint_positions`` has no notion of "only these joints" -- a
+positional write would map clamped slot *i* onto arm joint *i* rather than
+``state_joint_indices[i]``, scrambling the mapping and voiding the delta
+clamp wherever the two differ (e.g. a 5-DoF policy on a 6-joint arm).
+``state_joint_indices`` and ``gripper.joint_index`` are validated against the
+arm's actual joint count once at ``_run()`` setup, before any motion --
+config parsing has no access to the arm.
 """
 
 from __future__ import annotations
@@ -58,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from typing import Any, ClassVar, Mapping, Sequence
 
 import numpy as np
@@ -94,7 +80,9 @@ class VLAController(Generic, EasyResource):
         self._active_task_text = ""
         self._safety: SafetyLayer | None = None
         self._specs: dict[str, Any] | None = None
-        self._latencies: list[float] = []
+        # Bounded to the most recent 50: ``avg_latency_s`` must reflect
+        # recent performance, not a lifetime average a long run dilutes.
+        self._latencies: deque[float] = deque(maxlen=50)
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._scheduler: ChunkScheduler | None = None
@@ -130,7 +118,7 @@ class VLAController(Generic, EasyResource):
         self._specs = None
         self._scheduler = None
         self._safety = None
-        self._latencies = []
+        self._latencies.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._state = "idle"
@@ -210,7 +198,7 @@ class VLAController(Generic, EasyResource):
         self._specs = None
         self._scheduler = None
         self._safety = None
-        self._latencies = []
+        self._latencies.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._state = "waiting_for_policy"
@@ -403,28 +391,18 @@ class VLAController(Generic, EasyResource):
             )
 
     async def _preflight_gripper(self, gripper: GripperAdapter) -> None:
-        """Probe the gripper's actual write capability before any arm motion.
+        """Probe the gripper before any arm motion, so a driver that cannot
+        be read or written fails here rather than on the first real tick,
+        after the arm has already been commanded once -- the
+        refuse-before-motion discipline every other `_run()` check keeps.
 
-        `go_to_inputs` is abstract in the SDK, so not every driver implements
-        it -- `InputsGripper.write` only discovers that by calling it and
-        catching `NotImplementedError`. Without this probe, that discovery
-        happens on the *first real tick*, after the arm has already been
-        commanded once -- breaking the refuse-before-motion discipline every
-        other check in `_run()` maintains. Reads the gripper's own current
-        value and writes it straight back: a no-op for `ServoGripper` (it
-        lands on the same value already reported), and for `ThresholdGripper`
-        it is exactly the same "first write always
-        actuates once" behavior that would happen on tick 1 regardless --
-        merely moved earlier, before any arm command. Not a no-op for
-        `InputsGripper` either: its `read()` returns the driver's raw
-        frame-system value while its `write()` sends `_clamp_unit(value)`, so
-        any reading outside [0, 1] is written back changed. `DoCommandGripper` is
-        normally a no-op the same way too, but not always: `read()` clamps
-        to [0, 1], so a driver resting outside its configured endpoints
-        reads as an endpoint rather than its true position -- an so-101
-        resting at 98% (open_value=95) reads back as 0.0, and writing that
-        back commands 95, a real ~3% aperture move before any arm motion.
-        `arm_joint`/`none` have no separate gripper component to probe.
+        Reads the gripper's own current value and writes it straight back: a
+        no-op for `ServoGripper`, and usually one for `DoCommandGripper` --
+        but not always, since its `read()` clamps to [0, 1], so a driver
+        resting outside its configured endpoints reads as an endpoint rather
+        than its true position (an so-101 resting at 98% with open_value=95
+        reads 0.0, and writing that back commands 95, a real ~3% aperture
+        move). `arm_joint`/`none` have no separate component to probe.
         """
         if not gripper.has_normalized_tail:
             return
@@ -513,17 +491,8 @@ class VLAController(Generic, EasyResource):
             payload["rtc"] = rtc
         started = time.perf_counter()
         out = await self._resource(self._cfg.policy_service).do_command(payload)
-        self._record_latency(time.perf_counter() - started)
+        self._latencies.append(time.perf_counter() - started)
         return decode_matrix(out["actions"]), decode_matrix(out["raw_actions"])
-
-    def _record_latency(self, elapsed: float) -> None:
-        """Append one tick's inference latency, bounded to the most recent
-        50 -- ``avg_latency_s`` must reflect recent performance, not a
-        lifetime average that a long run would otherwise dilute towards
-        whatever the first few ticks happened to look like.
-        """
-        self._latencies.append(elapsed)
-        del self._latencies[:-50]
 
     def _record_tick(self, last_tick: float) -> float:
         now = time.perf_counter()

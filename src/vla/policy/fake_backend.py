@@ -92,17 +92,16 @@ class FakePolicyBackend(PolicyBackend):
 
     def predict_chunk(self, images, state, task, rtc_kwargs):
         if self._specs is None:
-            # Mirrors LeRobotBackend: Task 7 has two ordering hazards --
-            # warmup running ahead of load, and a superseded reconfigure
-            # swapping self._backend mid-flight -- that must fail loudly
-            # here rather than silently returning a chunk for a policy
-            # that was never loaded.
+            # Mirrors LeRobotBackend. Two ordering hazards -- warmup
+            # running ahead of load, and a superseded reconfigure swapping
+            # self._backend mid-flight -- must fail loudly here rather than
+            # silently returning a chunk for a policy never loaded.
             raise RuntimeError("backend not loaded")
 
-        # Bookkeeping only, guarded because Task 7 dispatches concurrent
-        # requests via asyncio.to_thread: call_count is read-modify-write
-        # and last_rtc is last-writer-wins, both of which race without a
-        # lock. The prediction itself below is still stateless per the
+        # Bookkeeping only, guarded because the policy service dispatches
+        # concurrent requests via asyncio.to_thread: call_count is
+        # read-modify-write and last_rtc is last-writer-wins, both of which
+        # race without a lock. The prediction itself stays stateless per the
         # PolicyBackend contract -- only these two test affordances share
         # mutable state across calls.
         with self._lock:

@@ -39,8 +39,8 @@ class PolicySpecs:
     def to_dict(self) -> dict[str, Any]:
         # dataclasses.asdict rather than hand-enumerating fields: a field
         # added to the dataclass without a matching line here would
-        # otherwise silently never reach Task 7's wire response or Task
-        # 17's controller, with no test catching the omission.
+        # otherwise silently never reach the wire response or the
+        # controller, with no test catching the omission.
         return dataclasses.asdict(self)
 
 

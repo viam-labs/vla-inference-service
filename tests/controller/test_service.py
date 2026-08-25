@@ -25,7 +25,7 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 from viam.proto.app.robot import ServiceConfig
 
-from tests.fakes import FakeArm, FakeCamera, FakeDoCommandGripper, FakeGripper, StalledArm
+from tests.fakes import FakeArm, FakeCamera, FakeDoCommandGripper, StalledArm
 from vla.controller.service import VLAController
 from vla.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
@@ -550,23 +550,23 @@ async def test_moved_joint_values_land_within_the_derived_delta_clamp():
 
 async def test_gripper_write_happens_after_arm_move_for_non_arm_joint_gripper():
     arm = FakeArm(positions=[0.0] * 5)
-    gripper = FakeGripper()
+    gripper = FakeDoCommandGripper(position=95.0)
     policy = FakePolicyClient(action_dim=6, action_value=0.5)
     svc = _svc(
-        config=_config(
-            gripper={"type": "gripper", "name": "g", "mode": "inputs"},
-        ),
+        config=_config(gripper=_DO_COMMAND_GRIPPER),
         deps=_deps(policy=policy, arm=arm, g=gripper),
     )
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
     assert len(arm.moves) >= 1
-    # gripper.sent[0] is the pre-flight probe's write-back of its own current
-    # value ([0.0], FakeGripper's default), which now happens before the
-    # arm's first move -- the real tick's value shows up afterward.
-    assert len(gripper.sent) >= 2
-    assert gripper.sent[-1] == [0.5]
+    # The first write is the pre-flight probe's write-back of the gripper's
+    # own current value, which happens before the arm's first move -- the
+    # real tick's value shows up afterward. 0.5 normalized against
+    # open=95/closed=0 is 47.5 in the driver's own units.
+    sets = [c["set"] for c in gripper.commands if "set" in c]
+    assert len(sets) >= 2
+    assert sets[-1] == pytest.approx(47.5)
 
 
 async def test_gripper_write_order_is_after_arm_move_not_before():
@@ -581,25 +581,26 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     """
     events: list[str] = []
     arm = FakeArm(positions=[0.0] * 5)
-    gripper = FakeGripper()
+    gripper = FakeDoCommandGripper(position=95.0)
 
     real_move = arm.move_to_joint_positions
-    real_go_to_inputs = gripper.go_to_inputs
+    real_do_command = gripper.do_command
 
     async def tracked_move(*a, **k):
         events.append("arm")
         return await real_move(*a, **k)
 
-    async def tracked_go_to_inputs(*a, **k):
-        events.append("gripper")
-        return await real_go_to_inputs(*a, **k)
+    async def tracked_do_command(command, *a, **k):
+        if "set" in command:
+            events.append("gripper")
+        return await real_do_command(command, *a, **k)
 
     arm.move_to_joint_positions = tracked_move
-    gripper.go_to_inputs = tracked_go_to_inputs
+    gripper.do_command = tracked_do_command
 
     policy = FakePolicyClient(action_dim=6, action_value=0.5)
     svc = _svc(
-        config=_config(gripper={"type": "gripper", "name": "g", "mode": "inputs"}),
+        config=_config(gripper=_DO_COMMAND_GRIPPER),
         deps=_deps(policy=policy, arm=arm, g=gripper),
     )
     await svc.do_command({"command": "start", "task": "t"})
@@ -613,25 +614,6 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     # in-tick order is swapped.
     assert events.index("arm") == 1, events
     assert events[:3] == ["gripper", "arm", "gripper"], events
-
-
-async def test_gripper_incompatible_mode_is_caught_before_any_arm_motion():
-    # mode="inputs" against a driver lacking go_to_inputs must be discovered
-    # by the pre-flight probe, before the arm has ever been commanded --
-    # not on the first real tick, which would break the refuse-before-motion
-    # discipline every other _run() check maintains.
-    arm = FakeArm(positions=[0.0] * 5)
-    gripper = FakeGripper(supports_inputs=False)
-    policy = FakePolicyClient(action_dim=6)
-    svc = _svc(
-        config=_config(gripper={"type": "gripper", "name": "g", "mode": "inputs"}),
-        deps=_deps(policy=policy, arm=arm, g=gripper),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    status = await _wait_for_state(svc, "error")
-    assert "go_to_inputs" in status["last_error"] or "does not implement" in status["last_error"]
-    assert len(arm.moves) == 0, "the arm must never have been commanded before the gripper probe failed"
-    assert arm.stopped >= 1
 
 
 async def test_do_command_gripper_is_driven_through_a_real_tick():
@@ -710,13 +692,8 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
             lambda: FakeDoCommandGripper(read_key="some_other_key"),
             "some_other_key",
         ),
-        (
-            {"type": "gripper", "name": "g", "mode": "inputs"},
-            lambda: FakeGripper(inputs=[]),
-            "no kinematic DOF",
-        ),
     ],
-    ids=["do_command-read-key-mismatch", "zero-dof-inputs"],
+    ids=["do_command-read-key-mismatch"],
 )
 async def test_a_failing_gripper_read_is_caught_before_any_arm_motion(
     gripper_block, gripper_factory, expected
@@ -1547,26 +1524,26 @@ async def test_high_duration_warn_threshold_suppresses_the_warning(caplog):
 
 
 # ---------------------------------------------------------------------------
-# _record_latency: the trim to the most recent 50 entries, tested directly
-# rather than through the full timed loop -- deterministic, and the exact
-# unit responsible for avg_latency_s not becoming a lifetime average.
+# The latency window caps at the most recent 50 entries, so avg_latency_s
+# never becomes a lifetime average. Tested directly on the buffer rather
+# than through the full timed loop -- deterministic.
 # ---------------------------------------------------------------------------
 
 
-async def test_record_latency_trims_to_the_most_recent_50():
+async def test_latency_window_keeps_only_the_most_recent_50():
     svc = VLAController("c")
     for i in range(60):
-        svc._record_latency(float(i))
+        svc._latencies.append(float(i))
     assert len(svc._latencies) == 50
     assert svc._latencies[0] == 10.0  # the first 10 (0..9) were pushed out
     assert svc._latencies[-1] == 59.0
 
 
-async def test_record_latency_does_not_trim_under_50():
+async def test_latency_window_does_not_trim_under_50():
     svc = VLAController("c")
     for i in range(10):
-        svc._record_latency(float(i))
-    assert svc._latencies == [float(i) for i in range(10)]
+        svc._latencies.append(float(i))
+    assert list(svc._latencies) == [float(i) for i in range(10)]
 
 
 # ---------------------------------------------------------------------------

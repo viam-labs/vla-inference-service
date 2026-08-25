@@ -150,43 +150,12 @@ class FakeServo:
         self.angle = angle
 
 
-class FakeGripper:
-    def __init__(self, inputs=None, supports_inputs=True):
-        # `if inputs is None`, not `inputs or [...]`: an explicitly empty list is
-        # a meaningful fixture -- it is what a zero-DOF gripper model reports --
-        # and `or` collapsed it to the default, hiding the case entirely.
-        self.inputs = list([0.0] if inputs is None else inputs)
-        self.supports_inputs = supports_inputs
-        self.opened = 0
-        self.grabbed = 0
-        self.sent = []
-
-    async def get_current_inputs(self, **kwargs):
-        return list(self.inputs)
-
-    async def go_to_inputs(self, values, **kwargs):
-        if not self.supports_inputs:
-            raise NotImplementedError("go_to_inputs unimplemented")
-        self.sent.append(list(values))
-        self.inputs = list(values)
-
-    async def open(self, **kwargs):
-        self.opened += 1
-
-    async def grab(self, **kwargs):
-        self.grabbed += 1
-        return True
-
-
 class FakeDoCommandGripper:
     """A gripper whose only proportional control is through ``DoCommand``.
 
     Mirrors the contract both `devrel:so101:gripper` and
     `viam:ufactory:gripper` implement: ``{"get": True}`` returns the current
-    position under some key, ``{"set": n}`` commands a new one. Deliberately
-    has no `get_current_inputs`/`go_to_inputs` -- that is the whole reason
-    this variant exists, and omitting them keeps a test that reaches for the
-    wrong API failing loudly.
+    position under some key, ``{"set": n}`` commands a new one.
 
     `position` is untyped and simply echoed back, so a non-numeric or `None`
     value (a driver returning a bad payload, or JSON null) reaches the

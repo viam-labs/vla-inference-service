@@ -65,7 +65,7 @@ def _check_actions_array(value: Any, field_name: str) -> np.ndarray:
       premise is "the torch version lives next door" -- raises a bare
       `AttributeError: 'Tensor' object has no attribute 'copy'` from deep
       inside `_replace_actions_queue`/`_append_actions_queue`, which is
-      exactly the kind of escape standing requirement 5 forbids
+      an escape this module's error contract forbids
     - a 1D array (a single action mistaken for a whole chunk) is accepted,
       `qsize()` then reports the action dimension instead of a step count,
       and `get()` returns a scalar that only fails once it reaches

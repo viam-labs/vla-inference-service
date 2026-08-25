@@ -300,7 +300,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `arm` | string | required | Name of the Viam `arm` component to drive. |
 | `cameras` | object (feature key → camera name) | required | Must cover every key the policy reports in `specs.image_feature_keys`. |
 | `state_joint_indices` | array of integers | required | Maps Viam joint order (base → end-effector) onto the state-vector position the checkpoint expects. Indices, not names — Viam joint names are not guaranteed to match LeRobot feature names. |
-| `gripper` | object | `{"type": "none"}` | Discriminated union — five variants, see below. |
+| `gripper` | object | `{"type": "none"}` | Discriminated union — four variants, see below. |
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
 | `mode` | `auto` \| `sequential` \| `async` \| `rtc` | `"auto"` | `auto` resolves to `sequential`. Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). `rtc` is not implemented; configuring it fails at `start`. |
@@ -435,8 +435,8 @@ What to read it for:
 
 ### Gripper variants
 
-A VLA emits one continuous gripper value per tick; Viam offers five different
-ways to carry it, at different fidelity.
+A VLA emits one continuous gripper value per tick; Viam offers several ways to
+carry it, at different fidelity.
 
 **`arm_joint`** — recommended default. The gripper rides the arm's own joint vector (SO-100-style
 drivers commonly expose it as the last joint), so read and write cost no extra round trip.
@@ -451,45 +451,6 @@ resolution). Value is normalized `0.0`–`1.0` and mapped onto `[min_deg, max_de
 
 ```json
 { "type": "servo", "name": "grip-servo", "min_deg": 0, "max_deg": 90 }
-```
-
-**`gripper`, `mode: "inputs"`** — the symmetric `get_current_inputs()`/`go_to_inputs()`
-pair. Usable only against a driver whose gripper model is **jointed**; for the
-common zero-DOF case it refuses at startup (see below), so reach for
-`do_command` first if you want proportional control. Both methods are abstract
-in the SDK, so not every driver implements them either.
-
-`get_current_inputs()`/`go_to_inputs()` are a *frame-system* interface, not
-an aperture channel: one value per kinematic DOF, in radians or meters. That
-only carries a usable aperture when the driver's gripper model is
-**jointed** — and most gripper models are zero-DOF, including
-`devrel:so101:gripper`, so against those the adapter now refuses at startup
-rather than reporting a permanently-open gripper. Unlike every other
-variant, `inputs` and `threshold` do not normalize on either side: `read()`
-hands the controller the driver's raw radians/meters value untouched
-(`_read_first_input` returns `float(values[0])` straight through). This is
-a known limitation, accepted because no driver we support actually has a
-jointed gripper model — `do_command` is the variant that normalizes
-honestly for one.
-
-`InputsGripper.write()` catches only `NotImplementedError` to attach the
-"reconfigure to threshold" hint, but a Go driver's `errors.ErrUnsupported`
-arrives in Python as a `GRPCError`, so that hint never fires for one. In
-practice the empty-inputs guard on `read()` fails first, since reading runs
-before any write can reach this code — so this is a note, not an observed
-defect.
-
-```json
-{ "type": "gripper", "name": "grip", "mode": "inputs" }
-```
-
-**`gripper`, `mode: "threshold"`** — read via `get_current_inputs()` (same
-frame-system/zero-DOF caveat as above), write by thresholding the
-normalized value to `open()`/`grab()`. Binary fallback for drivers that do
-not implement `go_to_inputs`.
-
-```json
-{ "type": "gripper", "name": "grip", "mode": "threshold", "close_threshold": 0.5 }
 ```
 
 **`do_command`** — proportional control for drivers that expose it through
@@ -544,10 +505,17 @@ endpoints do not describe this driver's scale at all.
 ```
 
 `servo` and `do_command` hand the controller a normalized `0.0`–`1.0` value
-(`0` = fully open), matching how LeRobot datasets typically encode a
-gripper channel. `arm_joint` carries degrees, per `action_units`.
-`inputs`/`threshold` pass the driver's raw frame-system value through
-unnormalized, radians or meters — the known limitation described above.
+(`0` = fully open), matching how LeRobot datasets typically encode a gripper
+channel. `arm_joint` carries degrees, per `action_units`.
+
+> **Not supported: the typed `Gripper` API's `get_current_inputs()`/
+> `go_to_inputs()` pair.** It is a *frame-system* interface — one value per
+> kinematic DOF, in radians or meters — not an aperture channel, so it only
+> carries a usable aperture against a driver whose gripper model is
+> **jointed**. `gripper.MakeModel` builds a zero-DOF model, and every driver
+> we support (`devrel:so101:gripper` included) is zero-DOF, so the adapters
+> that used it could never read an aperture at all. `do_command` is the
+> variant that works, and normalizes honestly.
 
 ### Arm writes do not wait for settle
 
@@ -679,8 +647,8 @@ Applied to every action, in this fixed order, before it reaches the arm:
    sign of wrong units or wrong joint order** — it is deliberately loud rather than
    silently "handled."
 
-The trailing gripper channel (`servo`, `gripper/inputs`, `gripper/threshold`,
-`do_command` — everything except `arm_joint`) is exempt
+The trailing gripper channel (`servo`, `do_command` — everything except
+`arm_joint`) is exempt
 from the degree-shaped delta and limit clamps — it gets its own `[0, 1]` clamp instead,
 counted separately as `clamp_counts["gripper"]`.
 

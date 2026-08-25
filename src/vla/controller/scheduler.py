@@ -3,38 +3,29 @@
 Two strategies ship: `SequentialScheduler` (blocking refill) and
 `AsyncScheduler` (overlapped refill). `RTCScheduler` is still a follow-up
 plan -- deferred until CUDA latency is measured, since RTC needs `delay <
-chunk_length` to function at all (see the design doc's measured-latency
-section: on the measured Apple Silicon target, `delay > chunk_length`, so
-RTC would discard every chunk on every merge). The `ActionQueue` underneath
-already supports both modes (`QueueSettings.rtc_enabled`).
+chunk_length` to function at all (on the measured Apple Silicon target
+`delay > chunk_length`, so RTC would discard every chunk on every merge).
+The `ActionQueue` underneath already supports both modes.
 
 `ChunkScheduler.next_action` is typed to allow returning `None`.
 `SequentialScheduler` never actually does -- it raises `SchedulerError`
-instead when it cannot produce an action. `AsyncScheduler` is the first
-scheduler that genuinely returns `None`: when its queue is empty and a
-background inference is already in flight, returning `None` (instead of
-blocking) is the entire point of the overlap -- blocking there would freeze
-the event loop exactly as badly as `SequentialScheduler` does, for exactly
-the latency `AsyncScheduler` exists to hide.
+instead. `AsyncScheduler` is the first scheduler that genuinely returns
+`None`: when its queue is empty and a background inference is already in
+flight, returning `None` instead of blocking is the entire point of the
+overlap.
 
-That makes the controller's (`vla.controller.service`) "action is None"
-branch in its tick loop reachable for the first time. `starvation_grace_ticks`
-is consumed there for two related but distinct purposes that happen to share
-one config field:
+That makes the controller's "action is None" branch reachable, where
+`starvation_grace_ticks` is consumed for two related purposes:
 
-  - a bound on consecutive tick *failures* (exceptions raised out of
-    `next_action`) when `safety.stop_on_error` is `False`: more than
-    `starvation_grace_ticks` failures in a row stops the arm and halts
-    regardless of `stop_on_error`.
+  - a bound on consecutive tick *failures* (exceptions out of `next_action`)
+    when `safety.stop_on_error` is `False`.
   - a bound on consecutive *empty* ticks (`next_action` returning `None`,
-    only possible under `AsyncScheduler`): more than `starvation_grace_ticks`
-    such ticks in a row stops the arm and halts unconditionally -- this one
-    is never gated by `stop_on_error`, since an empty tick is not a failure
-    to skip, it is an absence of anything to do.
+    only possible under `AsyncScheduler`) -- never gated by `stop_on_error`,
+    since an empty tick is not a failure to skip but an absence of anything
+    to do.
 
 Both readings are "how much starvation/failure to tolerate before giving
-up," which is why one field serves both, rather than adding a second,
-near-duplicate field.
+up," which is why one field serves both.
 """
 
 from __future__ import annotations
@@ -44,6 +35,7 @@ import asyncio
 import logging
 import math
 import time
+from collections import deque
 from typing import Any, Awaitable, Callable
 
 import numpy as np
@@ -66,33 +58,28 @@ _MIN_LATENCY_SAMPLES_BEFORE_WARNING = 2
 class SchedulerError(VLAError, RuntimeError):
     """Raised when the scheduler cannot produce an action.
 
-    A `RuntimeError` base (matching `SafetyError`/`ObservationError`'s
-    convention): the inputs are usually well-typed on their own terms, it's
-    the runtime response from the policy that's unusable.
+    A `RuntimeError` base (matching `SafetyError`/`ObservationError`): the
+    inputs are usually well-typed on their own terms, it's the runtime
+    response from the policy that's unusable.
     """
 
 
 def _validate_and_merge(queue: ActionQueue, processed: np.ndarray, raw: np.ndarray) -> None:
     """Validate a freshly-inferred chunk and merge it into `queue`.
 
-    Shared by `SequentialScheduler` and `AsyncScheduler` so the two cannot
-    drift apart on what counts as a malformed policy response -- both go
-    from a raw `infer()` result to a merged queue through this, and only
-    this.
-
-    `real_delay=0` is baked in here rather than threaded through as a
-    parameter: both callers run `ActionQueue` in append mode
-    (`rtc_enabled=False`), where the delay is ignored outright, and giving
-    either scheduler a way to pass a computed delay would imply RTC
-    semantics that do not apply to either of them.
+    Shared by both schedulers so the two cannot drift apart on what counts
+    as a malformed policy response. `real_delay=0` is baked in rather than a
+    parameter: both callers run `ActionQueue` in append mode, where the
+    delay is ignored, and a computed-delay parameter would imply RTC
+    semantics that apply to neither.
     """
     try:
         if processed.shape[0] == 0:
             raise SchedulerError("policy returned an empty action chunk")
     except AttributeError as exc:
-        # `.shape` on a non-ndarray (e.g. a policy service returning
-        # plain lists after a decode bug) must not leak as a bare
-        # AttributeError -- callers only know to catch SchedulerError.
+        # `.shape` on a non-ndarray (e.g. a policy service returning plain
+        # lists after a decode bug) must not leak as a bare AttributeError
+        # -- callers only know to catch SchedulerError.
         raise SchedulerError(
             "policy returned a malformed action chunk: expected numpy arrays from "
             f"infer(), got processed={type(processed).__name__!r} "
@@ -102,10 +89,8 @@ def _validate_and_merge(queue: ActionQueue, processed: np.ndarray, raw: np.ndarr
     try:
         queue.merge(raw, processed, real_delay=0)
     except ActionQueueError as exc:
-        # ActionQueue validates strictly (2D ndarray, matching action
-        # dims) and raises its own ActionQueueError -- a caller of the
-        # scheduler should never have to also know about that type, so it
-        # is never let through "two frames down".
+        # ActionQueue raises its own type; a caller of the scheduler should
+        # never have to also know about it.
         raise SchedulerError(f"policy returned a malformed action chunk: {exc}") from exc
 
 
@@ -115,34 +100,17 @@ class ChunkScheduler(abc.ABC):
         """Return the action for this tick, or None if none is available."""
 
     @abc.abstractmethod
-    async def reset(self) -> None:
-        """Clear episode-scoped state.
-
-        Async on the ABC itself, not only on `AsyncScheduler`: clearing
-        state safely can require awaiting the settlement of in-flight work
-        first -- `AsyncScheduler.reset` must cancel its background
-        inference and await it before touching the queue, or a
-        `queue.clear()` racing a still-running merge would prove nothing.
-        `SequentialScheduler.reset` has no such work, but implements the
-        same async signature for a uniform, safe interface: a generic
-        caller that forgot to `await` a `ChunkScheduler.reset()` call would
-        otherwise silently no-op for one scheduler and corrupt state for
-        the other, instead of failing the same way (a "coroutine was never
-        awaited" warning) for both.
-        """
-
-    @abc.abstractmethod
     def qsize(self) -> int:
         """Actions remaining in the queue."""
 
     async def close(self) -> None:
         """Release background resources.
 
-        Concrete, not abstract: most schedulers (`SequentialScheduler`)
-        hold none and get this no-op for free. `AsyncScheduler` overrides
-        it to cancel and await its in-flight inference task, so stopping
-        the controller never leaves an orphaned background task running
-        past the point it reports stopped.
+        Concrete, not abstract: `SequentialScheduler` holds none and gets
+        this no-op for free. `AsyncScheduler` overrides it to cancel and
+        await its in-flight inference, so stopping the controller never
+        leaves an orphaned background task running past the point it
+        reports stopped.
         """
         return None
 
@@ -150,10 +118,9 @@ class ChunkScheduler(abc.ABC):
 class SequentialScheduler(ChunkScheduler):
     """Blocking: when the queue drains, infer and refill.
 
-    Inference latency directly stalls the control loop, which is exactly
-    what `AsyncScheduler` exists to overlap -- but this is simple, and
-    correct behavior here is the baseline the overlapped path is compared
-    against.
+    Inference latency directly stalls the control loop, which is what
+    `AsyncScheduler` exists to overlap -- but this is simple, and correct
+    behavior here is the baseline the overlapped path is compared against.
     """
 
     def __init__(self, infer: InferFn) -> None:
@@ -165,13 +132,11 @@ class SequentialScheduler(ChunkScheduler):
         if action is not None:
             return action
 
-        # If `infer` raises, it does so before any queue mutation below, so
-        # the queue is left exactly as it was (empty) -- not partially
-        # written and not corrupted such that the next call misbehaves.
-        # Note this is *not* wrapped as SchedulerError: an arbitrary
-        # exception from `infer` itself propagates as-is, unlike
-        # AsyncScheduler, which must wrap it (see AsyncScheduler's
-        # docstring) because it surfaces on a later, unrelated call.
+        # If `infer` raises it does so before any queue mutation below, so
+        # the queue is left exactly as it was. Deliberately NOT wrapped as
+        # SchedulerError: an arbitrary exception from `infer` propagates
+        # as-is, unlike AsyncScheduler, which must wrap it because it
+        # surfaces on a later, unrelated call.
         processed, raw = await self._infer(None)
         _validate_and_merge(self._queue, processed, raw)
 
@@ -179,9 +144,6 @@ class SequentialScheduler(ChunkScheduler):
         if action is None:  # pragma: no cover - guarded by the shape check above
             raise SchedulerError("queue empty immediately after merge")
         return action
-
-    async def reset(self) -> None:
-        self._queue.clear()
 
     def qsize(self) -> int:
         return self._queue.qsize()
@@ -194,58 +156,43 @@ class AsyncScheduler(ChunkScheduler):
     latency every time the queue drains. When inference latency approaches
     or exceeds chunk duration -- measured at ~5.3s vs. a 5.0s chunk on
     Apple Silicon -- that is close to a 50% duty cycle, in multi-second
-    freezes. RTC cannot rescue this case (it needs `delay < chunk_length`,
-    and here `delay > chunk_length`: it would discard the entire chunk on
-    every merge, permanent starvation). Plain overlap can: keep serving the
-    current chunk's queued actions while the next chunk infers in the
-    background, merged in **append** mode (`QueueSettings.rtc_enabled=
-    False`) so the new chunk extends the queue instead of replacing it.
+    freezes. RTC cannot rescue this case (it needs `delay < chunk_length`;
+    here `delay > chunk_length`, so it would discard the entire chunk on
+    every merge). Plain overlap can: keep serving the current chunk's queued
+    actions while the next chunk infers in the background, merged in
+    **append** mode so the new chunk extends the queue instead of replacing
+    it.
 
     The honest cost is a discontinuity at each chunk boundary -- the last
-    action of chunk *k* and the first action of chunk *k+1* come from
-    observations however-many seconds apart the inference took, and can
-    disagree. The safety layer's delta clamp bounds that to one tick's
-    budget, so it hitches rather than lurches. Smoothing that seam is
-    exactly RTC's job, which cannot do it here -- this scheduler makes no
-    attempt at smoothing; it is the "keep moving, plainly" strategy, not
-    the "keep moving, smoothly" one.
-
-    One fact makes an occasionally-stale observation acceptable for this
-    policy: `n_obs_steps` is 1, so the policy consumes a single current
-    observation with no temporal buffer for a stale frame to corrupt --
-    a stale observation is merely stale, not buffer-corrupting.
+    action of chunk *k* and the first of *k+1* come from observations
+    however-many seconds apart the inference took, and can disagree. The
+    safety layer's delta clamp bounds that to one tick's budget, so it
+    hitches rather than lurches. Smoothing that seam is RTC's job, which
+    cannot do it here. `n_obs_steps` is 1, so the policy consumes a single
+    current observation with no temporal buffer for a stale frame to
+    corrupt -- a stale observation is merely stale, not buffer-corrupting.
 
     Concurrency contract:
       - Exactly one inference in flight at a time, tracked by `_inflight`,
         never started again while it is not `None`.
       - `next_action` never blocks except on the very first call (nothing
-        queued, nothing in flight -- there is no chunk to overlap with yet)
-        and, symmetrically, whenever the queue has run dry before any
-        background inference was ever requested (e.g. `queue_threshold=0`).
+        queued, nothing in flight) and, symmetrically, whenever the queue
+        has run dry before any background inference was requested (e.g.
+        `queue_threshold=0`).
       - When the queue is empty and an inference is already in flight,
-        `next_action` returns `None` immediately rather than blocking --
-        blocking there would freeze the event loop exactly as badly as
-        `SequentialScheduler` does, defeating the entire point of overlap.
+        `next_action` returns `None` immediately rather than blocking.
       - A background failure is never raised from inside the background
         task itself (an unhandled exception there would just log "Task
-        exception was never retrieved" and vanish silently) -- it is
-        captured and re-raised from the *next* call to `next_action`,
-        wrapped as `SchedulerError` if it is not one already, and raised
-        exactly once.
+        exception was never retrieved" and vanish) -- it is captured and
+        re-raised from the *next* call to `next_action`, wrapped as
+        `SchedulerError` if it is not one already, exactly once.
 
-    `queue_threshold` is decisive for how much of the overlap this actually
-    realizes -- a threshold that fires the refill too late leaves the queue
-    draining to empty (starvation) before the next chunk lands, even though
-    overlap is "working" in the sense that a background task did fire. This
-    is silent unless something says so out loud: once `fps` and a stable
-    reading of observed inference latency are both known, `next_action`
-    warns once (never every tick -- that would flood the log) if
-    `queue_threshold < ceil(observed_latency * fps)`, naming the observed
-    latency, the configured and required thresholds, and the consequence,
-    with a concrete remedy. This mirrors the safety layer's `clamp_counts`:
-    a misconfiguration that degrades behavior without raising anything gets
-    a loud diagnostic instead of a silently slow loop that looks like "the
-    policy is just slow."
+    `queue_threshold` decides how much of the overlap this realizes: a
+    threshold that fires the refill too late leaves the queue draining to
+    empty before the next chunk lands, even though a background task did
+    fire. That is silent unless something says so, so once `fps` and a
+    stable latency reading are known, `next_action` warns once (never every
+    tick) if `queue_threshold < ceil(observed_latency * fps)`.
     """
 
     def __init__(self, infer: InferFn, queue_threshold: int, fps: float = 10.0) -> None:
@@ -255,7 +202,7 @@ class AsyncScheduler(ChunkScheduler):
         self._fps = fps
         self._inflight: asyncio.Task[None] | None = None
         self._pending_error: Exception | None = None
-        self._latencies: list[float] = []
+        self._latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
         self._warned_starvation_risk = False
 
     async def next_action(self) -> np.ndarray | None:
@@ -268,29 +215,22 @@ class AsyncScheduler(ChunkScheduler):
 
         if self._inflight is not None:
             # Starved, but not stuck: inference is already working on the
-            # next chunk. Returning None here (never blocking) is the
-            # entire point of this scheduler -- the caller (the
-            # controller's tick loop) holds position for the tick and
-            # tries again next time.
+            # next chunk. Returning None here (never blocking) is the whole
+            # point -- the caller holds position for the tick and tries again.
             return None
 
         # Nothing queued, nothing in flight: either the very first call, or
-        # queue_threshold left the queue run completely dry before a
-        # refill was ever requested. Either way there is no chunk to
-        # overlap with right now -- block, the only honest option.
+        # queue_threshold let the queue run dry before a refill was ever
+        # requested. Either way there is nothing to overlap with -- block,
+        # the only honest option.
         self._start_background_inference()
         await self._inflight
         self._raise_pending_error()
 
         action = self._queue.get()
-        if action is None:  # pragma: no cover - guarded by the shape check in _validate_and_merge
+        if action is None:  # pragma: no cover - guarded by _validate_and_merge
             raise SchedulerError("queue empty immediately after merge")
         return action
-
-    async def reset(self) -> None:
-        await self._cancel_inflight()
-        self._queue.clear()
-        self._pending_error = None
 
     async def close(self) -> None:
         await self._cancel_inflight()
@@ -305,19 +245,17 @@ class AsyncScheduler(ChunkScheduler):
             raise err
 
     def _maybe_start_background_inference(self) -> None:
-        # No `await` between this check and `_start_background_inference`'s
-        # `asyncio.create_task` call -- the two together are one atomic
-        # step from asyncio's cooperative-scheduling point of view (a task
-        # only ever switches at an `await`), which is what keeps "exactly
-        # one inference in flight" true even under back-to-back
-        # `next_action` calls with no scheduling gap between them.
+        # No `await` between this check and `create_task` -- the two are one
+        # atomic step under asyncio's cooperative scheduling (a task only
+        # switches at an `await`), which is what keeps "exactly one inference
+        # in flight" true under back-to-back `next_action` calls.
         if self._inflight is None and self._queue.qsize() <= self._queue_threshold:
             self._start_background_inference()
 
     def _start_background_inference(self) -> None:
-        # Keeping the task on `self` is load-bearing, not defensive: a
-        # bare `create_task` handle can be garbage-collected before it
-        # ever runs, since asyncio only holds a weak reference to it.
+        # Keeping the task on `self` is load-bearing, not defensive: asyncio
+        # holds only a weak reference, so a bare handle can be
+        # garbage-collected before it ever runs.
         self._inflight = asyncio.create_task(self._infer_and_merge())
 
     async def _infer_and_merge(self) -> None:
@@ -328,37 +266,27 @@ class AsyncScheduler(ChunkScheduler):
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            # Always wrapped, unlike SequentialScheduler: a bare exception
-            # here surfaces on a *later*, unrelated `next_action` call, not
-            # the one that triggered inference -- a caller only knows to
-            # catch SchedulerError from this scheduler, and by the time
-            # this is raised there is no other frame left to explain where
-            # it came from.
+            # Always wrapped, unlike SequentialScheduler: this surfaces on a
+            # *later*, unrelated `next_action` call, and by then there is no
+            # other frame left to explain where it came from.
             self._pending_error = (
                 exc
                 if isinstance(exc, SchedulerError)
                 else SchedulerError(f"background inference failed: {exc}")
             )
         else:
-            # Only a *completed* inference tells us anything about steady-
-            # state latency -- a failed one's duration is not a meaningful
-            # sample (it may have failed immediately, or after a stall for
-            # an unrelated reason).
-            self._record_observed_latency(time.perf_counter() - started)
+            # Only a *completed* inference is a meaningful latency sample; a
+            # failed one may have failed immediately, or stalled unrelatedly.
+            self._latencies.append(time.perf_counter() - started)
+            self._maybe_warn_starvation_risk()
         finally:
             self._inflight = None
-
-    def _record_observed_latency(self, elapsed: float) -> None:
-        self._latencies.append(elapsed)
-        del self._latencies[:-_LATENCY_WINDOW]
-        self._maybe_warn_starvation_risk()
 
     def _maybe_warn_starvation_risk(self) -> None:
         if self._warned_starvation_risk:
             return
         if len(self._latencies) < _MIN_LATENCY_SAMPLES_BEFORE_WARNING:
-            # A single sample could be a cold-start outlier -- wait for a
-            # steadier reading before drawing a conclusion from it.
+            # A single sample could be a cold-start outlier.
             return
 
         avg_latency = sum(self._latencies) / len(self._latencies)
@@ -367,7 +295,6 @@ class AsyncScheduler(ChunkScheduler):
             return
 
         self._warned_starvation_risk = True
-        shortfall = required - self._queue_threshold
         LOGGER.warning(
             "queue_threshold=%d is too low for the observed inference latency "
             "(avg %.3fs over %d sample(s) at fps=%.2f); avoiding starvation "
@@ -381,7 +308,7 @@ class AsyncScheduler(ChunkScheduler):
             len(self._latencies),
             self._fps,
             required,
-            shortfall,
+            required - self._queue_threshold,
         )
 
     async def _cancel_inflight(self) -> None:
@@ -394,11 +321,9 @@ class AsyncScheduler(ChunkScheduler):
         except asyncio.CancelledError:
             pass
         except Exception:  # noqa: BLE001
-            # Whatever this in-flight inference concluded with -- an error,
-            # or a completed merge that raced the cancellation attempt --
-            # is about to be discarded (`reset`'s `queue.clear()` right
-            # after this returns, or `close` shutting the scheduler down
-            # outright); it must not escape here over a result this call
-            # is itself throwing away.
+            # Whatever this in-flight inference concluded with -- an error, or
+            # a completed merge that raced the cancellation -- is about to be
+            # discarded by the shutdown this call is part of; it must not
+            # escape over a result the caller is throwing away.
             pass
         self._inflight = None
