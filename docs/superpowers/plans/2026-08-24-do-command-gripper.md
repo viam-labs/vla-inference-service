@@ -31,7 +31,9 @@ Read these three things before Task 1. They explain why the tasks are shaped the
 
 With those four values, `_build_safety` gives the channel the normalized `[0,1]` clamp, `_check_action_dim` expects `len(state_joint_indices) + 1`, `_preflight_gripper` probes it before any arm motion, and the tick path reads it via `gripper.read()` and writes it after the arm move. All confirmed against the code; do not add branching.
 
-**The two type-string sites.** Only two places in `src/` compare the literal type string: `config.py:279` (`== "arm_joint"`, correctly needs no change) and `config.py:329` (a dependency tuple that **does** need our new name added, Task 7). `GRIPPER_TYPES` at `gripper.py:38` is the third place the string appears.
+**Where the type string is actually compared.** Outside `make_gripper_adapter` — which necessarily dispatches on it — only two sites in `src/` compare a gripper type string, both in `config.py`: line 279 (`== "arm_joint"`, a `joint_limits_degs` length check that correctly needs no change) and line 329 (a dependency tuple that **does** need the new name added, Task 7). `GRIPPER_TYPES` at `gripper.py:49` is where the set of legal strings lives.
+
+The stronger and more useful statement: **`service.py`, `safety.py`, and `observation.py` never branch on a gripper type string at all.** They dispatch purely on the four adapter attributes above. That is *why* a new variant needs no changes there — not a coincidence to be re-verified each time, but the property the adapter interface exists to provide. Verified independently at Task 7.
 
 ---
 
