@@ -55,6 +55,15 @@ _DEFAULT_MAX_DEG = 90.0
 _DEFAULT_CLOSE_THRESHOLD = 0.5
 _DEFAULT_READ_KEY = "position"
 
+# How far outside [0, 1] a reading may fall before it is refused rather than
+# clamped. The clamp absorbs *calibration* slop -- so-101 declares open at 95
+# while the servo travels to 100, ~5% of span -- which is small by definition.
+# A reading far outside the band means the configured endpoints do not describe
+# this driver's scale at all (the classic case: so-101's 95/0 percent copied
+# onto a driver reporting raw units), and silently saturating it freezes the
+# policy's gripper channel at a rail forever.
+_READ_SLACK = 0.25
+
 
 class GripperConfigError(VLAError, ValueError):
     """Raised for an invalid gripper config block."""
@@ -321,6 +330,10 @@ class DoCommandGripper(GripperAdapter):
                 f"gripper {self.dependency_name!r} returned a non-numeric "
                 f"{self._read_key!r}: {value!r} ({type(value).__name__})"
             )
+        # Non-finite is refused rather than clamped: _clamp_unit would turn nan
+        # and +inf into 0.0 -- "confidently fully open" -- and -inf into 1.0,
+        # fabricating an endpoint reading. This mirrors config_util.as_float,
+        # which already rejects non-finite config values for the same reason.
         if not math.isfinite(value):
             raise GripperRuntimeError(
                 f"gripper {self.dependency_name!r} returned a non-finite "
@@ -328,12 +341,22 @@ class DoCommandGripper(GripperAdapter):
                 "fabricated endpoint and report a confidently wrong aperture to the "
                 "policy, so it is refused rather than silently normalized."
             )
-        # Clamped because the endpoints are a *calibration*, not a hard travel
-        # limit: so-101 calls 95 fully open while the servo reaches 100.
-        return _clamp_unit(
-            (float(value) - self._open_value)
-            / (self._closed_value - self._open_value)
+        normalized = (float(value) - self._open_value) / (
+            self._closed_value - self._open_value
         )
+        if not -_READ_SLACK <= normalized <= 1.0 + _READ_SLACK:
+            raise GripperRuntimeError(
+                f"gripper {self.dependency_name!r} reported {self._read_key}={value!r}, "
+                f"which normalizes to {normalized:.3f} -- far outside [0, 1]. "
+                f"gripper.open_value={self._open_value!r}/closed_value="
+                f"{self._closed_value!r} do not describe this driver's scale; "
+                "check them against the driver's actual range."
+            )
+        # Clamped, not refused, inside the band: the endpoints are a
+        # *calibration*, not a hard travel limit -- so-101 calls 95 fully open
+        # while the servo reaches 100, so an ordinary reading of 98 is a real
+        # measurement slightly outside a declared range, not an error.
+        return _clamp_unit(normalized)
 
 
 def make_gripper_adapter(

@@ -573,9 +573,27 @@ async def test_do_command_read_uses_the_configured_read_key():
 
 async def test_do_command_read_errors_when_the_key_is_absent():
     """The fake answers under `some_other_key`; the adapter is configured for
-    the default `position`, so the key it wants is missing."""
+    the default `position`, so the key it wants is missing. The message must
+    name both the key the driver actually returned (`some_other_key`) and the
+    key the adapter was configured to read (`position`)."""
     adapter = _do_cmd(FakeDoCommandGripper(read_key="some_other_key"))
     with pytest.raises(GripperRuntimeError, match="some_other_key"):
+        await adapter.read()
+    with pytest.raises(GripperRuntimeError, match="position"):
+        await adapter.read()
+
+
+async def test_do_command_read_errors_on_a_non_mapping_response():
+    """`FakeDoCommandGripper` structurally always returns a dict, so it cannot
+    reach the `got = res` branch (non-Mapping response). A driver whose
+    `DoCommand` returns nothing -- `None` -- is the realistic case."""
+
+    class NoneReturningGripper:
+        async def do_command(self, command, *, timeout=None, **kwargs):
+            return None
+
+    adapter = _do_cmd(NoneReturningGripper())
+    with pytest.raises(GripperRuntimeError, match="returned"):
         await adapter.read()
 
 
@@ -610,3 +628,26 @@ async def test_do_command_read_refuses_a_non_finite_reading(raw):
     adapter = _do_cmd(FakeDoCommandGripper(position=raw))
     with pytest.raises(GripperRuntimeError, match="non-finite"):
         await adapter.read()
+
+
+@pytest.mark.parametrize(
+    "raw,note",
+    [(840.0, "raw-units-driver-on-percent-config"), (-100.0, "far-below-closed")],
+    ids=["far-above-open", "far-below-closed"],
+)
+async def test_do_command_read_refuses_a_grossly_out_of_range_reading(raw, note):
+    """The clamp absorbs calibration slop, not a mis-scaled endpoint pair. A
+    driver reporting raw units against a percent config would otherwise report
+    a frozen rail forever."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
+    with pytest.raises(GripperRuntimeError, match="do not describe this driver"):
+        await adapter.read()
+
+
+async def test_do_command_read_handles_a_non_inverted_scale():
+    """No real driver we target counts down toward open, but the named-endpoint
+    formulation claims to carry one with no special case. Pin the claim."""
+    adapter = _do_cmd(
+        FakeDoCommandGripper(position=25.0), open_value=0.0, closed_value=100.0
+    )
+    assert await adapter.read() == pytest.approx(0.25)
