@@ -24,12 +24,19 @@ arm. Order matters and is deliberately fixed:
      project's single most likely bug class: wrong units or wrong joint
      order.
 
-The degrees-based clamps (delta and limit) skip a normalized gripper
-channel (`servo`, `gripper/inputs`, `gripper/threshold`, `do_command`): that
-channel is 0.0-1.0, so a degree-shaped limit would either never fire
-(useless) or fire constantly on ordinary gripper motion (worse than useless).
-It gets its own `[0, 1]` clamp instead, tracked separately as
-`clamp_counts["gripper"]`.
+The degrees-based clamps (delta and limit) skip the trailing gripper channel
+for every variant except `arm_joint` (`servo`, `gripper/inputs`,
+`gripper/threshold`, `do_command`): a degree-shaped limit on a 0.0-1.0
+channel would either never fire (useless) or fire constantly on ordinary
+gripper motion (worse than useless). It gets its own `[0, 1]` clamp instead,
+tracked separately as `clamp_counts["gripper"]`.
+
+That `[0, 1]` shape is this layer's own contract, not a claim about what the
+adapter read: `servo` and `do_command` hand up an already-normalized value,
+but `gripper/inputs` and `gripper/threshold` pass the driver's raw
+radians/meters through unnormalized (see `_read_first_input` in
+`gripper.py`). For those two the clamp does real work rather than
+re-asserting an invariant.
 
 Boundary decisions, both deliberate: a value exactly equal to a joint limit
 is *not* counted as clamped (it passes through unchanged -- only a value

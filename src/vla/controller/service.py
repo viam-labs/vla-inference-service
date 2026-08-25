@@ -411,11 +411,14 @@ class VLAController(Generic, EasyResource):
         happens on the *first real tick*, after the arm has already been
         commanded once -- breaking the refuse-before-motion discipline every
         other check in `_run()` maintains. Reads the gripper's own current
-        value and writes it straight back: a no-op for `InputsGripper`/
-        `ServoGripper` (they land on the same value already reported), and
-        for `ThresholdGripper` it is exactly the same "first write always
+        value and writes it straight back: a no-op for `ServoGripper` (it
+        lands on the same value already reported), and for `ThresholdGripper`
+        it is exactly the same "first write always
         actuates once" behavior that would happen on tick 1 regardless --
-        merely moved earlier, before any arm command. `DoCommandGripper` is
+        merely moved earlier, before any arm command. Not a no-op for
+        `InputsGripper` either: its `read()` returns the driver's raw
+        frame-system value while its `write()` sends `_clamp_unit(value)`, so
+        any reading outside [0, 1] is written back changed. `DoCommandGripper` is
         normally a no-op the same way too, but not always: `read()` clamps
         to [0, 1], so a driver resting outside its configured endpoints
         reads as an endpoint rather than its true position -- an so-101

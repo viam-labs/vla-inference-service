@@ -519,9 +519,10 @@ carries a driver whose scale counts *up* toward open.
   "open_value": 840.0, "closed_value": 2.0 }
 ```
 
-`read_key` defaults to `"position"`. `write_args` is merged into the `set`
-command and defaults to `{}`; it may not contain `get` or `set` — those are
-the adapter's own protocol keys, and either one silently stops the gripper
+`name` is required, as for every variant with its own component. `read_key`
+defaults to `"position"`. `write_args` must be an object, is merged into the
+`set` command, and defaults to `{}`; it may not contain `get` or `set` — those
+are the adapter's own protocol keys, and either one silently stops the gripper
 tracking the policy.
 
 A reading that normalizes more than 0.25 outside `[0, 1]` is refused rather
@@ -544,6 +545,22 @@ endpoints do not describe this driver's scale at all.
 gripper channel. `arm_joint` carries degrees, per `action_units`.
 `inputs`/`threshold` pass the driver's raw frame-system value through
 unnormalized, radians or meters — the known limitation described above.
+
+### Arm writes do not wait for settle
+
+Every tick's arm command is sent with `extra={"wait": false}`. A VLA replaces
+its setpoint on the next tick, so a driver that blocks until the arm
+physically settles would spend the whole tick budget — 100 ms at `fps: 10` —
+waiting for a target about to be superseded. `devrel:so101:arm` defaults to
+waiting, and honours this flag to skip it.
+
+`extra` is a free-form struct, so a driver that does not read `wait` ignores
+it and behaves exactly as before. There is no config switch: if you need the
+blocking behaviour back, that is a code change.
+
+Note this is the *arm* channel only. The gripper's equivalent, for the
+`do_command` variant, is the `write_args` flag documented above — and unlike
+this one, it is not yet honoured by `devrel:so101:gripper`.
 
 ### Full worked example
 
@@ -657,7 +674,8 @@ Applied to every action, in this fixed order, before it reaches the arm:
    sign of wrong units or wrong joint order** — it is deliberately loud rather than
    silently "handled."
 
-A normalized gripper channel (`servo`, `gripper/inputs`, `gripper/threshold`) is exempt
+The trailing gripper channel (`servo`, `gripper/inputs`, `gripper/threshold`,
+`do_command` — everything except `arm_joint`) is exempt
 from the degree-shaped delta and limit clamps — it gets its own `[0, 1]` clamp instead,
 counted separately as `clamp_counts["gripper"]`.
 
