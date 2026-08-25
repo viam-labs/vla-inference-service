@@ -326,6 +326,6 @@ class ControllerConfig:
     def dependencies(self) -> list[str]:
         deps = [self.policy_service, self.arm, *self.cameras.values()]
         name = self.gripper.get("name")
-        if self.gripper.get("type") in ("servo", "gripper") and name:
+        if self.gripper.get("type") in ("servo", "gripper", "do_command") and name:
             deps.append(name)
         return deps

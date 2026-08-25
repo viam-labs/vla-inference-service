@@ -222,11 +222,34 @@ def test_rejects_unknown_gripper_type():
         ControllerConfig.parse({**BASE, "gripper": {"type": "claw"}})
 
 
-@pytest.mark.parametrize("kind", ["arm_joint", "servo", "gripper", "none"])
+@pytest.mark.parametrize("kind", ["arm_joint", "servo", "gripper", "do_command", "none"])
 def test_accepts_every_known_gripper_type(kind):
-    extra = {"joint_index": 5} if kind == "arm_joint" else {"name": "g"} if kind != "none" else {}
+    extra = (
+        {"joint_index": 5}
+        if kind == "arm_joint"
+        else {"name": "g", "open_value": 95.0, "closed_value": 0.0}
+        if kind == "do_command"
+        else {"name": "g"}
+        if kind != "none"
+        else {}
+    )
     cfg = ControllerConfig.parse({**BASE, "gripper": {"type": kind, **extra}})
     assert cfg.gripper["type"] == kind
+
+
+def test_do_command_gripper_adds_dependency():
+    cfg = ControllerConfig.parse(
+        {
+            **BASE,
+            "gripper": {
+                "type": "do_command",
+                "name": "grip",
+                "open_value": 95.0,
+                "closed_value": 0.0,
+            },
+        }
+    )
+    assert "grip" in cfg.dependencies()
 
 
 # ---------------------------------------------------------------------------
