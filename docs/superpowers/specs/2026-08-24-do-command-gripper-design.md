@@ -357,24 +357,30 @@ The xarm config carries a caveat: `goToPosition`
 to **10 seconds**, with no `wait` escape hatch. The variant is functionally
 correct there but impractical at 10 fps without an xarm-side change.
 
-## Known, not fixed here
+## Why `write()` validates nothing
 
-**A `nan` action reaches the driver as a rail command.** `write()` clamps via
-`_clamp_unit`, which is `min(1.0, max(0.0, value))` — and `nan` propagates
-through both comparisons, so a `nan` action normalizes to `0.0` and commands
-the gripper *fully open*, silently. The upstream safety layer does not catch it
-either: `np.clip(nan, 0, 1)` is `nan`.
+`read()` carries five guards; `write()` carries none. That asymmetry is
+deliberate and rests on an invariant both of `write()`'s callers enforce:
 
-This is the same silent-plausible-value pattern this design removed three times
-elsewhere (`else 0.0` on the inputs read, `or {}` on `write_args`, the
-unbounded read clamp), and `read()` explicitly refuses non-finite for exactly
-this reason. `write()` deliberately does not, because its input arrives from
-the safety layer rather than a driver, and the right place to reject a
-non-finite *action* is the safety layer — which is outside this design's scope.
+- The tick loop writes `float(safe[-1])` (`service.py:662`), and `safe` comes
+  from `SafetyLayer.apply`, which calls `_validate` first
+  (`safety.py:119` → `safety.py:74-78`). `_validate` raises `SafetyError` on any
+  non-finite value anywhere in the action vector, so a diverging policy is
+  refused before the gripper channel is ever computed.
+- `_preflight_gripper` (`service.py:423-424`) writes back exactly what `read()`
+  just returned, and `read()` has already refused non-finite and clamped into
+  `[0, 1]`.
 
-A policy emitting `nan` (a diverging model, a bad checkpoint) would therefore
-drive the gripper fully open with no diagnostic. Worth a separate change to
-`safety.py`; recorded here so it is not rediscovered as a mystery.
+So `write()`'s input is finite and in range by construction. The `_clamp_unit`
+call in it is a backstop, not a validation point — worth keeping, but not worth
+an error path.
+
+An earlier draft of this document claimed the opposite: that a `nan` action
+would reach the driver as a fully-open command because `np.clip(nan, 0, 1)` is
+`nan`. That was wrong — it reasoned about the clip without checking that
+`_validate` runs ahead of it. Recorded here because the wrong version was
+committed, and because the invariant is the reason `write()` is allowed to be
+five lines with no guards.
 
 ## Out of scope
 
