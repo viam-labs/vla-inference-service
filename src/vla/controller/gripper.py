@@ -285,6 +285,7 @@ class DoCommandGripper(GripperAdapter):
         self,
         name: str,
         gripper: Any,
+        *,
         open_value: float,
         closed_value: float,
         read_key: str,
@@ -297,8 +298,8 @@ class DoCommandGripper(GripperAdapter):
             )
         self.dependency_name = name
         self._gripper = gripper
-        self._open = open_value
-        self._closed = closed_value
+        self._open_value = open_value
+        self._closed_value = closed_value
         self._read_key = read_key
         self._write_args = dict(write_args)
 
@@ -349,20 +350,25 @@ def make_gripper_adapter(
         return ServoGripper(name, dependencies.get(name), min_deg, max_deg)
 
     if kind == "do_command":
-        for field in ("open_value", "closed_value"):
-            if field not in raw:
-                raise GripperConfigError(
-                    f'gripper.type="do_command" requires {field}; it is the driver-native '
-                    "value at that extreme (so-101: 95/0 percent, xarm: 840/2 raw units). "
-                    "There is no safe default -- a percentage guess silently saturates a "
-                    "raw-unit driver in the first percent of its travel."
-                )
+        missing = [field for field in ("open_value", "closed_value") if field not in raw]
+        if missing:
+            raise GripperConfigError(
+                f'gripper.type="do_command" requires {", ".join(missing)}; it is the '
+                "driver-native value at that extreme (so-101 open/closed: 95/0 percent, "
+                "xarm: 840/2 raw units). There is no safe default -- a percentage guess "
+                "silently saturates a raw-unit driver in the first percent of its travel."
+            )
         open_value = as_float(raw["open_value"], "gripper.open_value")
         closed_value = as_float(raw["closed_value"], "gripper.closed_value")
         read_key = as_str(raw.get("read_key", _DEFAULT_READ_KEY), "gripper.read_key")
-        write_args = raw.get("write_args") or {}
+        write_args = raw.get("write_args", {})
         return DoCommandGripper(
-            name, dependencies.get(name), open_value, closed_value, read_key, write_args
+            name,
+            dependencies.get(name),
+            open_value=open_value,
+            closed_value=closed_value,
+            read_key=read_key,
+            write_args=write_args,
         )
 
     # kind == "gripper"
