@@ -1,10 +1,7 @@
 # `do_command` gripper variant, and two latency/correctness fixes
 
 Date: 2026-08-24
-Status: implemented on `feat/do-command-gripper`. This document records the
-design as agreed plus three mid-implementation amendments (bounded read clamp,
-both protocol keys reserved, a retracted claim about `nan` reaching `write()`).
-Where it and the code disagree, the code is right — see the branch's commits.
+Status: design approved, not yet implemented
 Companion doc: `docs/superpowers/specs/2026-08-24-so101-nonblocking-set-handoff.md`
 (the so-101 module change this design depends on for acceptable tick latency)
 
@@ -67,7 +64,7 @@ A fifth entry in `GRIPPER_TYPES` (`src/vla/controller/gripper.py`):
 | `open_value` | **yes** | — | The driver-native value at fully open. |
 | `closed_value` | **yes** | — | The driver-native value at fully closed. |
 | `read_key` | no | `"position"` | Key to pull from the `{"get": true}` response. |
-| `write_args` | no | `{}` | Extra pairs merged into the `set` command. Must be a mapping, and must not contain `get` or `set` — the adapter's own protocol keys. |
+| `write_args` | no | `{}` | Extra pairs merged into the `set` command. Must be a mapping, and must not contain a `set` key. |
 
 `open_value` and `closed_value` are **required, not defaulted**. A percentage
 default (`100`/`0`) would silently saturate a 0–850 driver like xarm at the
@@ -81,24 +78,11 @@ companion so-101 change lands; xarm ignores an unrecognized key, as does any
 driver that does not read it.
 
 Two validations on `write_args` are load-bearing rather than defensive. It must
-be rejected if it is not a mapping, and rejected if it contains either of the
-adapter's own protocol keys, `get` or `set`. The write merges as
-`{"set": raw, **write_args}`, so:
-
-- a `set` entry silently *replaces* the setpoint just computed from the policy's
-  action — the gripper parks at a constant;
-- a `get` entry makes any driver that checks `get` before `set` treat every
-  write as a read — the gripper never moves at all. This is not hypothetical:
-  the project's own `FakeDoCommandGripper` checks in that order, and so does
-  `devrel:so101:gripper` (`components/gripper/gripper.go:366-387`).
-
-Both failures are invisible at runtime — the gripper simply stops tracking the
-policy with nothing raised — so both have to be config errors.
-
-The mapping check must also come *first*, and `write_args` must default via
-`raw.get("write_args", {})` rather than `or {}`: `or` folds falsy non-mappings
-(`[]`, `0`, `False`, `''`) into `{}` before either guard can see them, and
-`dict([])`/`dict('')` both succeed, so those would be accepted silently.
+be rejected if it is not a mapping, and rejected if it contains a `set` key:
+the write merges as `{"set": raw, **write_args}`, so a `set` entry in
+`write_args` would silently *replace* the setpoint the adapter just computed
+from the policy's action. That failure is invisible — the gripper simply parks
+at a constant — so it has to be a config error, not a runtime surprise.
 
 **On timing:** these are `ConfigError`s, but they do not surface at
 `validate_config`/`reconfigure`. `make_gripper_adapter` runs inside `_run()`
@@ -146,27 +130,6 @@ The read-side clamp is load-bearing, not defensive habit: so-101's
 `openPosition` is 95 while the servo physically travels to 100, so a raw read
 of 98 maps to `-0.03` unclamped and puts an out-of-range value into the
 observation vector the policy sees.
-
-**But the clamp is bounded, and that matters.** An unbounded clamp absorbs a
-mis-scaled endpoint pair as readily as it absorbs calibration slop, and the
-two are not the same thing. With `open_value=95, closed_value=0` pointed at a
-driver actually reporting raw units, `840 → 0.0`, `400 → 0.0`, `2 → 0.979`:
-the whole upper half of that driver's travel reads "fully open" and the
-policy's gripper channel freezes at a rail, silently and permanently. That is
-the same failure shape as a non-finite reading, and copying the so-101 config
-example onto a different gripper is a realistic way to reach it.
-
-So `read()` clamps within a slack band and *refuses* outside it
-(`_READ_SLACK = 0.25` of span in each direction). Calibration slop is small by
-definition — so-101's is ~5% of span, xarm's ~1% — so the band admits every
-legitimate excursion while a wrong endpoint pair becomes an error naming both
-configured values. It pairs with `_preflight_gripper`, which reads before any
-arm motion, so a mis-scaled pair surfaces as a startup refusal rather than a
-per-tick lie.
-
-Note the config-time message about percentage guesses saturating a raw-unit
-driver fires only when the fields are *omitted*, never when they are wrong.
-This band is what covers the wrong case.
 
 Errors name what went wrong and what to do:
 
@@ -291,14 +254,8 @@ the command map (`write_args`) rather than beside it.
 - normalization in both directions, including the inverted so-101 bounds
   (`open=95, closed=0`) and the xarm bounds (`open=840, closed=2`)
 - read clamping at both rails, specifically a raw read *above* `open_value`
-- a grossly out-of-range read refused rather than clamped (a raw-units reading
-  against a percent config), and a non-finite read refused rather than clamped
 - `open_value` missing, `closed_value` missing, and the two equal — all
   `GripperConfigError`
-
-(These, and the `write_args` validations, live in `tests/controller/test_gripper.py`,
-not `test_config.py`: `ControllerConfig.parse` validates only `gripper.type`,
-and every other gripper field is validated inside `make_gripper_adapter`.)
 - `read_key` absent from the response, and present but non-numeric
 - `read_key` defaulting to `"position"`, and overridden to `"pos"`
 - `write_args` merged into the emitted command, and `{}` emitting `{"set": v}` alone
@@ -329,9 +286,8 @@ bounds rejections.
 - the pre-flight probe runs for `do_command`, and its write lands *after* the
   arm move on a real tick (mirroring the existing
   `test_gripper_write_happens_after_arm_move_for_non_arm_joint_gripper`)
-- `inputs` against a gripper returning `[]` refuses at startup, with no arm
-  motion first. (`threshold` shares the same `_read_first_input` helper and is
-  covered at adapter level only — deliberately, not an omission.)
+- `inputs` and `threshold` against a gripper returning `[]` refuse at startup,
+  with no arm motion first
 - the arm receives `extra={"wait": False}`
 
 ## 6. Documentation
@@ -350,20 +306,13 @@ README §"Gripper variants" gains a `do_command` entry with both worked configs:
 ```
 
 The trailing sentence at README:478 — "Except for `arm_joint`, every variant's
-value is normalized `0.0`–`1.0` (`0` = fully open)" — is **false**, and this
-change is where it gets corrected rather than extended. An earlier draft of this
-spec claimed it "stays true because it describes what each *adapter* hands the
-controller". That is true only for `servo` and `do_command`. `InputsGripper` and
-`ThresholdGripper` both delegate to `_read_first_input`, which returns
-`float(values[0])` — the driver's raw frame-system value in radians or meters,
-passed straight through with no normalization on either side. That is recorded as
-a known limitation in `_read_first_input`'s own docstring, and this document
-contradicted it two sections later.
-
-What the README must say instead: `servo` and `do_command` hand the controller a
-normalized `0.0`–`1.0` value; `arm_joint` carries degrees per `action_units`;
-`inputs`/`threshold` pass the driver's raw frame-system value through
-unnormalized. Three behaviors, not one rule with one exception.
+value is normalized `0.0`–`1.0` (`0` = fully open)" — stays true and now covers
+five variants. It describes what each *adapter* hands the controller, which is
+genuinely normalized; §3's correction is about what `get_current_inputs()`
+*returns to the adapter*, which is not. Those are different claims and both
+survive. To stop the next reader conflating them the way this spec's own §3 and
+§6 initially did, the `inputs` entry should say explicitly that its driver-side
+values are radians or meters per DOF and the adapter is what normalizes them.
 
 The `inputs`/`threshold` entries are otherwise rewritten per §3.
 
@@ -371,31 +320,6 @@ The xarm config carries a caveat: `goToPosition`
 (`viam-ufactory-xarm/arm/gripper.go:307-356`) polls until the jaw settles, up
 to **10 seconds**, with no `wait` escape hatch. The variant is functionally
 correct there but impractical at 10 fps without an xarm-side change.
-
-## Why `write()` validates nothing
-
-`read()` carries five guards; `write()` carries none. That asymmetry is
-deliberate and rests on an invariant both of `write()`'s callers enforce:
-
-- The tick loop writes `float(safe[-1])` (`service.py:662`), and `safe` comes
-  from `SafetyLayer.apply`, which calls `_validate` first
-  (`safety.py:119` → `safety.py:74-78`). `_validate` raises `SafetyError` on any
-  non-finite value anywhere in the action vector, so a diverging policy is
-  refused before the gripper channel is ever computed.
-- `_preflight_gripper` (`service.py:423-424`) writes back exactly what `read()`
-  just returned, and `read()` has already refused non-finite and clamped into
-  `[0, 1]`.
-
-So `write()`'s input is finite and in range by construction. The `_clamp_unit`
-call in it is a backstop, not a validation point — worth keeping, but not worth
-an error path.
-
-An earlier draft of this document claimed the opposite: that a `nan` action
-would reach the driver as a fully-open command because `np.clip(nan, 0, 1)` is
-`nan`. That was wrong — it reasoned about the clip without checking that
-`_validate` runs ahead of it. Recorded here because the wrong version was
-committed, and because the invariant is the reason `write()` is allowed to be
-five lines with no guards.
 
 ## Out of scope
 

@@ -505,16 +505,17 @@ carries a driver whose scale counts *up* toward open.
 
 ```json
 { "type": "do_command", "name": "grip",
-  "open_value": 95.0, "closed_value": 0.0 }
+  "open_value": 95.0, "closed_value": 0.0,
+  "write_args": { "wait": false } }
 ```
 
-> Deliberately no `write_args` above: `devrel:so101:gripper` does not yet
-> honor a `wait` flag, so `write_args: {"wait": false}` is currently inert and
-> every write blocks up to ~2s waiting for the servo to settle — against a
-> 100ms budget at 10 fps. Add it once the companion non-blocking-write change
-> lands in that module; today it does nothing either way. Note this is the
-> gripper channel only: the *arm* write already passes `wait: false` and
-> so-101 honors it there (see [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle)).
+> `write_args: {"wait": false}` is worth setting for so-101 and is why
+> `write_args` exists. Without it `devrel:so101:gripper` blocks up to ~2s per
+> write waiting for the servo to settle — against a 100ms budget at 10 fps. It
+> needs `devrel:so101-arm` recent enough to honor the flag (the gripper's
+> `set`/`set_position` commands gained it alongside the arm's); an older
+> version ignores the key and simply keeps blocking, so setting it is safe
+> either way.
 
 ```json
 { "type": "do_command", "name": "grip", "read_key": "pos",
@@ -560,9 +561,11 @@ waiting, and honours this flag to skip it.
 it and behaves exactly as before. There is no config switch: if you need the
 blocking behaviour back, that is a code change.
 
-Note this is the *arm* channel only. The gripper's equivalent, for the
-`do_command` variant, is the `write_args` flag documented above — and unlike
-this one, it is not yet honoured by `devrel:so101:gripper`.
+Note this is the *arm* channel only, and it is passed unconditionally. The
+gripper's equivalent is opt-in: set `write_args: {"wait": false}` on a
+`do_command` block, as the so-101 example above does. Both flags reach
+`devrel:so101-arm` through the same helper on its side, so a version that
+honors one honors the other.
 
 ### Full worked example
 

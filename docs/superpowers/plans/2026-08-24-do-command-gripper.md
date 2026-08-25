@@ -2,15 +2,6 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> **Status: executed.** All ten tasks shipped on `feat/do-command-gripper`. This
-> document is the plan as written plus targeted corrections; it is **not** a
-> faithful record of what shipped. Review found real defects in several tasks'
-> prescribed code and tests, and the fixes live in the commits, not here. If you
-> are replaying this plan rather than reading history, diff against the branch
-> first — in particular Tasks 5, 6, 8 and 10 all shipped differently from their
-> text below. Checkboxes were never ticked; the commit log is the completion
-> record.
-
 **Goal:** Add a fifth gripper variant that carries a VLA policy's gripper channel over a driver's `DoCommand` `{"get": true}` / `{"set": n}` pair, and fix two latency/correctness defects the design work uncovered.
 
 **Architecture:** One new `GripperAdapter` subclass in the existing adapter module, selected by a new `gripper.type` string. The adapter normalizes between the driver's native scale and this module's `0.0 = fully open` convention using two required config endpoints, so a driver whose scale runs the opposite way needs no special case. Everything downstream (safety clamping, action-dim checks, the pre-flight probe, the tick read/write path) already branches on adapter *attributes* rather than type strings, so no control-flow changes are needed outside two one-line touch-ups.
@@ -40,9 +31,7 @@ Read these three things before Task 1. They explain why the tasks are shaped the
 
 With those four values, `_build_safety` gives the channel the normalized `[0,1]` clamp, `_check_action_dim` expects `len(state_joint_indices) + 1`, `_preflight_gripper` probes it before any arm motion, and the tick path reads it via `gripper.read()` and writes it after the arm move. All confirmed against the code; do not add branching.
 
-**Where the type string is actually compared.** Outside `make_gripper_adapter` — which necessarily dispatches on it — only two sites in `src/` compare a gripper type string, both in `config.py`: line 279 (`== "arm_joint"`, a `joint_limits_degs` length check that correctly needs no change) and line 329 (a dependency tuple that **does** need the new name added, Task 7). `GRIPPER_TYPES` at `gripper.py:49` is where the set of legal strings lives.
-
-The stronger and more useful statement: **`service.py`, `safety.py`, and `observation.py` never branch on a gripper type string at all.** They dispatch purely on the four adapter attributes above. That is *why* a new variant needs no changes there — not a coincidence to be re-verified each time, but the property the adapter interface exists to provide. Verified independently at Task 7.
+**The two type-string sites.** Only two places in `src/` compare the literal type string: `config.py:279` (`== "arm_joint"`, correctly needs no change) and `config.py:329` (a dependency tuple that **does** need our new name added, Task 7). `GRIPPER_TYPES` at `gripper.py:38` is the third place the string appears.
 
 ---
 
@@ -61,7 +50,7 @@ The stronger and more useful statement: **`service.py`, `safety.py`, and `observ
 
 **Test files:** `tests/controller/test_gripper.py` (adapter unit tests), `tests/controller/test_config.py` (parse/dependency tests), `tests/controller/test_service.py` (integration through the tick loop).
 
-No new source files. The adapter module was ~290 lines when this plan was written and lands near 440; it stays cohesive because every class is the same shape (one way of carrying the channel) behind one factory. Revisit splitting if a seventh variant appears, not on line count alone.
+No new source files. The adapter module is ~250 lines and cohesive; adding a sixth class keeps it well under the point where splitting would help.
 
 **Test commands:**
 - One test: `uv run pytest tests/controller/test_gripper.py::test_name -v`
@@ -339,22 +328,28 @@ class FakeDoCommandGripper:
     wrong API failing loudly.
     """
 
-    def __init__(self, position=0.0, read_key="position"):
+    def __init__(self, position=0.0, read_key="position", omit_read_key=False, read_value=None):
         self.position = position
         self.read_key = read_key
+        # `omit_read_key` and `read_value` exist to drive the two malformed-response
+        # paths: a driver whose key differs from the configured one, and a driver
+        # returning a non-numeric value under the right key.
+        self.omit_read_key = omit_read_key
+        self.read_value = read_value
         self.commands = []
 
-    async def do_command(self, command, *, timeout=None, **kwargs):
+    async def do_command(self, command, **kwargs):
         self.commands.append(dict(command))
         if command.get("get") is True:
-            return {self.read_key: self.position}
+            if self.omit_read_key:
+                return {"some_other_key": 1.0}
+            value = self.position if self.read_value is None else self.read_value
+            return {self.read_key: value}
         if "set" in command:
             self.position = command["set"]
-            return {self.read_key: self.position}
+            return {"position": self.position}
         raise AssertionError(f"unexpected command {command!r}")
 ```
-
-> **Two knobs deliberately absent.** An earlier draft carried `omit_read_key=True` and `read_value=X`. Both were redundant: a driver returning the wrong key is `read_key="some_other_key"`, and a driver returning a non-numeric value is `position="halfway"` (or `position=True`, or `position=None` for JSON null) — because `position` is untyped and simply echoed. Removing them keeps the malformed-key literal inside the test that asserts on it, drops an undocumented precedence rule (`omit_read_key` silently shadowed `read_value`), and makes the JSON-null case expressible, which the old shape could not do. Do not reintroduce them.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -479,7 +474,6 @@ class DoCommandGripper(GripperAdapter):
         self,
         name: str,
         gripper: Any,
-        *,
         open_value: float,
         closed_value: float,
         read_key: str,
@@ -492,8 +486,8 @@ class DoCommandGripper(GripperAdapter):
             )
         self.dependency_name = name
         self._gripper = gripper
-        self._open_value = open_value
-        self._closed_value = closed_value
+        self._open = open_value
+        self._closed = closed_value
         self._read_key = read_key
         self._write_args = dict(write_args)
 ```
@@ -502,28 +496,20 @@ Add the branch in `make_gripper_adapter`, immediately after the `if kind == "ser
 
 ```python
     if kind == "do_command":
-        missing = [f for f in ("open_value", "closed_value") if f not in raw]
-        if missing:
-            raise GripperConfigError(
-                f'gripper.type="do_command" requires {", ".join(missing)}; it is the '
-                "driver-native value at that extreme (so-101 open/closed: 95/0 percent, "
-                "xarm: 840/2 raw units). There is no safe default -- a percentage guess "
-                "silently saturates a raw-unit driver in the first percent of its travel."
-            )
+        for field in ("open_value", "closed_value"):
+            if field not in raw:
+                raise GripperConfigError(
+                    f'gripper.type="do_command" requires {field}; it is the driver-native '
+                    "value at that extreme (so-101: 95/0 percent, xarm: 840/2 raw units). "
+                    "There is no safe default -- a percentage guess silently saturates a "
+                    "raw-unit driver in the first percent of its travel."
+                )
         open_value = as_float(raw["open_value"], "gripper.open_value")
         closed_value = as_float(raw["closed_value"], "gripper.closed_value")
         read_key = as_str(raw.get("read_key", _DEFAULT_READ_KEY), "gripper.read_key")
-        # A plain default, NOT `or {}`: `or` would fold falsy non-mappings
-        # (`[]`, `0`, `False`, `''`) into `{}` before Task 6's Mapping guard
-        # could ever see them, silently dropping a misspelled write_args block.
-        write_args = raw.get("write_args", {})
+        write_args = raw.get("write_args") or {}
         return DoCommandGripper(
-            name,
-            dependencies.get(name),
-            open_value=open_value,
-            closed_value=closed_value,
-            read_key=read_key,
-            write_args=write_args,
+            name, dependencies.get(name), open_value, closed_value, read_key, write_args
         )
 ```
 
@@ -607,37 +593,22 @@ async def test_do_command_read_uses_the_configured_read_key():
 
 
 async def test_do_command_read_errors_when_the_key_is_absent():
-    """The fake answers under `some_other_key`; the adapter is configured for
-    the default `position`, so the key it wants is missing."""
-    adapter = _do_cmd(FakeDoCommandGripper(read_key="some_other_key"))
+    adapter = _do_cmd(FakeDoCommandGripper(omit_read_key=True))
     with pytest.raises(GripperRuntimeError, match="some_other_key"):
         await adapter.read()
 
 
-@pytest.mark.parametrize(
-    "raw", ["halfway", True, None], ids=["string", "bool", "json-null"]
-)
-async def test_do_command_read_errors_on_a_non_numeric_value(raw):
-    """`bool` needs excluding explicitly -- `isinstance(True, int)` is True in
-    Python, so a driver returning True would otherwise read as fully closed.
-    `None` is the likeliest real malformed response (JSON null)."""
-    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
+async def test_do_command_read_errors_on_a_non_numeric_value():
+    adapter = _do_cmd(FakeDoCommandGripper(read_value="halfway"))
     with pytest.raises(GripperRuntimeError, match="non-numeric"):
         await adapter.read()
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [float("nan"), float("inf"), float("-inf")],
-    ids=["nan", "inf", "-inf"],
-)
-async def test_do_command_read_refuses_a_non_finite_reading(raw):
-    """`_clamp_unit` would turn these into a fabricated rail reading -- nan and
-    +inf both land on 0.0, i.e. "confidently fully open" -- so they are refused
-    instead. Matches how `config_util.as_float` already treats non-finite
-    config values."""
-    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
-    with pytest.raises(GripperRuntimeError, match="non-finite"):
+async def test_do_command_read_rejects_a_bool_as_non_numeric():
+    """`isinstance(True, int)` is True in Python, so bool needs excluding
+    explicitly or a driver returning True reads as fully closed."""
+    adapter = _do_cmd(FakeDoCommandGripper(read_value=True))
+    with pytest.raises(GripperRuntimeError, match="non-numeric"):
         await adapter.read()
 
 
@@ -677,28 +648,9 @@ Add to `DoCommandGripper`:
                 f"gripper {self.dependency_name!r} returned a non-numeric "
                 f"{self._read_key!r}: {value!r} ({type(value).__name__})"
             )
-        # Non-finite is refused rather than clamped: _clamp_unit would turn nan
-        # and +inf into 0.0 -- "confidently fully open" -- and -inf into 1.0,
-        # fabricating an endpoint reading. This mirrors config_util.as_float,
-        # which already rejects non-finite config values for the same reason.
-        if not math.isfinite(value):
-            raise GripperRuntimeError(
-                f"gripper {self.dependency_name!r} returned a non-finite "
-                f"{self._read_key!r}: {value!r}. A non-finite reading would clamp to a "
-                "fabricated endpoint and report a confidently wrong aperture to the "
-                "policy, so it is refused rather than silently normalized."
-            )
-        # SUPERSEDED: this unbounded clamp shipped bounded. An unbounded clamp
-        # absorbs a mis-scaled endpoint pair as readily as calibration slop --
-        # 95/0 against a raw-units driver reads "fully open" across the whole
-        # upper half of travel, silently and forever. The shipped code computes
-        # `normalized` once, refuses outside +/-_READ_SLACK (0.25) of [0, 1]
-        # naming both configured endpoints, and clamps only inside that band.
-        # See the spec's section 2 and `gripper.py`.
-        return _clamp_unit(
-            (float(value) - self._open_value)
-            / (self._closed_value - self._open_value)
-        )
+        # Clamped because the endpoints are a *calibration*, not a hard travel
+        # limit: so-101 calls 95 fully open while the servo reaches 100.
+        return _clamp_unit((float(value) - self._open) / (self._closed - self._open))
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -707,7 +659,7 @@ Add to `DoCommandGripper`:
 uv run pytest tests/controller/test_gripper.py -k "do_command_read" -v
 ```
 
-Expected: 17 passed — 3 (inverted scale) + 3 (xarm units) + 2 (clamp rails) + 1 (configured key) + 1 (absent key) + 3 (non-numeric: string, bool, json-null) + 3 (non-finite: nan, inf, -inf) + 1 (emits get).
+Expected: 13 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -791,28 +743,23 @@ Add to `DoCommandGripper`:
 
 ```python
     async def write(self, value: float) -> None:
-        raw = self._open_value + _clamp_unit(value) * (
-            self._closed_value - self._open_value
-        )
+        raw = self._open + _clamp_unit(value) * (self._closed - self._open)
         await self._gripper.do_command({"set": raw, **self._write_args})
 ```
 
-In `make_gripper_adapter`'s `do_command` branch, Task 4 already left `write_args = raw.get("write_args", {})` — a plain default, **not** `or {}`, because `or` would swallow falsy non-mappings (`[]`, `0`, `False`, `''`) into `{}` before the guard below could ever see them. Add the guard after it:
+In `make_gripper_adapter`'s `do_command` branch, replace `write_args = raw.get("write_args") or {}` with:
 
 ```python
-        write_args = raw.get("write_args", {})
+        write_args = raw.get("write_args") or {}
         if not isinstance(write_args, Mapping):
             raise GripperConfigError(
                 f"gripper.write_args must be an object, got {write_args!r}"
             )
-        reserved = sorted({"get", "set"} & write_args.keys())
-        if reserved:
+        if "set" in write_args:
             raise GripperConfigError(
-                f"gripper.write_args must not contain {', '.join(repr(k) for k in reserved)}: "
-                'these are the adapter\'s own protocol keys. A "set" entry would replace the '
-                'setpoint computed from the policy\'s action; a "get" entry makes a driver '
-                "that checks it first treat every write as a read. Either way the gripper "
-                "silently stops tracking the policy."
+                'gripper.write_args must not contain "set": it is merged into the set '
+                "command and would silently replace the setpoint computed from the "
+                "policy's action, parking the gripper at a constant"
             )
 ```
 
@@ -835,7 +782,7 @@ git commit -m "feat: write a do_command gripper setpoint, guarding write_args"
 
 ## Task 7: Register the dependency in config parsing
 
-Without this the configured resource is never requested, so `dependencies.get(name)` hands the adapter `None`. The failure surfaces at `_preflight_gripper` (`service.py:461`) — at run start, before any arm command, so the refuse-before-motion discipline holds — as an `AttributeError: 'NoneType' object has no attribute 'do_command'`. Safe, but the wrong shape: a config omission reported as a driver fault, at deploy time rather than config time.
+Without this the configured resource is never requested, so `dependencies.get(name)` hands the adapter `None` and every call fails with `AttributeError` at runtime.
 
 **Files:**
 - Modify: `src/vla/controller/config.py:329`
@@ -1004,13 +951,7 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
-    # SUPERSEDED -- this assertion does not work. With ~8 ticks in the window it
-    # is satisfied by the NEXT tick's gripper write even when the in-tick order
-    # is swapped; mutation-verified. The shipped test asserts a prefix instead:
-    #     assert events.index("arm") == 1, events
-    #     assert events[:3] == ["gripper", "arm", "gripper"], events
-    # The same broken form existed in the pre-existing sibling test, whose
-    # docstring claimed a swap "must be caught". It never was.
+    # events[0] is the pre-flight probe's own write, before any arm motion.
     first_arm_idx = events.index("arm")
     assert events[first_arm_idx + 1] == "gripper", events
 
@@ -1019,7 +960,7 @@ async def test_do_command_malformed_read_is_caught_before_any_arm_motion():
     """`_preflight_gripper` reads then writes back, so a driver whose response
     key does not match `read_key` fails before the arm is ever commanded."""
     arm = FakeArm(positions=[0.0] * 5)
-    g = FakeDoCommandGripper(read_key="some_other_key")
+    g = FakeDoCommandGripper(omit_read_key=True)
     # action_dim=6 matters: with 5 state_joint_indices and in_state=True the
     # expected dim is 6, and a mismatch would raise in _check_action_dim
     # *before* the preflight probe -- passing the arm-motion assertion for
@@ -1160,9 +1101,7 @@ Four sites, all of which currently state something now false or incomplete. No t
 
 - [ ] **Step 1: Correct the adapter module docstring**
 
-> **Partly already done.** Task 2 corrected the `inputs`/`threshold` unit description at `gripper.py:12-13` and updated `GripperRuntimeError`'s docstring, because the design spec §3 named that site as belonging in the same commit as the code change and it needed nothing from the `do_command` type. Re-read the docstring before editing and do not redo that part.
-
-What remains here: `gripper.py:1-26` still says "Viam offers three components" — update the count, and add the `do_command` variant to the list. Extend the closing unit-convention paragraph to note `do_command` is normalized like the others.
+`gripper.py:1-26` says "Viam offers three components" and describes `inputs` as "normalized 0..1". Update the count, add the `do_command` variant, and correct the `inputs` description: `get_current_inputs`/`go_to_inputs` are a frame-system interface carrying one value per kinematic DOF in radians or meters, so those variants work only against a driver whose gripper model is *jointed*; most gripper models, `devrel:so101:gripper` included, are zero-DOF. Keep the closing unit-convention paragraph, extending it to note `do_command` is normalized like the others.
 
 - [ ] **Step 2: Add the variant to the safety docstring**
 
@@ -1216,7 +1155,7 @@ command and defaults to `{}`; it may not contain a `set` key.
 > way to opt out.
 ````
 
-Then rewrite the `inputs` and `threshold` entries per Step 1's correction, and **correct** the closing sentence at `README.md:478`. Do not merely extend it: "Except for `arm_joint`, every variant's value is normalized `0.0`–`1.0`" is false. Only `servo` and `do_command` normalize. `InputsGripper`/`ThresholdGripper` delegate to `_read_first_input`, which returns `float(values[0])` — the driver's raw radians or meters, unnormalized (its own docstring records this as a known limitation). State all three behaviors explicitly: normalized (`servo`, `do_command`), degrees per `action_units` (`arm_joint`), raw frame-system pass-through (`inputs`, `threshold`).
+Then rewrite the `inputs` and `threshold` entries per Step 1's correction, and extend the closing sentence at `README.md:478` to cover five variants. That sentence — "Except for `arm_joint`, every variant's value is normalized `0.0`–`1.0`" — stays **true**: it describes what each adapter hands the controller, whereas the `inputs` correction is about what the driver hands the adapter. State that distinction explicitly in the `inputs` entry so the next reader does not conflate the two, as the design spec's own sections initially did.
 
 Finally, add the note the spec's §3 asks for (its closing paragraph): `InputsGripper.write` catches only `NotImplementedError`, but a Go driver's `errors.ErrUnsupported` arrives in Python as a `GRPCError`, so the "reconfigure to threshold" hint never fires for one. Task 2's empty-inputs guard makes the *read* fail first, which is the path that actually runs — so this is a documentation note in the `inputs` entry, not a code change.
 
@@ -1232,22 +1171,6 @@ assert 'do_command' in GRIPPER_TYPES
 ```
 
 Then re-read each of the four edited passages against the implementation. Every config key named in the README must exist in `make_gripper_adapter`, and every key it accepts must appear in the README.
-
-Finally, add a guard against a class of error this branch already contains once. Task 2's empty-inputs message names `gripper.type="do_command"` — a value that did not exist when that commit landed, and would have been a dead end for anyone reading it from a partial merge. Assert that every gripper type named inside an error string is real:
-
-```python
-uv run python -c "
-import re, pathlib
-from vla.controller.gripper import GRIPPER_TYPES
-src = pathlib.Path('src/vla/controller/gripper.py').read_text()
-named = set(re.findall(r'gripper\.type=\"([a-z_]+)\"', src))
-missing = named - set(GRIPPER_TYPES)
-assert not missing, f'error strings name nonexistent gripper types: {missing}'
-print(f'ok: {sorted(named)} all in GRIPPER_TYPES')
-"
-```
-
-This retires the risk structurally rather than relying on the branch always merging as a unit.
 
 - [ ] **Step 6: Commit**
 
