@@ -46,12 +46,13 @@ from vla.config_util import as_float as _as_float
 from vla.config_util import as_int as _as_int
 from vla.config_util import as_str as _as_str
 
-GRIPPER_TYPES = ("arm_joint", "servo", "gripper", "none")
+GRIPPER_TYPES = ("arm_joint", "servo", "gripper", "do_command", "none")
 GRIPPER_MODES = ("inputs", "threshold")
 
 _DEFAULT_MIN_DEG = 0.0
 _DEFAULT_MAX_DEG = 90.0
 _DEFAULT_CLOSE_THRESHOLD = 0.5
+_DEFAULT_READ_KEY = "position"
 
 
 class GripperConfigError(VLAError, ValueError):
@@ -262,6 +263,46 @@ class ThresholdGripper(GripperAdapter):
             await self._gripper.open()
 
 
+class DoCommandGripper(GripperAdapter):
+    """Proportional control through ``DoCommand``, for drivers that expose it
+    there rather than through the typed API.
+
+    Contract: any gripper whose ``DoCommand`` implements ``{"get": True}`` ->
+    ``{read_key: number}`` and ``{"set": number}``. Both
+    ``devrel:so101:gripper`` and ``viam:ufactory:gripper`` do, with the same
+    request shape -- they differ only in the read response key and the value
+    range.
+
+    ``open_value``/``closed_value`` are the driver's own native values at the
+    two extremes: percent for so-101 (95 / 0), raw units for xarm (840 / 2).
+    Expressing the mapping in terms of the two *named endpoints* rather than a
+    min/max ordering is what lets it carry a driver whose scale runs opposite
+    to this module's ``0.0 = fully open`` convention -- which both of those
+    drivers do, since for them a higher number means more open.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        gripper: Any,
+        open_value: float,
+        closed_value: float,
+        read_key: str,
+        write_args: Mapping[str, Any],
+    ) -> None:
+        if open_value == closed_value:
+            raise GripperConfigError(
+                "gripper.open_value and gripper.closed_value must differ, both are "
+                f"{open_value!r}"
+            )
+        self.dependency_name = name
+        self._gripper = gripper
+        self._open = open_value
+        self._closed = closed_value
+        self._read_key = read_key
+        self._write_args = dict(write_args)
+
+
 def make_gripper_adapter(
     raw: Mapping[str, Any] | None, dependencies: Mapping[str, Any]
 ) -> GripperAdapter:
@@ -306,6 +347,23 @@ def make_gripper_adapter(
         min_deg = as_float(raw.get("min_deg", _DEFAULT_MIN_DEG), "gripper.min_deg")
         max_deg = as_float(raw.get("max_deg", _DEFAULT_MAX_DEG), "gripper.max_deg")
         return ServoGripper(name, dependencies.get(name), min_deg, max_deg)
+
+    if kind == "do_command":
+        for field in ("open_value", "closed_value"):
+            if field not in raw:
+                raise GripperConfigError(
+                    f'gripper.type="do_command" requires {field}; it is the driver-native '
+                    "value at that extreme (so-101: 95/0 percent, xarm: 840/2 raw units). "
+                    "There is no safe default -- a percentage guess silently saturates a "
+                    "raw-unit driver in the first percent of its travel."
+                )
+        open_value = as_float(raw["open_value"], "gripper.open_value")
+        closed_value = as_float(raw["closed_value"], "gripper.closed_value")
+        read_key = as_str(raw.get("read_key", _DEFAULT_READ_KEY), "gripper.read_key")
+        write_args = raw.get("write_args") or {}
+        return DoCommandGripper(
+            name, dependencies.get(name), open_value, closed_value, read_key, write_args
+        )
 
     # kind == "gripper"
     mode = as_choice(raw.get("mode", "inputs"), "gripper.mode", GRIPPER_MODES)

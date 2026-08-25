@@ -466,3 +466,53 @@ async def test_fake_do_command_gripper_honors_a_custom_read_key():
     g = FakeDoCommandGripper(position=3.0, read_key="pos")
     assert await g.do_command({"get": True}) == {"pos": 3.0}
     assert await g.do_command({"set": 9.0}) == {"pos": 9.0}
+
+
+def test_do_command_adapter_wires_its_attributes():
+    a = make_gripper_adapter(
+        {"type": "do_command", "name": "grip", "open_value": 95.0, "closed_value": 0.0},
+        {"grip": FakeDoCommandGripper()},
+    )
+    assert a.in_state is True
+    assert a.uses_degrees is False
+    assert a.dependency_name == "grip"
+    assert a.arm_joint_index is None
+
+
+@pytest.mark.parametrize("missing", ["open_value", "closed_value"])
+def test_do_command_requires_both_bounds(missing):
+    block = {"type": "do_command", "name": "grip", "open_value": 95.0, "closed_value": 0.0}
+    del block[missing]
+    with pytest.raises(GripperConfigError, match=missing):
+        make_gripper_adapter(block, {"grip": FakeDoCommandGripper()})
+
+
+def test_do_command_rejects_equal_bounds():
+    """Equal endpoints make the read mapping a division by zero."""
+    with pytest.raises(GripperConfigError, match="must differ"):
+        make_gripper_adapter(
+            {"type": "do_command", "name": "grip", "open_value": 50.0, "closed_value": 50.0},
+            {"grip": FakeDoCommandGripper()},
+        )
+
+
+def test_do_command_requires_a_name():
+    with pytest.raises(GripperConfigError, match="name"):
+        make_gripper_adapter(
+            {"type": "do_command", "open_value": 95.0, "closed_value": 0.0}, {}
+        )
+
+
+def test_do_command_rejects_close_threshold():
+    """`close_threshold` belongs only to gripper/threshold."""
+    with pytest.raises(GripperConfigError, match="close_threshold"):
+        make_gripper_adapter(
+            {
+                "type": "do_command",
+                "name": "grip",
+                "open_value": 95.0,
+                "closed_value": 0.0,
+                "close_threshold": 0.5,
+            },
+            {"grip": FakeDoCommandGripper()},
+        )
