@@ -359,6 +359,14 @@ class DoCommandGripper(GripperAdapter):
         return _clamp_unit(normalized)
 
     async def write(self, value: float) -> None:
+        # No validation here, unlike read(): both callers guarantee a finite,
+        # in-range input. The tick loop passes float(safe[-1]) from
+        # SafetyLayer.apply, which calls _validate first (safety.py:119 ->
+        # 74-78) and raises SafetyError on any non-finite value in the action
+        # vector; _preflight_gripper (service.py:423-424) writes back what
+        # read() just returned, already refused-if-non-finite and clamped.
+        # The _clamp_unit below is a backstop on an already-clamped value, not
+        # a validation point -- do not turn it into one.
         raw = self._open_value + _clamp_unit(value) * (
             self._closed_value - self._open_value
         )

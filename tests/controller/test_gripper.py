@@ -713,9 +713,16 @@ def test_do_command_rejects_non_mapping_write_args(bad):
         _do_cmd(FakeDoCommandGripper(), write_args=bad)
 
 
-async def test_do_command_round_trips_through_the_driver():
-    """write() then read() should land back on the value written."""
+@pytest.mark.parametrize(
+    "open_value,closed_value",
+    [(95.0, 0.0), (840.0, 2.0), (0.0, 100.0)],
+    ids=["so101-percent", "xarm-raw-units", "non-inverted"],
+)
+async def test_do_command_round_trips_through_the_driver(open_value, closed_value):
+    """write() then read() lands back on the value written, on every scale --
+    including a non-inverted one, which no real driver uses but the
+    endpoint-named formulation claims to carry with no special case."""
     g = FakeDoCommandGripper()
-    adapter = _do_cmd(g)
+    adapter = _do_cmd(g, open_value=open_value, closed_value=closed_value)
     await adapter.write(0.25)
     assert await adapter.read() == pytest.approx(0.25)
