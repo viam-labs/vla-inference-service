@@ -418,6 +418,43 @@ async def test_delta_clamp_uses_measured_position_not_last_commanded():
             assert v == pytest.approx(8.0), list(move.values)
 
 
+async def test_radians_conversion_does_not_scale_a_normalized_gripper_channel():
+    """`action_units="radians"` must convert the driven joints only.
+
+    The gripper channel of every non-`arm_joint` variant is already 0.0-1.0.
+    Converting it too multiplies by ~57.3, so a policy output of 0.5 arrives as
+    28.6, the safety layer clamps it to 1.0, and the gripper sits fully closed
+    on every tick -- silently, with only a per-tick clamp warning. This is the
+    documented SO-100/101 configuration (radians checkpoint, degrees driver),
+    so it is the combination most likely to be run, and `observation.py`'s read
+    side already splits the conversion the same way.
+    """
+    arm = FakeArm(positions=[0.0] * 5)
+    g = FakeDoCommandGripper(position=95.0)
+    policy = FakePolicyClient(action_dim=6, action_value=0.5)
+    svc = _svc(
+        config=_config(
+            action_units="radians",
+            safety={"max_start_delta_degs": 1000.0},
+            gripper={
+                "type": "do_command",
+                "name": "g",
+                "open_value": 95.0,
+                "closed_value": 0.0,
+            },
+        ),
+        deps=_deps(policy=policy, arm=arm, g=g),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+    sets = [c["set"] for c in g.commands if "set" in c]
+    assert sets, g.commands
+    # 0.5 normalized on a 95/0 scale is the midpoint, 47.5. Scaled by 57.3 it
+    # would clamp to 1.0 and command 0.0 -- fully closed.
+    assert sets[-1] == pytest.approx(47.5), sets
+
+
 async def test_action_units_radians_are_converted_before_commanding_the_arm():
     # If action_units="radians" -> degrees conversion were skipped (an
     # identity mutation), a policy emitting pi/2 rad (~90deg) would be

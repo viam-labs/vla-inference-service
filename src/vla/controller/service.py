@@ -621,7 +621,24 @@ class VLAController(Generic, EasyResource):
 
             consecutive_starved_ticks = 0
 
-            degrees = to_degrees(np.asarray(action, dtype=np.float32), cfg.action_units)
+            # Convert the *driven joints* only. A normalized gripper channel
+            # (every variant except `arm_joint`) is already 0.0-1.0 and must
+            # not be scaled: under `action_units="radians"` an unconditional
+            # conversion multiplies it by ~57.3, so a policy output of 0.5
+            # becomes 28.6, the safety layer clamps it to 1.0, and the gripper
+            # sits fully closed on every tick. `observation.py`'s read side
+            # already splits this way (see its `# already normalized` tail);
+            # the write side has to match or the two disagree about units.
+            raw_action = np.asarray(action, dtype=np.float32)
+            if gripper.in_state and not gripper.uses_degrees:
+                degrees = np.concatenate(
+                    [
+                        to_degrees(raw_action[:-1], cfg.action_units),
+                        raw_action[-1:],
+                    ]
+                )
+            else:
+                degrees = to_degrees(raw_action, cfg.action_units)
 
             # Every joint the arm has, not just the driven ones: `positions`
             # below seeds from the *measured* values so an un-driven joint

@@ -31,12 +31,16 @@ channel would either never fire (useless) or fire constantly on ordinary
 gripper motion (worse than useless). It gets its own `[0, 1]` clamp instead,
 tracked separately as `clamp_counts["gripper"]`.
 
-That `[0, 1]` shape is this layer's own contract, not a claim about what the
-adapter read: `servo` and `do_command` hand up an already-normalized value,
-but `gripper/inputs` and `gripper/threshold` pass the driver's raw
-radians/meters through unnormalized (see `_read_first_input` in
-`gripper.py`). For those two the clamp does real work rather than
-re-asserting an invariant.
+That `[0, 1]` shape is this layer's own contract about the *action*, and it is
+worth being precise about what it does not cover. The clamp acts on the
+policy's output; `current[gripper_idx]` is never read (`joint_slice` stops at
+`gripper_idx`), so the value the adapter *read* does not pass through here at
+all. That matters because `gripper/inputs` and `gripper/threshold` hand the
+controller the driver's raw radians/meters unnormalized (see
+`_read_first_input` in `gripper.py`) -- an out-of-range read from those two
+reaches the policy's observation vector without this layer seeing it. The one
+place it does leak in is `check_start`, which maxes over the whole vector and
+so compares that raw value against a degrees budget.
 
 Boundary decisions, both deliberate: a value exactly equal to a joint limit
 is *not* counted as clamped (it passes through unchanged -- only a value

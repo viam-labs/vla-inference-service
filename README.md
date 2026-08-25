@@ -454,8 +454,10 @@ resolution). Value is normalized `0.0`–`1.0` and mapped onto `[min_deg, max_de
 ```
 
 **`gripper`, `mode: "inputs"`** — the symmetric `get_current_inputs()`/`go_to_inputs()`
-pair, preserving proportional control. Preferred whenever the driver implements both
-(they are abstract SDK methods, so not every driver does).
+pair. Usable only against a driver whose gripper model is **jointed**; for the
+common zero-DOF case it refuses at startup (see below), so reach for
+`do_command` first if you want proportional control. Both methods are abstract
+in the SDK, so not every driver implements them either.
 
 `get_current_inputs()`/`go_to_inputs()` are a *frame-system* interface, not
 an aperture channel: one value per kinematic DOF, in radians or meters. That
@@ -503,16 +505,16 @@ carries a driver whose scale counts *up* toward open.
 
 ```json
 { "type": "do_command", "name": "grip",
-  "open_value": 95.0, "closed_value": 0.0,
-  "write_args": { "wait": false } }
+  "open_value": 95.0, "closed_value": 0.0 }
 ```
 
-> `write_args: {"wait": false}` is forward-looking: `devrel:so101:gripper`
-> does not yet honor a `wait` flag, so this key is currently inert and every
-> write blocks for up to ~2s waiting for the servo to settle — against a
-> 100ms budget at 10 fps. It will take effect once the companion
-> non-blocking-write change lands in that module; until then, omit it, it
-> does nothing either way.
+> Deliberately no `write_args` above: `devrel:so101:gripper` does not yet
+> honor a `wait` flag, so `write_args: {"wait": false}` is currently inert and
+> every write blocks up to ~2s waiting for the servo to settle — against a
+> 100ms budget at 10 fps. Add it once the companion non-blocking-write change
+> lands in that module; today it does nothing either way. Note this is the
+> gripper channel only: the *arm* write already passes `wait: false` and
+> so-101 honors it there (see [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle)).
 
 ```json
 { "type": "do_command", "name": "grip", "read_key": "pos",

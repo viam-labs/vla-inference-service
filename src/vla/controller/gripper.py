@@ -225,6 +225,12 @@ class ServoGripper(GripperAdapter):
         self._max = max_deg
 
     async def read(self) -> float:
+        # Deliberately unvalidated and unclamped, unlike `DoCommandGripper.read`:
+        # a servo past its configured `max_deg` returns >1.0 and a driver
+        # returning NaN propagates, both straight into the observation vector.
+        # This predates the guarded adapters and is left alone rather than
+        # changed under a feature branch -- but do not read the density of
+        # guards two classes below as a module-wide discipline. It is not one.
         deg = float(await self._servo.get_position())
         return (deg - self._min) / (self._max - self._min)
 
