@@ -1,7 +1,7 @@
 """Adapters carrying a policy's continuous gripper channel onto Viam components.
 
-A VLA emits one continuous gripper value per tick. Viam offers three
-components that can carry it at different fidelity, so the config picks one
+A VLA emits one continuous gripper value per tick. Viam offers four
+different ways to carry it at different fidelity, so the config picks one
 explicitly:
 
   arm_joint  gripper is joint N of the arm; value is a joint angle
@@ -24,15 +24,19 @@ explicitly:
                               by thresholding the normalized value to
                               open()/grab(). Binary fallback for drivers that
                               do not implement go_to_inputs.
+  do_command                 proportional control through DoCommand, for
+                              drivers that expose it there instead of the
+                              typed API (``devrel:so101:gripper``,
+                              ``viam:ufactory:gripper``).
   none       no gripper channel.
 
 Unit convention: ``arm_joint`` is in degrees (or whatever ``action_units``
-is); every other variant is normalized 0.0-1.0, 0 = fully open, matching how
-LeRobot datasets typically encode a gripper channel. That convention
-describes what each *adapter* hands the controller -- a separate claim from
-what the underlying driver call hands the adapter, which for
-``get_current_inputs()``/``go_to_inputs()`` is the frame-system DOF vector
-described above, not a normalized aperture.
+is); every other variant -- including ``do_command`` -- is normalized
+0.0-1.0, 0 = fully open, matching how LeRobot datasets typically encode a
+gripper channel. That convention describes what each *adapter* hands the
+controller -- a separate claim from what the underlying driver call hands
+the adapter, which for ``get_current_inputs()``/``go_to_inputs()`` is the
+frame-system DOF vector described above, not a normalized aperture.
 """
 
 from __future__ import annotations
@@ -362,7 +366,7 @@ class DoCommandGripper(GripperAdapter):
         # No validation here, unlike read(): both callers guarantee a finite,
         # in-range input. The tick loop passes float(safe[-1]) from
         # SafetyLayer.apply, which calls _validate first (safety.py:119 ->
-        # 74-78) and raises SafetyError on any non-finite value in the action
+        # 75-78) and raises SafetyError on any non-finite value in the action
         # vector; _preflight_gripper (service.py:423-424) writes back what
         # read() just returned, already refused-if-non-finite and clamped.
         # The _clamp_unit below is a backstop on an already-clamped value, not

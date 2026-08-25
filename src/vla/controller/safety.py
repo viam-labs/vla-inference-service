@@ -25,10 +25,11 @@ arm. Order matters and is deliberately fixed:
      order.
 
 The degrees-based clamps (delta and limit) skip a normalized gripper
-channel (`servo`, `gripper/inputs`, `gripper/threshold`): that channel is
-0.0-1.0, so a degree-shaped limit would either never fire (useless) or fire
-constantly on ordinary gripper motion (worse than useless). It gets its own
-`[0, 1]` clamp instead, tracked separately as `clamp_counts["gripper"]`.
+channel (`servo`, `gripper/inputs`, `gripper/threshold`, `do_command`): that
+channel is 0.0-1.0, so a degree-shaped limit would either never fire
+(useless) or fire constantly on ordinary gripper motion (worse than useless).
+It gets its own `[0, 1]` clamp instead, tracked separately as
+`clamp_counts["gripper"]`.
 
 Boundary decisions, both deliberate: a value exactly equal to a joint limit
 is *not* counted as clamped (it passes through unchanged -- only a value
