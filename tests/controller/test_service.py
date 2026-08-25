@@ -25,7 +25,7 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 from viam.proto.app.robot import ServiceConfig
 
-from tests.fakes import FakeArm, FakeCamera, FakeGripper, StalledArm
+from tests.fakes import FakeArm, FakeCamera, FakeDoCommandGripper, FakeGripper, StalledArm
 from vla.controller.service import VLAController
 from vla.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
@@ -579,6 +579,124 @@ async def test_gripper_incompatible_mode_is_caught_before_any_arm_motion():
     status = await _wait_for_state(svc, "error")
     assert "go_to_inputs" in status["last_error"] or "does not implement" in status["last_error"]
     assert len(arm.moves) == 0, "the arm must never have been commanded before the gripper probe failed"
+    assert arm.stopped >= 1
+
+
+async def test_do_command_gripper_is_driven_through_a_real_tick():
+    """5 driven joints + 1 gripper channel accounted for, and the gripper's
+    own component actually receives the policy's action."""
+    arm = FakeArm(positions=[0.0] * 5)
+    g = FakeDoCommandGripper(position=95.0)
+    policy = FakePolicyClient(action_dim=6, action_value=1.0)
+    svc = _svc(
+        config=_config(
+            gripper={
+                "type": "do_command",
+                "name": "g",
+                "open_value": 95.0,
+                "closed_value": 0.0,
+            }
+        ),
+        deps=_deps(policy=policy, arm=arm, g=g),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    # Status BEFORE stop, and via its own command: `stop` returns {"ok": True}
+    # (service.py:171-172), so reading last_error off its result is a KeyError.
+    # This is the established pattern -- see test_service.py:455.
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["last_error"] == ""
+    # A policy action of 1.0 is fully closed, which on this driver's scale is 0.0.
+    sets = [c["set"] for c in g.commands if "set" in c]
+    assert sets, g.commands
+    assert sets[-1] == pytest.approx(0.0)
+
+
+async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
+    """Same ordering guarantee the other non-arm_joint variants have."""
+    events = []
+    arm = FakeArm(positions=[0.0] * 5)
+    g = FakeDoCommandGripper(position=95.0)
+    policy = FakePolicyClient(action_dim=6, action_value=1.0)
+
+    real_move = arm.move_to_joint_positions
+    real_do = g.do_command
+
+    async def tracked_move(*a, **kw):
+        events.append("arm")
+        return await real_move(*a, **kw)
+
+    async def tracked_do(command, **kw):
+        if "set" in command:
+            events.append("gripper")
+        return await real_do(command, **kw)
+
+    arm.move_to_joint_positions = tracked_move
+    g.do_command = tracked_do
+
+    svc = _svc(
+        config=_config(
+            gripper={
+                "type": "do_command",
+                "name": "g",
+                "open_value": 95.0,
+                "closed_value": 0.0,
+            }
+        ),
+        deps=_deps(policy=policy, arm=arm, g=g),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+    # events[0] is the pre-flight probe's own write, before any arm motion.
+    first_arm_idx = events.index("arm")
+    assert events[first_arm_idx + 1] == "gripper", events
+
+
+async def test_do_command_malformed_read_is_caught_before_any_arm_motion():
+    """`_preflight_gripper` reads then writes back, so a driver whose response
+    key does not match `read_key` fails before the arm is ever commanded."""
+    arm = FakeArm(positions=[0.0] * 5)
+    g = FakeDoCommandGripper(read_key="some_other_key")
+    # action_dim=6 matters: with 5 state_joint_indices and in_state=True the
+    # expected dim is 6, and a mismatch would raise in _check_action_dim
+    # *before* the preflight probe -- passing the arm-motion assertion for
+    # entirely the wrong reason.
+    policy = FakePolicyClient(action_dim=6)
+    svc = _svc(
+        config=_config(
+            gripper={
+                "type": "do_command",
+                "name": "g",
+                "open_value": 95.0,
+                "closed_value": 0.0,
+            }
+        ),
+        deps=_deps(policy=policy, arm=arm, g=g),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "some_other_key" in status["last_error"]
+    assert len(arm.moves) == 0, "the arm must never move before the gripper probe fails"
+    assert arm.stopped >= 1
+
+
+async def test_zero_dof_inputs_gripper_is_caught_before_any_arm_motion():
+    """The Task 2 refusal has to surface at *startup*, not mid-episode -- that
+    is the whole claim the pre-flight probe makes. Adapter-level tests in
+    test_gripper.py cannot prove it."""
+    arm = FakeArm(positions=[0.0] * 5)
+    gripper = FakeGripper(inputs=[])
+    policy = FakePolicyClient(action_dim=6)
+    svc = _svc(
+        config=_config(gripper={"type": "gripper", "name": "g", "mode": "inputs"}),
+        deps=_deps(policy=policy, arm=arm, g=gripper),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "no kinematic DOF" in status["last_error"]
+    assert len(arm.moves) == 0, "the arm must never move before the gripper probe fails"
     assert arm.stopped >= 1
 
 
