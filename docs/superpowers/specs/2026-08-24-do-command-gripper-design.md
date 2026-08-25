@@ -1,7 +1,10 @@
 # `do_command` gripper variant, and two latency/correctness fixes
 
 Date: 2026-08-24
-Status: design approved, not yet implemented
+Status: implemented on `feat/do-command-gripper`. This document records the
+design as agreed plus three mid-implementation amendments (bounded read clamp,
+both protocol keys reserved, a retracted claim about `nan` reaching `write()`).
+Where it and the code disagree, the code is right — see the branch's commits.
 Companion doc: `docs/superpowers/specs/2026-08-24-so101-nonblocking-set-handoff.md`
 (the so-101 module change this design depends on for acceptable tick latency)
 
@@ -292,6 +295,10 @@ the command map (`write_args`) rather than beside it.
   against a percent config), and a non-finite read refused rather than clamped
 - `open_value` missing, `closed_value` missing, and the two equal — all
   `GripperConfigError`
+
+(These, and the `write_args` validations, live in `tests/controller/test_gripper.py`,
+not `test_config.py`: `ControllerConfig.parse` validates only `gripper.type`,
+and every other gripper field is validated inside `make_gripper_adapter`.)
 - `read_key` absent from the response, and present but non-numeric
 - `read_key` defaulting to `"position"`, and overridden to `"pos"`
 - `write_args` merged into the emitted command, and `{}` emitting `{"set": v}` alone
@@ -322,8 +329,9 @@ bounds rejections.
 - the pre-flight probe runs for `do_command`, and its write lands *after* the
   arm move on a real tick (mirroring the existing
   `test_gripper_write_happens_after_arm_move_for_non_arm_joint_gripper`)
-- `inputs` and `threshold` against a gripper returning `[]` refuse at startup,
-  with no arm motion first
+- `inputs` against a gripper returning `[]` refuses at startup, with no arm
+  motion first. (`threshold` shares the same `_read_first_input` helper and is
+  covered at adapter level only — deliberately, not an omission.)
 - the arm receives `extra={"wait": False}`
 
 ## 6. Documentation

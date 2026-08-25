@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status: executed.** All ten tasks shipped on `feat/do-command-gripper`. This
+> document is the plan as written plus targeted corrections; it is **not** a
+> faithful record of what shipped. Review found real defects in several tasks'
+> prescribed code and tests, and the fixes live in the commits, not here. If you
+> are replaying this plan rather than reading history, diff against the branch
+> first — in particular Tasks 5, 6, 8 and 10 all shipped differently from their
+> text below. Checkboxes were never ticked; the commit log is the completion
+> record.
+
 **Goal:** Add a fifth gripper variant that carries a VLA policy's gripper channel over a driver's `DoCommand` `{"get": true}` / `{"set": n}` pair, and fix two latency/correctness defects the design work uncovered.
 
 **Architecture:** One new `GripperAdapter` subclass in the existing adapter module, selected by a new `gripper.type` string. The adapter normalizes between the driver's native scale and this module's `0.0 = fully open` convention using two required config endpoints, so a driver whose scale runs the opposite way needs no special case. Everything downstream (safety clamping, action-dim checks, the pre-flight probe, the tick read/write path) already branches on adapter *attributes* rather than type strings, so no control-flow changes are needed outside two one-line touch-ups.
@@ -679,8 +688,13 @@ Add to `DoCommandGripper`:
                 "fabricated endpoint and report a confidently wrong aperture to the "
                 "policy, so it is refused rather than silently normalized."
             )
-        # Clamped because the endpoints are a *calibration*, not a hard travel
-        # limit: so-101 calls 95 fully open while the servo reaches 100.
+        # SUPERSEDED: this unbounded clamp shipped bounded. An unbounded clamp
+        # absorbs a mis-scaled endpoint pair as readily as calibration slop --
+        # 95/0 against a raw-units driver reads "fully open" across the whole
+        # upper half of travel, silently and forever. The shipped code computes
+        # `normalized` once, refuses outside +/-_READ_SLACK (0.25) of [0, 1]
+        # naming both configured endpoints, and clamps only inside that band.
+        # See the spec's section 2 and `gripper.py`.
         return _clamp_unit(
             (float(value) - self._open_value)
             / (self._closed_value - self._open_value)
@@ -990,7 +1004,13 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
-    # events[0] is the pre-flight probe's own write, before any arm motion.
+    # SUPERSEDED -- this assertion does not work. With ~8 ticks in the window it
+    # is satisfied by the NEXT tick's gripper write even when the in-tick order
+    # is swapped; mutation-verified. The shipped test asserts a prefix instead:
+    #     assert events.index("arm") == 1, events
+    #     assert events[:3] == ["gripper", "arm", "gripper"], events
+    # The same broken form existed in the pre-existing sibling test, whose
+    # docstring claimed a swap "must be caught". It never was.
     first_arm_idx = events.index("arm")
     assert events[first_arm_idx + 1] == "gripper", events
 
