@@ -468,6 +468,7 @@ class DoCommandGripper(GripperAdapter):
         self,
         name: str,
         gripper: Any,
+        *,
         open_value: float,
         closed_value: float,
         read_key: str,
@@ -480,8 +481,8 @@ class DoCommandGripper(GripperAdapter):
             )
         self.dependency_name = name
         self._gripper = gripper
-        self._open = open_value
-        self._closed = closed_value
+        self._open_value = open_value
+        self._closed_value = closed_value
         self._read_key = read_key
         self._write_args = dict(write_args)
 ```
@@ -490,20 +491,28 @@ Add the branch in `make_gripper_adapter`, immediately after the `if kind == "ser
 
 ```python
     if kind == "do_command":
-        for field in ("open_value", "closed_value"):
-            if field not in raw:
-                raise GripperConfigError(
-                    f'gripper.type="do_command" requires {field}; it is the driver-native '
-                    "value at that extreme (so-101: 95/0 percent, xarm: 840/2 raw units). "
-                    "There is no safe default -- a percentage guess silently saturates a "
-                    "raw-unit driver in the first percent of its travel."
-                )
+        missing = [f for f in ("open_value", "closed_value") if f not in raw]
+        if missing:
+            raise GripperConfigError(
+                f'gripper.type="do_command" requires {", ".join(missing)}; it is the '
+                "driver-native value at that extreme (so-101 open/closed: 95/0 percent, "
+                "xarm: 840/2 raw units). There is no safe default -- a percentage guess "
+                "silently saturates a raw-unit driver in the first percent of its travel."
+            )
         open_value = as_float(raw["open_value"], "gripper.open_value")
         closed_value = as_float(raw["closed_value"], "gripper.closed_value")
         read_key = as_str(raw.get("read_key", _DEFAULT_READ_KEY), "gripper.read_key")
-        write_args = raw.get("write_args") or {}
+        # A plain default, NOT `or {}`: `or` would fold falsy non-mappings
+        # (`[]`, `0`, `False`, `''`) into `{}` before Task 6's Mapping guard
+        # could ever see them, silently dropping a misspelled write_args block.
+        write_args = raw.get("write_args", {})
         return DoCommandGripper(
-            name, dependencies.get(name), open_value, closed_value, read_key, write_args
+            name,
+            dependencies.get(name),
+            open_value=open_value,
+            closed_value=closed_value,
+            read_key=read_key,
+            write_args=write_args,
         )
 ```
 
@@ -644,7 +653,10 @@ Add to `DoCommandGripper`:
             )
         # Clamped because the endpoints are a *calibration*, not a hard travel
         # limit: so-101 calls 95 fully open while the servo reaches 100.
-        return _clamp_unit((float(value) - self._open) / (self._closed - self._open))
+        return _clamp_unit(
+            (float(value) - self._open_value)
+            / (self._closed_value - self._open_value)
+        )
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -737,14 +749,16 @@ Add to `DoCommandGripper`:
 
 ```python
     async def write(self, value: float) -> None:
-        raw = self._open + _clamp_unit(value) * (self._closed - self._open)
+        raw = self._open_value + _clamp_unit(value) * (
+            self._closed_value - self._open_value
+        )
         await self._gripper.do_command({"set": raw, **self._write_args})
 ```
 
-In `make_gripper_adapter`'s `do_command` branch, replace `write_args = raw.get("write_args") or {}` with:
+In `make_gripper_adapter`'s `do_command` branch, Task 4 already left `write_args = raw.get("write_args", {})` — a plain default, **not** `or {}`, because `or` would swallow falsy non-mappings (`[]`, `0`, `False`, `''`) into `{}` before the guard below could ever see them. Add the guard after it:
 
 ```python
-        write_args = raw.get("write_args") or {}
+        write_args = raw.get("write_args", {})
         if not isinstance(write_args, Mapping):
             raise GripperConfigError(
                 f"gripper.write_args must be an object, got {write_args!r}"
