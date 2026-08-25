@@ -153,8 +153,30 @@ def _svc(config=None, deps=None):
     return svc
 
 
+async def _wait_until(predicate, what, timeout=2.0):
+    """Poll `predicate` until it returns a truthy value; raise on timeout.
+
+    Returns whatever the predicate returned, so a caller can both wait for
+    and capture a value in one step.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        result = predicate()
+        if result:
+            return result
+        await asyncio.sleep(0.002)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
 async def _wait_for_state(svc, *states, timeout=2.0):
-    """Poll status until it reaches one of `states`; raise on timeout."""
+    """Poll status until it reaches one of `states`; raise on timeout.
+
+    NOTE: `"running"` is set by `_run()` *before* the first tick executes,
+    so reaching it does NOT mean the arm has been commanded yet. A test that
+    asserts on `arm.moves` must wait for the move itself -- see
+    `_wait_for_first_move`.
+    """
+    status: dict = {}
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         status = await svc.do_command({"command": "status"})
@@ -162,6 +184,11 @@ async def _wait_for_state(svc, *states, timeout=2.0):
             return status
         await asyncio.sleep(0.01)
     raise AssertionError(f"never reached {states}: last status {status}")
+
+
+async def _wait_for_first_move(arm, timeout=2.0):
+    """Wait until the arm has actually been commanded at least once."""
+    await _wait_until(lambda: arm.moves, "the arm's first move", timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -929,11 +956,9 @@ async def test_consecutive_failure_count_resets_on_a_successful_tick():
     await _wait_for_state(svc, "running")
 
     async def _wait_for_call(target: int) -> None:
-        for _ in range(500):
-            if policy.infer_calls >= target:
-                return
-            await asyncio.sleep(0.002)
-        raise AssertionError(f"infer_calls never reached {target}")
+        await _wait_until(
+            lambda: policy.infer_calls >= target, f"infer_calls to reach {target}"
+        )
 
     for _ in range(6):
         policy.fail_infer = True
@@ -1663,8 +1688,12 @@ async def test_controller_runs_when_policy_declares_more_cameras_than_are_mapped
     )
     await svc.do_command({"command": "start", "task": "t"})
     status = await _wait_for_state(svc, "running", "error")
-    await svc.do_command({"command": "stop"})
     assert status["state"] == "running"
+    # "running" is set before the first tick runs, so waiting for the move
+    # itself is what makes this assertion deterministic -- stopping straight
+    # off the state flip raced the first arm command.
+    await _wait_for_first_move(arm)
+    await svc.do_command({"command": "stop"})
     assert len(arm.moves) >= 1
 
 
