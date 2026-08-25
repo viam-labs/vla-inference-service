@@ -303,6 +303,30 @@ class DoCommandGripper(GripperAdapter):
         self._read_key = read_key
         self._write_args = dict(write_args)
 
+    async def read(self) -> float:
+        res = await self._gripper.do_command({"get": True})
+        if not isinstance(res, Mapping) or self._read_key not in res:
+            got = sorted(res) if isinstance(res, Mapping) else res
+            raise GripperRuntimeError(
+                f"gripper {self.dependency_name!r} do_command({{'get': True}}) returned "
+                f"no {self._read_key!r} key; got {got!r}. Set gripper.read_key to the key "
+                "this driver actually returns."
+            )
+        value = res[self._read_key]
+        # `isinstance(True, int)` is True, so bool has to be excluded by hand or a
+        # driver returning a flag under this key reads as a legitimate position.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise GripperRuntimeError(
+                f"gripper {self.dependency_name!r} returned a non-numeric "
+                f"{self._read_key!r}: {value!r} ({type(value).__name__})"
+            )
+        # Clamped because the endpoints are a *calibration*, not a hard travel
+        # limit: so-101 calls 95 fully open while the servo reaches 100.
+        return _clamp_unit(
+            (float(value) - self._open_value)
+            / (self._closed_value - self._open_value)
+        )
+
 
 def make_gripper_adapter(
     raw: Mapping[str, Any] | None, dependencies: Mapping[str, Any]

@@ -516,3 +516,82 @@ def test_do_command_rejects_close_threshold():
             },
             {"grip": FakeDoCommandGripper()},
         )
+
+
+def _do_cmd(gripper, **overrides):
+    block = {
+        "type": "do_command",
+        "name": "grip",
+        "open_value": 95.0,
+        "closed_value": 0.0,
+        **overrides,
+    }
+    return make_gripper_adapter(block, {"grip": gripper})
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(95.0, 0.0), (0.0, 1.0), (47.5, 0.5)],
+    ids=["open-rail", "closed-rail", "midpoint"],
+)
+async def test_do_command_read_normalizes_an_inverted_scale(raw, expected):
+    """so-101 counts *up* toward open; this module's 0.0 means fully open."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
+    assert await adapter.read() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "raw,expected", [(840.0, 0.0), (2.0, 1.0), (421.0, 0.5)], ids=["open", "closed", "mid"]
+)
+async def test_do_command_read_handles_xarm_raw_units(raw, expected):
+    adapter = _do_cmd(
+        FakeDoCommandGripper(position=raw, read_key="pos"),
+        read_key="pos",
+        open_value=840.0,
+        closed_value=2.0,
+    )
+    assert await adapter.read() == pytest.approx(expected)
+
+
+async def test_do_command_read_clamps_past_the_open_rail():
+    """Not defensive: so-101's openPosition is 95 but the servo travels to 100,
+    so an ordinary reading of 98 maps to -0.03 unclamped and puts an
+    out-of-range value into the state vector the policy sees."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=98.0))
+    assert await adapter.read() == 0.0
+
+
+async def test_do_command_read_clamps_past_the_closed_rail():
+    adapter = _do_cmd(FakeDoCommandGripper(position=-5.0))
+    assert await adapter.read() == 1.0
+
+
+async def test_do_command_read_uses_the_configured_read_key():
+    adapter = _do_cmd(FakeDoCommandGripper(position=95.0, read_key="pos"), read_key="pos")
+    assert await adapter.read() == pytest.approx(0.0)
+
+
+async def test_do_command_read_errors_when_the_key_is_absent():
+    """The fake answers under `some_other_key`; the adapter is configured for
+    the default `position`, so the key it wants is missing."""
+    adapter = _do_cmd(FakeDoCommandGripper(read_key="some_other_key"))
+    with pytest.raises(GripperRuntimeError, match="some_other_key"):
+        await adapter.read()
+
+
+@pytest.mark.parametrize(
+    "raw", ["halfway", True, None], ids=["string", "bool", "json-null"]
+)
+async def test_do_command_read_errors_on_a_non_numeric_value(raw):
+    """`bool` needs excluding explicitly -- `isinstance(True, int)` is True in
+    Python, so a driver returning True would otherwise read as fully closed.
+    `None` is the likeliest real malformed response (JSON null)."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
+    with pytest.raises(GripperRuntimeError, match="non-numeric"):
+        await adapter.read()
+
+
+async def test_do_command_read_emits_the_get_command():
+    g = FakeDoCommandGripper(position=95.0)
+    await _do_cmd(g).read()
+    assert g.commands == [{"get": True}]
