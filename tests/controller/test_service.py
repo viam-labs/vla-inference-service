@@ -1948,3 +1948,16 @@ async def test_fake_arm_records_the_extra_it_was_called_with(cls):
     await arm2.move_to_joint_positions(JointPositions(values=[0.0] * 6))
     assert arm2.move_extras == [None]
     assert len(arm2.moves) == len(arm2.move_extras)
+
+
+async def test_arm_move_asks_the_driver_not_to_wait_for_settle():
+    """A driver that blocks until the arm settles burns the whole tick budget
+    waiting for a setpoint the next tick is about to replace. Drivers that do
+    not read `wait` ignore it."""
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(config=_config(), deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+    assert arm.move_extras, "the arm was never commanded"
+    assert all(e == {"wait": False} for e in arm.move_extras), arm.move_extras

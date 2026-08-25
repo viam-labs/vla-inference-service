@@ -415,8 +415,13 @@ class VLAController(Generic, EasyResource):
         `ServoGripper` (they land on the same value already reported), and
         for `ThresholdGripper` it is exactly the same "first write always
         actuates once" behavior that would happen on tick 1 regardless --
-        merely moved earlier, before any arm command. `arm_joint`/`none` have
-        no separate gripper component to probe.
+        merely moved earlier, before any arm command. `DoCommandGripper` is
+        normally a no-op the same way too, but not always: `read()` clamps
+        to [0, 1], so a driver resting outside its configured endpoints
+        reads as an endpoint rather than its true position -- an so-101
+        resting at 98% (open_value=95) reads back as 0.0, and writing that
+        back commands 95, a real ~3% aperture move before any arm motion.
+        `arm_joint`/`none` have no separate gripper component to probe.
         """
         if not gripper.in_state or gripper.arm_joint_index is not None:
             return
@@ -657,7 +662,14 @@ class VLAController(Generic, EasyResource):
             # this point inference already succeeded and safety already
             # cleared the action, so there is no "try again next tick" that
             # would be safe -- the arm itself is reporting the fault.
-            await arm.move_to_joint_positions(JointPositions(values=target))
+            #
+            # `wait: False` because the next tick supersedes this setpoint: a driver
+            # that blocks until the arm physically settles (so-101's default) spends
+            # the entire tick budget waiting for a target we are about to replace.
+            # Free-form `extra`, so a driver that does not read the key ignores it.
+            await arm.move_to_joint_positions(
+                JointPositions(values=target), extra={"wait": False}
+            )
             if gripper.in_state and gripper.arm_joint_index is None:
                 await gripper.write(float(safe[-1]))
 
