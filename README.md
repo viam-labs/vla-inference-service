@@ -435,7 +435,7 @@ What to read it for:
 
 ### Gripper variants
 
-A VLA emits one continuous gripper value per tick; Viam offers four different
+A VLA emits one continuous gripper value per tick; Viam offers five different
 ways to carry it, at different fidelity.
 
 **`arm_joint`** — recommended default. The gripper rides the arm's own joint vector (SO-100-style
@@ -462,11 +462,13 @@ an aperture channel: one value per kinematic DOF, in radians or meters. That
 only carries a usable aperture when the driver's gripper model is
 **jointed** — and most gripper models are zero-DOF, including
 `devrel:so101:gripper`, so against those the adapter now refuses at startup
-rather than reporting a permanently-open gripper. (The closing note below —
-that every variant's value is normalized `0.0`–`1.0` — describes what this
-adapter's `read()` hands the *controller*; it is a separate claim from what
-`get_current_inputs()` itself hands the *adapter*, which is the raw
-radian/meter DOF vector above.)
+rather than reporting a permanently-open gripper. Unlike every other
+variant, `inputs` and `threshold` do not normalize on either side: `read()`
+hands the controller the driver's raw radians/meters value untouched
+(`_read_first_input` returns `float(values[0])` straight through). This is
+a known limitation, accepted because no driver we support actually has a
+jointed gripper model — `do_command` is the variant that normalizes
+honestly for one.
 
 `InputsGripper.write()` catches only `NotImplementedError` to attach the
 "reconfigure to threshold" hint, but a Go driver's `errors.ErrUnsupported`
@@ -505,6 +507,13 @@ carries a driver whose scale counts *up* toward open.
   "write_args": { "wait": false } }
 ```
 
+> `write_args: {"wait": false}` is forward-looking: `devrel:so101:gripper`
+> does not yet honor a `wait` flag, so this key is currently inert and every
+> write blocks for up to ~2s waiting for the servo to settle — against a
+> 100ms budget at 10 fps. It will take effect once the companion
+> non-blocking-write change lands in that module; until then, omit it, it
+> does nothing either way.
+
 ```json
 { "type": "do_command", "name": "grip", "read_key": "pos",
   "open_value": 840.0, "closed_value": 2.0 }
@@ -530,8 +539,11 @@ endpoints do not describe this driver's scale at all.
 { "type": "none" }
 ```
 
-Except for `arm_joint`, every variant's value is normalized `0.0`–`1.0` (`0` = fully
-open), matching how LeRobot datasets typically encode a gripper channel.
+`servo` and `do_command` hand the controller a normalized `0.0`–`1.0` value
+(`0` = fully open), matching how LeRobot datasets typically encode a
+gripper channel. `arm_joint` carries degrees, per `action_units`.
+`inputs`/`threshold` pass the driver's raw frame-system value through
+unnormalized, radians or meters — the known limitation described above.
 
 ### Full worked example
 

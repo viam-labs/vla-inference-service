@@ -1,6 +1,6 @@
 """Adapters carrying a policy's continuous gripper channel onto Viam components.
 
-A VLA emits one continuous gripper value per tick. Viam offers four
+A VLA emits one continuous gripper value per tick. Viam offers five
 different ways to carry it at different fidelity, so the config picks one
 explicitly:
 
@@ -31,12 +31,14 @@ explicitly:
   none       no gripper channel.
 
 Unit convention: ``arm_joint`` is in degrees (or whatever ``action_units``
-is); every other variant -- including ``do_command`` -- is normalized
-0.0-1.0, 0 = fully open, matching how LeRobot datasets typically encode a
-gripper channel. That convention describes what each *adapter* hands the
-controller -- a separate claim from what the underlying driver call hands
-the adapter, which for ``get_current_inputs()``/``go_to_inputs()`` is the
-frame-system DOF vector described above, not a normalized aperture.
+is); ``servo`` and ``do_command`` are normalized 0.0-1.0, 0 = fully open,
+matching how LeRobot datasets typically encode a gripper channel. ``gripper``
+(``mode=inputs``/``mode=threshold``) is the exception: per the frame-system
+caveat above, it hands the controller the driver's raw radians/meters value
+untouched -- not normalized at all, on either side of the adapter. That is a
+known limitation, accepted because no driver we support actually has a
+jointed gripper model; ``do_command`` is the variant that normalizes
+honestly for one.
 """
 
 from __future__ import annotations
@@ -367,7 +369,7 @@ class DoCommandGripper(GripperAdapter):
         # in-range input. The tick loop passes float(safe[-1]) from
         # SafetyLayer.apply, which calls _validate first (safety.py:119 ->
         # 75-78) and raises SafetyError on any non-finite value in the action
-        # vector; _preflight_gripper (service.py:423-424) writes back what
+        # vector; _preflight_gripper (service.py:428-429) writes back what
         # read() just returned, already refused-if-non-finite and clamped.
         # The _clamp_unit below is a backstop on an already-clamped value, not
         # a validation point -- do not turn it into one.
