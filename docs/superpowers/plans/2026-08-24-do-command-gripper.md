@@ -1196,7 +1196,7 @@ command and defaults to `{}`; it may not contain a `set` key.
 > way to opt out.
 ````
 
-Then rewrite the `inputs` and `threshold` entries per Step 1's correction, and extend the closing sentence at `README.md:478` to cover five variants. That sentence — "Except for `arm_joint`, every variant's value is normalized `0.0`–`1.0`" — stays **true**: it describes what each adapter hands the controller, whereas the `inputs` correction is about what the driver hands the adapter. State that distinction explicitly in the `inputs` entry so the next reader does not conflate the two, as the design spec's own sections initially did.
+Then rewrite the `inputs` and `threshold` entries per Step 1's correction, and **correct** the closing sentence at `README.md:478`. Do not merely extend it: "Except for `arm_joint`, every variant's value is normalized `0.0`–`1.0`" is false. Only `servo` and `do_command` normalize. `InputsGripper`/`ThresholdGripper` delegate to `_read_first_input`, which returns `float(values[0])` — the driver's raw radians or meters, unnormalized (its own docstring records this as a known limitation). State all three behaviors explicitly: normalized (`servo`, `do_command`), degrees per `action_units` (`arm_joint`), raw frame-system pass-through (`inputs`, `threshold`).
 
 Finally, add the note the spec's §3 asks for (its closing paragraph): `InputsGripper.write` catches only `NotImplementedError`, but a Go driver's `errors.ErrUnsupported` arrives in Python as a `GRPCError`, so the "reconfigure to threshold" hint never fires for one. Task 2's empty-inputs guard makes the *read* fail first, which is the path that actually runs — so this is a documentation note in the `inputs` entry, not a code change.
 

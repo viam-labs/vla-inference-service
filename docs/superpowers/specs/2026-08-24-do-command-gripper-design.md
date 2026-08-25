@@ -342,13 +342,20 @@ README §"Gripper variants" gains a `do_command` entry with both worked configs:
 ```
 
 The trailing sentence at README:478 — "Except for `arm_joint`, every variant's
-value is normalized `0.0`–`1.0` (`0` = fully open)" — stays true and now covers
-five variants. It describes what each *adapter* hands the controller, which is
-genuinely normalized; §3's correction is about what `get_current_inputs()`
-*returns to the adapter*, which is not. Those are different claims and both
-survive. To stop the next reader conflating them the way this spec's own §3 and
-§6 initially did, the `inputs` entry should say explicitly that its driver-side
-values are radians or meters per DOF and the adapter is what normalizes them.
+value is normalized `0.0`–`1.0` (`0` = fully open)" — is **false**, and this
+change is where it gets corrected rather than extended. An earlier draft of this
+spec claimed it "stays true because it describes what each *adapter* hands the
+controller". That is true only for `servo` and `do_command`. `InputsGripper` and
+`ThresholdGripper` both delegate to `_read_first_input`, which returns
+`float(values[0])` — the driver's raw frame-system value in radians or meters,
+passed straight through with no normalization on either side. That is recorded as
+a known limitation in `_read_first_input`'s own docstring, and this document
+contradicted it two sections later.
+
+What the README must say instead: `servo` and `do_command` hand the controller a
+normalized `0.0`–`1.0` value; `arm_joint` carries degrees per `action_units`;
+`inputs`/`threshold` pass the driver's raw frame-system value through
+unnormalized. Three behaviors, not one rule with one exception.
 
 The `inputs`/`threshold` entries are otherwise rewritten per §3.
 
