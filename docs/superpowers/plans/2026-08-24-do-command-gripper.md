@@ -50,7 +50,7 @@ With those four values, `_build_safety` gives the channel the normalized `[0,1]`
 
 **Test files:** `tests/controller/test_gripper.py` (adapter unit tests), `tests/controller/test_config.py` (parse/dependency tests), `tests/controller/test_service.py` (integration through the tick loop).
 
-No new source files. The adapter module is ~250 lines and cohesive; adding a sixth class keeps it well under the point where splitting would help.
+No new source files. The adapter module was ~290 lines when this plan was written and lands near 440; it stays cohesive because every class is the same shape (one way of carrying the channel) behind one factory. Revisit splitting if a seventh variant appears, not on line count alone.
 
 **Test commands:**
 - One test: `uv run pytest tests/controller/test_gripper.py::test_name -v`

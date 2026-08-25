@@ -131,6 +131,27 @@ The read-side clamp is load-bearing, not defensive habit: so-101's
 of 98 maps to `-0.03` unclamped and puts an out-of-range value into the
 observation vector the policy sees.
 
+**But the clamp is bounded, and that matters.** An unbounded clamp absorbs a
+mis-scaled endpoint pair as readily as it absorbs calibration slop, and the
+two are not the same thing. With `open_value=95, closed_value=0` pointed at a
+driver actually reporting raw units, `840 → 0.0`, `400 → 0.0`, `2 → 0.979`:
+the whole upper half of that driver's travel reads "fully open" and the
+policy's gripper channel freezes at a rail, silently and permanently. That is
+the same failure shape as a non-finite reading, and copying the so-101 config
+example onto a different gripper is a realistic way to reach it.
+
+So `read()` clamps within a slack band and *refuses* outside it
+(`_READ_SLACK = 0.25` of span in each direction). Calibration slop is small by
+definition — so-101's is ~5% of span, xarm's ~1% — so the band admits every
+legitimate excursion while a wrong endpoint pair becomes an error naming both
+configured values. It pairs with `_preflight_gripper`, which reads before any
+arm motion, so a mis-scaled pair surfaces as a startup refusal rather than a
+per-tick lie.
+
+Note the config-time message about percentage guesses saturating a raw-unit
+driver fires only when the fields are *omitted*, never when they are wrong.
+This band is what covers the wrong case.
+
 Errors name what went wrong and what to do:
 
 - missing `read_key` → `GripperRuntimeError` quoting the configured key *and*
@@ -254,6 +275,8 @@ the command map (`write_args`) rather than beside it.
 - normalization in both directions, including the inverted so-101 bounds
   (`open=95, closed=0`) and the xarm bounds (`open=840, closed=2`)
 - read clamping at both rails, specifically a raw read *above* `open_value`
+- a grossly out-of-range read refused rather than clamped (a raw-units reading
+  against a percent config), and a non-finite read refused rather than clamped
 - `open_value` missing, `closed_value` missing, and the two equal — all
   `GripperConfigError`
 - `read_key` absent from the response, and present but non-numeric
