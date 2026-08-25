@@ -686,11 +686,19 @@ async def test_do_command_write_omits_extras_by_default():
     assert list(g.commands[0]) == ["set"]
 
 
-def test_do_command_rejects_a_set_key_in_write_args():
-    """A `set` entry would override the computed setpoint and park the gripper
-    at a constant, with nothing raised anywhere."""
-    with pytest.raises(GripperConfigError, match="write_args"):
-        _do_cmd(FakeDoCommandGripper(), write_args={"set": 12.0})
+@pytest.mark.parametrize(
+    "bad_args",
+    [{"set": 12.0}, {"get": True}, {"get": True, "set": 12.0}, {"wait": False, "get": True}],
+    ids=["set", "get", "both", "get-alongside-valid"],
+)
+def test_do_command_rejects_reserved_keys_in_write_args(bad_args):
+    """Both halves of the {"get": ...} / {"set": ...} protocol are reserved. A
+    `set` entry would replace the computed setpoint; a `get` entry makes a
+    driver that checks it first (FakeDoCommandGripper does) treat every write as
+    a read. Both leave the gripper silently not tracking the policy.
+    """
+    with pytest.raises(GripperConfigError, match="protocol keys"):
+        _do_cmd(FakeDoCommandGripper(), write_args=bad_args)
 
 
 @pytest.mark.parametrize(
