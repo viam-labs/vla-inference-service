@@ -452,6 +452,16 @@ async def test_nonempty_inputs_still_read_normally():
 # ---------------------------------------------------------------------------
 # do_command
 # ---------------------------------------------------------------------------
+def _do_cmd(gripper, **overrides):
+    block = {
+        "type": "do_command",
+        "name": "grip",
+        "open_value": 95.0,
+        "closed_value": 0.0,
+        **overrides,
+    }
+    return make_gripper_adapter(block, {"grip": gripper})
+
 
 
 async def test_fake_do_command_gripper_round_trips():
@@ -469,10 +479,7 @@ async def test_fake_do_command_gripper_honors_a_custom_read_key():
 
 
 def test_do_command_adapter_wires_its_attributes():
-    a = make_gripper_adapter(
-        {"type": "do_command", "name": "grip", "open_value": 95.0, "closed_value": 0.0},
-        {"grip": FakeDoCommandGripper()},
-    )
+    a = _do_cmd(FakeDoCommandGripper())
     assert a.in_state is True
     assert a.uses_degrees is False
     assert a.dependency_name == "grip"
@@ -490,10 +497,7 @@ def test_do_command_requires_both_bounds(missing):
 def test_do_command_rejects_equal_bounds():
     """Equal endpoints make the read mapping a division by zero."""
     with pytest.raises(GripperConfigError, match="must differ"):
-        make_gripper_adapter(
-            {"type": "do_command", "name": "grip", "open_value": 50.0, "closed_value": 50.0},
-            {"grip": FakeDoCommandGripper()},
-        )
+        _do_cmd(FakeDoCommandGripper(), open_value=50.0, closed_value=50.0)
 
 
 def test_do_command_requires_a_name():
@@ -506,27 +510,8 @@ def test_do_command_requires_a_name():
 def test_do_command_rejects_close_threshold():
     """`close_threshold` belongs only to gripper/threshold."""
     with pytest.raises(GripperConfigError, match="close_threshold"):
-        make_gripper_adapter(
-            {
-                "type": "do_command",
-                "name": "grip",
-                "open_value": 95.0,
-                "closed_value": 0.0,
-                "close_threshold": 0.5,
-            },
-            {"grip": FakeDoCommandGripper()},
-        )
+        _do_cmd(FakeDoCommandGripper(), close_threshold=0.5)
 
-
-def _do_cmd(gripper, **overrides):
-    block = {
-        "type": "do_command",
-        "name": "grip",
-        "open_value": 95.0,
-        "closed_value": 0.0,
-        **overrides,
-    }
-    return make_gripper_adapter(block, {"grip": gripper})
 
 
 @pytest.mark.parametrize(
@@ -553,17 +538,16 @@ async def test_do_command_read_handles_xarm_raw_units(raw, expected):
     assert await adapter.read() == pytest.approx(expected)
 
 
-async def test_do_command_read_clamps_past_the_open_rail():
+@pytest.mark.parametrize(
+    "raw,expected", [(98.0, 0.0), (-5.0, 1.0)], ids=["open-rail", "closed-rail"]
+)
+async def test_do_command_read_clamps_just_past_a_rail(raw, expected):
     """Not defensive: so-101's openPosition is 95 but the servo travels to 100,
     so an ordinary reading of 98 maps to -0.03 unclamped and puts an
-    out-of-range value into the state vector the policy sees."""
-    adapter = _do_cmd(FakeDoCommandGripper(position=98.0))
-    assert await adapter.read() == 0.0
-
-
-async def test_do_command_read_clamps_past_the_closed_rail():
-    adapter = _do_cmd(FakeDoCommandGripper(position=-5.0))
-    assert await adapter.read() == 1.0
+    out-of-range value into the state vector the policy sees. Both of these are
+    inside the slack band, so they clamp rather than being refused."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
+    assert await adapter.read() == expected
 
 
 async def test_do_command_read_uses_the_configured_read_key():
@@ -631,11 +615,9 @@ async def test_do_command_read_refuses_a_non_finite_reading(raw):
 
 
 @pytest.mark.parametrize(
-    "raw,note",
-    [(840.0, "raw-units-driver-on-percent-config"), (-100.0, "far-below-closed")],
-    ids=["far-above-open", "far-below-closed"],
+    "raw", [840.0, -100.0], ids=["far-above-open", "far-below-closed"]
 )
-async def test_do_command_read_refuses_a_grossly_out_of_range_reading(raw, note):
+async def test_do_command_read_refuses_a_grossly_out_of_range_reading(raw):
     """The clamp absorbs calibration slop, not a mis-scaled endpoint pair. A
     driver reporting raw units against a percent config would otherwise report
     a frozen rail forever."""

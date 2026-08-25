@@ -242,21 +242,6 @@ def test_accepts_every_known_gripper_type(kind):
     assert cfg.gripper["type"] == kind
 
 
-def test_do_command_gripper_adds_dependency():
-    cfg = ControllerConfig.parse(
-        {
-            **BASE,
-            "gripper": {
-                "type": "do_command",
-                "name": "grip",
-                "open_value": 95.0,
-                "closed_value": 0.0,
-            },
-        }
-    )
-    assert "grip" in cfg.dependencies()
-
-
 @pytest.mark.parametrize("kind", GRIPPER_TYPES)
 def test_dependencies_cover_what_the_adapter_needs(kind):
     """`dependencies()` must name every resource the built adapter will ask for.

@@ -108,6 +108,18 @@ class FakePolicyClient:
         raise ValueError(name)
 
 
+# The one `do_command` gripper block every test below shares. so-101's scale:
+# percent, counting *up* toward open, which is inverted from this module's
+# `0.0 = fully open` convention -- so a fully-closed action of 1.0 maps to a
+# driver setpoint of 0.0. The assertions depend on that pair.
+_DO_COMMAND_GRIPPER = {
+    "type": "do_command",
+    "name": "g",
+    "open_value": 95.0,
+    "closed_value": 0.0,
+}
+
+
 def _config(**overrides):
     attrs = {
         "policy_service": "p",
@@ -436,12 +448,7 @@ async def test_radians_conversion_does_not_scale_a_normalized_gripper_channel():
         config=_config(
             action_units="radians",
             safety={"max_start_delta_degs": 1000.0},
-            gripper={
-                "type": "do_command",
-                "name": "g",
-                "open_value": 95.0,
-                "closed_value": 0.0,
-            },
+            gripper=_DO_COMMAND_GRIPPER,
         ),
         deps=_deps(policy=policy, arm=arm, g=g),
     )
@@ -635,12 +642,7 @@ async def test_do_command_gripper_is_driven_through_a_real_tick():
     policy = FakePolicyClient(action_dim=6, action_value=1.0)
     svc = _svc(
         config=_config(
-            gripper={
-                "type": "do_command",
-                "name": "g",
-                "open_value": 95.0,
-                "closed_value": 0.0,
-            }
+            gripper=_DO_COMMAND_GRIPPER
         ),
         deps=_deps(policy=policy, arm=arm, g=g),
     )
@@ -688,96 +690,67 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
 
     svc = _svc(
         config=_config(
-            gripper={
-                "type": "do_command",
-                "name": "g",
-                "open_value": 95.0,
-                "closed_value": 0.0,
-            }
+            gripper=_DO_COMMAND_GRIPPER
         ),
         deps=_deps(policy=policy, arm=arm, g=g),
     )
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
-    # Only the preflight write may precede the first arm move; within a tick
-    # the gripper write must follow it. Asserting on a prefix rather than on
-    # events[first_arm_idx + 1] is load-bearing: with ~8 ticks in the window,
-    # the looser form is satisfied by the NEXT tick's write even when the
-    # in-tick order is swapped.
+    # Same prefix assertion as the sibling test above, for the same reason.
     assert events.index("arm") == 1, events
     assert events[:3] == ["gripper", "arm", "gripper"], events
 
 
-async def test_do_command_malformed_read_is_caught_before_any_arm_motion():
-    """A driver whose DoCommand response key does not match the configured
-    read_key fails on its very first gripper read -- before any arm motion.
-
-    ``len(arm.moves) == 0`` alone would pass even with `_preflight_gripper`
-    deleted: the tick loop's own `gripper.read()` (called from
-    `ObservationBuilder.build()`, before any arm command) fails for the
-    identical reason on tick 1. `camera.reads == 0` is what actually pins
-    this on the probe: `build()` reads the camera and the gripper
-    concurrently via `asyncio.gather`, so a failure surfacing from the
-    tick's own read would still show >= 1 camera read. Zero reads means the
-    loop -- and its `ObservationBuilder` -- never ran at all, which only the
-    pre-flight probe (called before the loop is even entered) can produce.
-    """
-    arm = FakeArm(positions=[0.0] * 5)
-    camera = FakeCamera()
-    g = FakeDoCommandGripper(read_key="some_other_key")
-    # action_dim=6 matters: with 5 state_joint_indices and in_state=True the
-    # expected dim is 6, and a mismatch would raise in _check_action_dim
-    # *before* the preflight probe -- passing the arm-motion assertion for
-    # entirely the wrong reason.
-    policy = FakePolicyClient(action_dim=6)
-    svc = _svc(
-        config=_config(
-            gripper={
-                "type": "do_command",
-                "name": "g",
-                "open_value": 95.0,
-                "closed_value": 0.0,
-            }
+@pytest.mark.parametrize(
+    "gripper_block,gripper_factory,expected",
+    [
+        (
+            _DO_COMMAND_GRIPPER,
+            lambda: FakeDoCommandGripper(read_key="some_other_key"),
+            "some_other_key",
         ),
-        deps=_deps(policy=policy, arm=arm, camera=camera, g=g),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    status = await _wait_for_state(svc, "error")
-    assert "some_other_key" in status["last_error"]
-    assert len(arm.moves) == 0, "the arm must never move before the gripper probe fails"
-    assert arm.stopped >= 1
-    assert camera.reads == 0, "a non-zero read means the tick loop's own build() ran"
+        (
+            {"type": "gripper", "name": "g", "mode": "inputs"},
+            lambda: FakeGripper(inputs=[]),
+            "no kinematic DOF",
+        ),
+    ],
+    ids=["do_command-read-key-mismatch", "zero-dof-inputs"],
+)
+async def test_a_failing_gripper_read_is_caught_before_any_arm_motion(
+    gripper_block, gripper_factory, expected
+):
+    """Both refusals have to surface at *startup*, not mid-episode.
 
-
-async def test_zero_dof_inputs_gripper_is_caught_before_any_arm_motion():
-    """The Task 2 refusal has to surface at *startup*, not mid-episode.
-
-    Same caveat as the do_command malformed-read test above: a zero-DOF
-    `get_current_inputs()` failure is a `read()` failure just like the tick
-    loop's own gripper read, so `len(arm.moves) == 0` alone would pass even
-    with `_preflight_gripper` deleted. `camera.reads == 0` is the
-    discriminator -- `ObservationBuilder.build()` reads the camera and the
-    gripper concurrently via `asyncio.gather`, so the tick loop's own read
-    failing here would still show >= 1 camera read. Zero reads proves the
-    pre-flight probe caught this before the loop, and its
-    `ObservationBuilder`, ever ran. Adapter-level tests in test_gripper.py
+    `len(arm.moves) == 0` alone would pass even with `_preflight_gripper`
+    deleted: both of these are `read()` failures, and the tick loop's own
+    `gripper.read()` -- called from `ObservationBuilder.build()`, before any arm
+    command -- fails for the identical reason on tick 1. `camera.reads == 0` is
+    what actually pins it on the probe: `build()` reads the camera and the
+    gripper concurrently via `asyncio.gather`, so a failure surfacing from the
+    tick's own read would still show >= 1 camera read. Zero reads means the loop
+    -- and its `ObservationBuilder` -- never ran at all, which only the
+    pre-flight probe can produce. Adapter-level tests in `test_gripper.py`
     cannot prove any of this.
+
+    `action_dim=6` matters: with 5 `state_joint_indices` and `in_state=True` the
+    expected dim is 6, and a mismatch would raise in `_check_action_dim` before
+    the probe -- passing the arm-motion assertion for entirely the wrong reason.
     """
     arm = FakeArm(positions=[0.0] * 5)
     camera = FakeCamera()
-    gripper = FakeGripper(inputs=[])
     policy = FakePolicyClient(action_dim=6)
     svc = _svc(
-        config=_config(gripper={"type": "gripper", "name": "g", "mode": "inputs"}),
-        deps=_deps(policy=policy, arm=arm, camera=camera, g=gripper),
+        config=_config(gripper=gripper_block),
+        deps=_deps(policy=policy, arm=arm, camera=camera, g=gripper_factory()),
     )
     await svc.do_command({"command": "start", "task": "t"})
     status = await _wait_for_state(svc, "error")
-    assert "no kinematic DOF" in status["last_error"]
+    assert expected in status["last_error"]
     assert len(arm.moves) == 0, "the arm must never move before the gripper probe fails"
     assert arm.stopped >= 1
-    assert camera.reads == 0, "a non-zero read means the tick loop's own build() ran"
+    assert camera.reads == 0
 
 
 async def test_extra_configured_camera_not_needed_by_policy_is_ignored():

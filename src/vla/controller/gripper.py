@@ -54,22 +54,19 @@ from vla.config_util import as_int as _as_int
 from vla.config_util import as_str as _as_str
 
 GRIPPER_TYPES = ("arm_joint", "servo", "gripper", "do_command", "none")
+
+# Variants that resolve their own Viam resource, and so must be named in
+# `ControllerConfig.dependencies()`. Lives here rather than in `config.py`
+# because it is a fact about the adapters: `dependencies()` has to answer it
+# before any adapter exists, so it cannot read `dependency_name` off an
+# instance, but it can import the set from the module that owns the variants.
+GRIPPER_TYPES_NEEDING_DEPENDENCY = frozenset({"servo", "gripper", "do_command"})
 GRIPPER_MODES = ("inputs", "threshold")
 
 _DEFAULT_MIN_DEG = 0.0
 _DEFAULT_MAX_DEG = 90.0
 _DEFAULT_CLOSE_THRESHOLD = 0.5
 _DEFAULT_READ_KEY = "position"
-
-# How far outside [0, 1] a reading may fall before it is refused rather than
-# clamped. The clamp absorbs *calibration* slop -- so-101 declares open at 95
-# while the servo travels to 100, ~5% of span -- which is small by definition.
-# A reading far outside the band means the configured endpoints do not describe
-# this driver's scale at all (the classic case: so-101's 95/0 percent copied
-# onto a driver reporting raw units), and silently saturating it freezes the
-# policy's gripper channel at a rail forever.
-_READ_SLACK = 0.25
-
 
 class GripperConfigError(VLAError, ValueError):
     """Raised for an invalid gripper config block."""
@@ -181,6 +178,28 @@ class GripperAdapter(abc.ABC):
     uses_degrees: bool = False
     dependency_name: str | None = None
     arm_joint_index: int | None = None
+
+    @property
+    def has_normalized_tail(self) -> bool:
+        """Whether this adapter contributes a trailing 0.0-1.0 channel.
+
+        True for every variant whose value is normalized (`servo`,
+        `gripper/inputs`, `gripper/threshold`, `do_command`); False for
+        `arm_joint`, whose channel rides the arm's joint vector in
+        ``action_units``, and for `none`, which contributes nothing.
+
+        This exists so the fact has one name. It was previously re-derived at
+        four call sites in three spellings -- `in_state and not uses_degrees`,
+        `not in_state or uses_degrees`, `arm_joint_index is not None`, and
+        `in_state and arm_joint_index is None` -- two of them De Morgan
+        negations of each other. `uses_degrees` and `arm_joint_index` are set
+        by exactly one class between them, so all four were the same predicate,
+        and a variant that set them inconsistently would have made the safety
+        layer and the tick loop silently disagree about units. That is the bug
+        class the write-side conversion split exists to prevent; naming the
+        predicate once is what keeps it prevented.
+        """
+        return self.in_state and self.arm_joint_index is None
 
     async def read(self) -> float:
         raise NotImplementedError
@@ -303,6 +322,18 @@ class DoCommandGripper(GripperAdapter):
     drivers do, since for them a higher number means more open.
     """
 
+    # How far outside [0, 1] a reading may fall before it is refused rather
+    # than clamped. The clamp absorbs *calibration* slop -- so-101 declares
+    # open at 95 while the servo travels to 100, ~5% of span -- which is small
+    # by definition. A reading far outside the band means the configured
+    # endpoints do not describe this driver's scale at all (the classic case:
+    # so-101's 95/0 percent copied onto a driver reporting raw units), and
+    # silently saturating it freezes the policy's gripper channel at a rail
+    # forever. A class attribute rather than a module constant because this is
+    # the only adapter that validates its reads at all -- `ServoGripper`
+    # deliberately does not, so a module-level name would overstate its reach.
+    _READ_SLACK = 0.25
+
     def __init__(
         self,
         name: str,
@@ -317,6 +348,20 @@ class DoCommandGripper(GripperAdapter):
             raise GripperConfigError(
                 "gripper.open_value and gripper.closed_value must differ, both are "
                 f"{open_value!r}"
+            )
+        # Checked here rather than in the factory because it is an invariant of
+        # what `write()` does with `**self._write_args`, not a statement about
+        # config shape -- the module's rule is cross-argument invariants in
+        # __init__, raw-config coercion in the factory. Direct construction gets
+        # it too this way.
+        reserved = sorted({"get", "set"} & write_args.keys())
+        if reserved:
+            raise GripperConfigError(
+                f"gripper.write_args must not contain {', '.join(repr(k) for k in reserved)}: "
+                'these are the adapter\'s own protocol keys. A "set" entry would replace the '
+                'setpoint computed from the policy\'s action; a "get" entry makes a driver '
+                "that checks it first treat every write as a read. Either way the gripper "
+                "silently stops tracking the policy."
             )
         self.dependency_name = name
         self._gripper = gripper
@@ -342,10 +387,13 @@ class DoCommandGripper(GripperAdapter):
                 f"gripper {self.dependency_name!r} returned a non-numeric "
                 f"{self._read_key!r}: {value!r} ({type(value).__name__})"
             )
-        # Non-finite is refused rather than clamped: _clamp_unit would turn nan
-        # and +inf into 0.0 -- "confidently fully open" -- and -inf into 1.0,
-        # fabricating an endpoint reading. This mirrors config_util.as_float,
-        # which already rejects non-finite config values for the same reason.
+        # Kept for its message, not for safety: the slack-band check below
+        # already refuses every non-finite reading (nan fails both comparisons;
+        # +/-inf normalize to -/+inf and fail too), so _clamp_unit can never see
+        # one. But the band's message would read "normalizes to nan", which is
+        # actively misleading, where this one names the actual fault. When this
+        # guard landed the band did not exist yet and the safety rationale was
+        # real -- do not read the overlap as licence to delete either check.
         if not math.isfinite(value):
             raise GripperRuntimeError(
                 f"gripper {self.dependency_name!r} returned a non-finite "
@@ -356,7 +404,7 @@ class DoCommandGripper(GripperAdapter):
         normalized = (float(value) - self._open_value) / (
             self._closed_value - self._open_value
         )
-        if not -_READ_SLACK <= normalized <= 1.0 + _READ_SLACK:
+        if not -self._READ_SLACK <= normalized <= 1.0 + self._READ_SLACK:
             raise GripperRuntimeError(
                 f"gripper {self.dependency_name!r} reported {self._read_key}={value!r}, "
                 f"which normalizes to {normalized:.3f} -- far outside [0, 1]. "
@@ -446,15 +494,6 @@ def make_gripper_adapter(
         if not isinstance(write_args, Mapping):
             raise GripperConfigError(
                 f"gripper.write_args must be an object, got {write_args!r}"
-            )
-        reserved = sorted({"get", "set"} & write_args.keys())
-        if reserved:
-            raise GripperConfigError(
-                f"gripper.write_args must not contain {', '.join(repr(k) for k in reserved)}: "
-                'these are the adapter\'s own protocol keys. A "set" entry would replace the '
-                'setpoint computed from the policy\'s action; a "get" entry makes a driver '
-                "that checks it first treat every write as a read. Either way the gripper "
-                "silently stops tracking the policy."
             )
         return DoCommandGripper(
             name,

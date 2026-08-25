@@ -352,7 +352,7 @@ class VLAController(Generic, EasyResource):
                 max_joint_delta_degs=s.max_joint_delta_degs,
                 max_start_delta_degs=s.max_start_delta_degs,
                 joint_limits_degs=s.joint_limits_degs,
-                gripper_in_degrees=(not gripper.in_state) or gripper.uses_degrees,
+                gripper_in_degrees=not gripper.has_normalized_tail,
             )
         )
 
@@ -426,7 +426,7 @@ class VLAController(Generic, EasyResource):
         back commands 95, a real ~3% aperture move before any arm motion.
         `arm_joint`/`none` have no separate gripper component to probe.
         """
-        if not gripper.in_state or gripper.arm_joint_index is not None:
+        if not gripper.has_normalized_tail:
             return
         value = await gripper.read()
         await gripper.write(value)
@@ -630,15 +630,10 @@ class VLAController(Generic, EasyResource):
             # already splits this way (see its `# already normalized` tail);
             # the write side has to match or the two disagree about units.
             raw_action = np.asarray(action, dtype=np.float32)
-            if gripper.in_state and not gripper.uses_degrees:
-                degrees = np.concatenate(
-                    [
-                        to_degrees(raw_action[:-1], cfg.action_units),
-                        raw_action[-1:],
-                    ]
-                )
-            else:
-                degrees = to_degrees(raw_action, cfg.action_units)
+            head = len(raw_action) - (1 if gripper.has_normalized_tail else 0)
+            degrees = np.concatenate(
+                [to_degrees(raw_action[:head], cfg.action_units), raw_action[head:]]
+            )
 
             # Every joint the arm has, not just the driven ones: `positions`
             # below seeds from the *measured* values so an un-driven joint
@@ -690,7 +685,7 @@ class VLAController(Generic, EasyResource):
             await arm.move_to_joint_positions(
                 JointPositions(values=target), extra={"wait": False}
             )
-            if gripper.in_state and gripper.arm_joint_index is None:
+            if gripper.has_normalized_tail:
                 await gripper.write(float(safe[-1]))
 
             last_tick = self._record_tick(last_tick)

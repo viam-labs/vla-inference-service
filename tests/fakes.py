@@ -35,11 +35,21 @@ class FakeArm:
 
         return JointPositions(values=self.positions)
 
-    async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
+    def _record_move(self, positions, extra):
+        """The bookkeeping both arm fakes share.
+
+        Split out so `StalledArm` can override only the part it means to
+        change. It previously duplicated this whole prologue to skip one
+        trailing line, which is how it came to need its own guard test -- the
+        `move_extras` append had to be remembered in two places.
+        """
         if self.fail_next_move:
             raise RuntimeError("arm move failed")
         self.moves.append(positions)
         self.move_extras.append(extra)
+
+    async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
+        self._record_move(positions, extra)
         # Write into the existing vector rather than replacing it: a commanded
         # action can be narrower than the arm's joint count (gripper on its own
         # component), and replacing would silently shrink the arm.
@@ -67,11 +77,9 @@ class StalledArm(FakeArm):
     """
 
     async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
-        if self.fail_next_move:
-            raise RuntimeError("arm move failed")
-        self.moves.append(positions)
-        self.move_extras.append(extra)
-        # Deliberately does NOT update self.positions -- the whole point.
+        self._record_move(positions, extra)
+        # Deliberately does NOT update self.positions -- the whole point, and
+        # now the only line this override exists to omit.
 
 
 class FakeCamera:
