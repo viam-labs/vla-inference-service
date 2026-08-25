@@ -821,7 +821,7 @@ git commit -m "feat: write a do_command gripper setpoint, guarding write_args"
 
 ## Task 7: Register the dependency in config parsing
 
-Without this the configured resource is never requested, so `dependencies.get(name)` hands the adapter `None` and every call fails with `AttributeError` at runtime.
+Without this the configured resource is never requested, so `dependencies.get(name)` hands the adapter `None`. The failure surfaces at `_preflight_gripper` (`service.py:461`) — at run start, before any arm command, so the refuse-before-motion discipline holds — as an `AttributeError: 'NoneType' object has no attribute 'do_command'`. Safe, but the wrong shape: a config omission reported as a driver fault, at deploy time rather than config time.
 
 **Files:**
 - Modify: `src/vla/controller/config.py:329`
