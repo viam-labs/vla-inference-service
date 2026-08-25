@@ -789,11 +789,14 @@ In `make_gripper_adapter`'s `do_command` branch, Task 4 already left `write_args
             raise GripperConfigError(
                 f"gripper.write_args must be an object, got {write_args!r}"
             )
-        if "set" in write_args:
+        reserved = sorted({"get", "set"} & write_args.keys())
+        if reserved:
             raise GripperConfigError(
-                'gripper.write_args must not contain "set": it is merged into the set '
-                "command and would silently replace the setpoint computed from the "
-                "policy's action, parking the gripper at a constant"
+                f"gripper.write_args must not contain {', '.join(repr(k) for k in reserved)}: "
+                'these are the adapter\'s own protocol keys. A "set" entry would replace the '
+                'setpoint computed from the policy\'s action; a "get" entry makes a driver '
+                "that checks it first treat every write as a read. Either way the gripper "
+                "silently stops tracking the policy."
             )
 ```
 

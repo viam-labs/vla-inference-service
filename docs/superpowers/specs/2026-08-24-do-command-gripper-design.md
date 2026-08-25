@@ -64,7 +64,7 @@ A fifth entry in `GRIPPER_TYPES` (`src/vla/controller/gripper.py`):
 | `open_value` | **yes** | — | The driver-native value at fully open. |
 | `closed_value` | **yes** | — | The driver-native value at fully closed. |
 | `read_key` | no | `"position"` | Key to pull from the `{"get": true}` response. |
-| `write_args` | no | `{}` | Extra pairs merged into the `set` command. Must be a mapping, and must not contain a `set` key. |
+| `write_args` | no | `{}` | Extra pairs merged into the `set` command. Must be a mapping, and must not contain `get` or `set` — the adapter's own protocol keys. |
 
 `open_value` and `closed_value` are **required, not defaulted**. A percentage
 default (`100`/`0`) would silently saturate a 0–850 driver like xarm at the
@@ -78,11 +78,24 @@ companion so-101 change lands; xarm ignores an unrecognized key, as does any
 driver that does not read it.
 
 Two validations on `write_args` are load-bearing rather than defensive. It must
-be rejected if it is not a mapping, and rejected if it contains a `set` key:
-the write merges as `{"set": raw, **write_args}`, so a `set` entry in
-`write_args` would silently *replace* the setpoint the adapter just computed
-from the policy's action. That failure is invisible — the gripper simply parks
-at a constant — so it has to be a config error, not a runtime surprise.
+be rejected if it is not a mapping, and rejected if it contains either of the
+adapter's own protocol keys, `get` or `set`. The write merges as
+`{"set": raw, **write_args}`, so:
+
+- a `set` entry silently *replaces* the setpoint just computed from the policy's
+  action — the gripper parks at a constant;
+- a `get` entry makes any driver that checks `get` before `set` treat every
+  write as a read — the gripper never moves at all. This is not hypothetical:
+  the project's own `FakeDoCommandGripper` checks in that order, and so does
+  `devrel:so101:gripper` (`components/gripper/gripper.go:366-387`).
+
+Both failures are invisible at runtime — the gripper simply stops tracking the
+policy with nothing raised — so both have to be config errors.
+
+The mapping check must also come *first*, and `write_args` must default via
+`raw.get("write_args", {})` rather than `or {}`: `or` folds falsy non-mappings
+(`[]`, `0`, `False`, `''`) into `{}` before either guard can see them, and
+`dict([])`/`dict('')` both succeed, so those would be accepted silently.
 
 **On timing:** these are `ConfigError`s, but they do not surface at
 `validate_config`/`reconfigure`. `make_gripper_adapter` runs inside `_run()`
@@ -343,6 +356,25 @@ The xarm config carries a caveat: `goToPosition`
 (`viam-ufactory-xarm/arm/gripper.go:307-356`) polls until the jaw settles, up
 to **10 seconds**, with no `wait` escape hatch. The variant is functionally
 correct there but impractical at 10 fps without an xarm-side change.
+
+## Known, not fixed here
+
+**A `nan` action reaches the driver as a rail command.** `write()` clamps via
+`_clamp_unit`, which is `min(1.0, max(0.0, value))` — and `nan` propagates
+through both comparisons, so a `nan` action normalizes to `0.0` and commands
+the gripper *fully open*, silently. The upstream safety layer does not catch it
+either: `np.clip(nan, 0, 1)` is `nan`.
+
+This is the same silent-plausible-value pattern this design removed three times
+elsewhere (`else 0.0` on the inputs read, `or {}` on `write_args`, the
+unbounded read clamp), and `read()` explicitly refuses non-finite for exactly
+this reason. `write()` deliberately does not, because its input arrives from
+the safety layer rather than a driver, and the right place to reject a
+non-finite *action* is the safety layer — which is outside this design's scope.
+
+A policy emitting `nan` (a diverging model, a bad checkpoint) would therefore
+drive the gripper fully open with no diagnostic. Worth a separate change to
+`safety.py`; recorded here so it is not rediscovered as a mystery.
 
 ## Out of scope
 
