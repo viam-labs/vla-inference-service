@@ -526,8 +526,15 @@ async def test_gripper_write_happens_after_arm_move_for_non_arm_joint_gripper():
 
 
 async def test_gripper_write_order_is_after_arm_move_not_before():
-    """Both happening is necessary but not sufficient -- prove the order too:
-    a swap (write the gripper, then move the arm) must be caught."""
+    """Both happening is necessary but not sufficient -- prove the order too.
+
+    Asserts on a prefix, not on events[first_arm_idx + 1]: with ~8 ticks in
+    the sleep window, the looser index-based form is satisfied by the NEXT
+    tick's gripper write even when the in-tick order is swapped (write then
+    move) -- verified by mutation, see git history for this test. Only the
+    preflight probe's own write may precede the first arm move; within a
+    tick the gripper write must follow it immediately.
+    """
     events: list[str] = []
     arm = FakeArm(positions=[0.0] * 5)
     gripper = FakeGripper()
@@ -555,12 +562,13 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
 
-    # events[0] is the pre-flight probe's own gripper write, before any arm
-    # move -- expected and fine. What matters is that once the arm starts
-    # moving, its own tick's gripper write always comes right after it, not
-    # before.
-    first_arm_idx = events.index("arm")
-    assert events[first_arm_idx + 1] == "gripper", events
+    # Only the preflight write may precede the first arm move; within a tick
+    # the gripper write must follow it. Asserting on a prefix rather than on
+    # events[first_arm_idx + 1] is load-bearing: with ~8 ticks in the window,
+    # the looser form is satisfied by the NEXT tick's write even when the
+    # in-tick order is swapped.
+    assert events.index("arm") == 1, events
+    assert events[:3] == ["gripper", "arm", "gripper"], events
 
 
 async def test_gripper_incompatible_mode_is_caught_before_any_arm_motion():
@@ -614,7 +622,13 @@ async def test_do_command_gripper_is_driven_through_a_real_tick():
 
 
 async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
-    """Same ordering guarantee the other non-arm_joint variants have."""
+    """Same ordering guarantee the other non-arm_joint variants have.
+
+    See test_gripper_write_order_is_after_arm_move_not_before for why this
+    asserts on a prefix rather than on events[first_arm_idx + 1]: with ~8
+    ticks in the sleep window, the index-based form is satisfied by the
+    NEXT tick's gripper write even when the in-tick order is swapped.
+    """
     events = []
     arm = FakeArm(positions=[0.0] * 5)
     g = FakeDoCommandGripper(position=95.0)
@@ -649,15 +663,31 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
-    # events[0] is the pre-flight probe's own write, before any arm motion.
-    first_arm_idx = events.index("arm")
-    assert events[first_arm_idx + 1] == "gripper", events
+    # Only the preflight write may precede the first arm move; within a tick
+    # the gripper write must follow it. Asserting on a prefix rather than on
+    # events[first_arm_idx + 1] is load-bearing: with ~8 ticks in the window,
+    # the looser form is satisfied by the NEXT tick's write even when the
+    # in-tick order is swapped.
+    assert events.index("arm") == 1, events
+    assert events[:3] == ["gripper", "arm", "gripper"], events
 
 
 async def test_do_command_malformed_read_is_caught_before_any_arm_motion():
-    """`_preflight_gripper` reads then writes back, so a driver whose response
-    key does not match `read_key` fails before the arm is ever commanded."""
+    """A driver whose DoCommand response key does not match the configured
+    read_key fails on its very first gripper read -- before any arm motion.
+
+    ``len(arm.moves) == 0`` alone would pass even with `_preflight_gripper`
+    deleted: the tick loop's own `gripper.read()` (called from
+    `ObservationBuilder.build()`, before any arm command) fails for the
+    identical reason on tick 1. `camera.reads == 0` is what actually pins
+    this on the probe: `build()` reads the camera and the gripper
+    concurrently via `asyncio.gather`, so a failure surfacing from the
+    tick's own read would still show >= 1 camera read. Zero reads means the
+    loop -- and its `ObservationBuilder` -- never ran at all, which only the
+    pre-flight probe (called before the loop is even entered) can produce.
+    """
     arm = FakeArm(positions=[0.0] * 5)
+    camera = FakeCamera()
     g = FakeDoCommandGripper(read_key="some_other_key")
     # action_dim=6 matters: with 5 state_joint_indices and in_state=True the
     # expected dim is 6, and a mismatch would raise in _check_action_dim
@@ -673,31 +703,44 @@ async def test_do_command_malformed_read_is_caught_before_any_arm_motion():
                 "closed_value": 0.0,
             }
         ),
-        deps=_deps(policy=policy, arm=arm, g=g),
+        deps=_deps(policy=policy, arm=arm, camera=camera, g=g),
     )
     await svc.do_command({"command": "start", "task": "t"})
     status = await _wait_for_state(svc, "error")
     assert "some_other_key" in status["last_error"]
     assert len(arm.moves) == 0, "the arm must never move before the gripper probe fails"
     assert arm.stopped >= 1
+    assert camera.reads == 0, "a non-zero read means the tick loop's own build() ran"
 
 
 async def test_zero_dof_inputs_gripper_is_caught_before_any_arm_motion():
-    """The Task 2 refusal has to surface at *startup*, not mid-episode -- that
-    is the whole claim the pre-flight probe makes. Adapter-level tests in
-    test_gripper.py cannot prove it."""
+    """The Task 2 refusal has to surface at *startup*, not mid-episode.
+
+    Same caveat as the do_command malformed-read test above: a zero-DOF
+    `get_current_inputs()` failure is a `read()` failure just like the tick
+    loop's own gripper read, so `len(arm.moves) == 0` alone would pass even
+    with `_preflight_gripper` deleted. `camera.reads == 0` is the
+    discriminator -- `ObservationBuilder.build()` reads the camera and the
+    gripper concurrently via `asyncio.gather`, so the tick loop's own read
+    failing here would still show >= 1 camera read. Zero reads proves the
+    pre-flight probe caught this before the loop, and its
+    `ObservationBuilder`, ever ran. Adapter-level tests in test_gripper.py
+    cannot prove any of this.
+    """
     arm = FakeArm(positions=[0.0] * 5)
+    camera = FakeCamera()
     gripper = FakeGripper(inputs=[])
     policy = FakePolicyClient(action_dim=6)
     svc = _svc(
         config=_config(gripper={"type": "gripper", "name": "g", "mode": "inputs"}),
-        deps=_deps(policy=policy, arm=arm, g=gripper),
+        deps=_deps(policy=policy, arm=arm, camera=camera, g=gripper),
     )
     await svc.do_command({"command": "start", "task": "t"})
     status = await _wait_for_state(svc, "error")
     assert "no kinematic DOF" in status["last_error"]
     assert len(arm.moves) == 0, "the arm must never move before the gripper probe fails"
     assert arm.stopped >= 1
+    assert camera.reads == 0, "a non-zero read means the tick loop's own build() ran"
 
 
 async def test_extra_configured_camera_not_needed_by_policy_is_ignored():
