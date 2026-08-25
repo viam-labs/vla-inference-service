@@ -435,8 +435,8 @@ What to read it for:
 
 ### Gripper variants
 
-A VLA emits one continuous gripper value per tick; Viam offers three different
-components that can carry it, at different fidelity.
+A VLA emits one continuous gripper value per tick; Viam offers five different
+ways to carry it, at different fidelity.
 
 **`arm_joint`** — recommended default. The gripper rides the arm's own joint vector (SO-100-style
 drivers commonly expose it as the last joint), so read and write cost no extra round trip.
@@ -454,20 +454,88 @@ resolution). Value is normalized `0.0`–`1.0` and mapped onto `[min_deg, max_de
 ```
 
 **`gripper`, `mode: "inputs"`** — the symmetric `get_current_inputs()`/`go_to_inputs()`
-pair, preserving proportional control. Preferred whenever the driver implements both
-(they are abstract SDK methods, so not every driver does).
+pair. Usable only against a driver whose gripper model is **jointed**; for the
+common zero-DOF case it refuses at startup (see below), so reach for
+`do_command` first if you want proportional control. Both methods are abstract
+in the SDK, so not every driver implements them either.
+
+`get_current_inputs()`/`go_to_inputs()` are a *frame-system* interface, not
+an aperture channel: one value per kinematic DOF, in radians or meters. That
+only carries a usable aperture when the driver's gripper model is
+**jointed** — and most gripper models are zero-DOF, including
+`devrel:so101:gripper`, so against those the adapter now refuses at startup
+rather than reporting a permanently-open gripper. Unlike every other
+variant, `inputs` and `threshold` do not normalize on either side: `read()`
+hands the controller the driver's raw radians/meters value untouched
+(`_read_first_input` returns `float(values[0])` straight through). This is
+a known limitation, accepted because no driver we support actually has a
+jointed gripper model — `do_command` is the variant that normalizes
+honestly for one.
+
+`InputsGripper.write()` catches only `NotImplementedError` to attach the
+"reconfigure to threshold" hint, but a Go driver's `errors.ErrUnsupported`
+arrives in Python as a `GRPCError`, so that hint never fires for one. In
+practice the empty-inputs guard on `read()` fails first, since reading runs
+before any write can reach this code — so this is a note, not an observed
+defect.
 
 ```json
 { "type": "gripper", "name": "grip", "mode": "inputs" }
 ```
 
-**`gripper`, `mode: "threshold"`** — read via `get_current_inputs()`, write by
-thresholding the normalized value to `open()`/`grab()`. Binary fallback for drivers that
-do not implement `go_to_inputs`.
+**`gripper`, `mode: "threshold"`** — read via `get_current_inputs()` (same
+frame-system/zero-DOF caveat as above), write by thresholding the
+normalized value to `open()`/`grab()`. Binary fallback for drivers that do
+not implement `go_to_inputs`.
 
 ```json
 { "type": "gripper", "name": "grip", "mode": "threshold", "close_threshold": 0.5 }
 ```
+
+**`do_command`** — proportional control for drivers that expose it through
+`DoCommand` rather than the typed API. Requires that the driver implement
+`{"get": true}` → `{<read_key>: number}` and `{"set": number}`.
+`devrel:so101:gripper` and `viam:ufactory:gripper` both do.
+
+`open_value` and `closed_value` are the driver's own native values at each
+extreme and are **required** — there is no safe default, since a percentage
+guess would silently saturate a raw-unit driver within the first percent of
+its travel. They may run in either direction, which is how this variant
+carries a driver whose scale counts *up* toward open.
+
+```json
+{ "type": "do_command", "name": "grip",
+  "open_value": 95.0, "closed_value": 0.0,
+  "write_args": { "wait": false } }
+```
+
+> `write_args: {"wait": false}` is worth setting for so-101 and is why
+> `write_args` exists. Without it `devrel:so101:gripper` blocks up to ~2s per
+> write waiting for the servo to settle — against a 100ms budget at 10 fps. It
+> needs `devrel:so101-arm` recent enough to honor the flag (the gripper's
+> `set`/`set_position` commands gained it alongside the arm's); an older
+> version ignores the key and simply keeps blocking, so setting it is safe
+> either way.
+
+```json
+{ "type": "do_command", "name": "grip", "read_key": "pos",
+  "open_value": 840.0, "closed_value": 2.0 }
+```
+
+`name` is required, as for every variant with its own component. `read_key`
+defaults to `"position"`. `write_args` must be an object, is merged into the
+`set` command, and defaults to `{}`; it may not contain `get` or `set` — those
+are the adapter's own protocol keys, and either one silently stops the gripper
+tracking the policy.
+
+A reading that normalizes more than 0.25 outside `[0, 1]` is refused rather
+than clamped: small excursions are calibration slop (so-101 calls 95 fully
+open while the servo reaches 100), but a large one means the configured
+endpoints do not describe this driver's scale at all.
+
+> The xarm config above is functionally correct but impractical in a 10 fps
+> loop: that driver polls until the jaw settles, up to 10 seconds, with no
+> way to opt out.
 
 **`none`** — no gripper channel.
 
@@ -475,8 +543,29 @@ do not implement `go_to_inputs`.
 { "type": "none" }
 ```
 
-Except for `arm_joint`, every variant's value is normalized `0.0`–`1.0` (`0` = fully
-open), matching how LeRobot datasets typically encode a gripper channel.
+`servo` and `do_command` hand the controller a normalized `0.0`–`1.0` value
+(`0` = fully open), matching how LeRobot datasets typically encode a
+gripper channel. `arm_joint` carries degrees, per `action_units`.
+`inputs`/`threshold` pass the driver's raw frame-system value through
+unnormalized, radians or meters — the known limitation described above.
+
+### Arm writes do not wait for settle
+
+Every tick's arm command is sent with `extra={"wait": false}`. A VLA replaces
+its setpoint on the next tick, so a driver that blocks until the arm
+physically settles would spend the whole tick budget — 100 ms at `fps: 10` —
+waiting for a target about to be superseded. `devrel:so101:arm` defaults to
+waiting, and honours this flag to skip it.
+
+`extra` is a free-form struct, so a driver that does not read `wait` ignores
+it and behaves exactly as before. There is no config switch: if you need the
+blocking behaviour back, that is a code change.
+
+Note this is the *arm* channel only, and it is passed unconditionally. The
+gripper's equivalent is opt-in: set `write_args: {"wait": false}` on a
+`do_command` block, as the so-101 example above does. Both flags reach
+`devrel:so101-arm` through the same helper on its side, so a version that
+honors one honors the other.
 
 ### Full worked example
 
@@ -590,7 +679,8 @@ Applied to every action, in this fixed order, before it reaches the arm:
    sign of wrong units or wrong joint order** — it is deliberately loud rather than
    silently "handled."
 
-A normalized gripper channel (`servo`, `gripper/inputs`, `gripper/threshold`) is exempt
+The trailing gripper channel (`servo`, `gripper/inputs`, `gripper/threshold`,
+`do_command` — everything except `arm_joint`) is exempt
 from the degree-shaped delta and limit clamps — it gets its own `[0, 1]` clamp instead,
 counted separately as `clamp_counts["gripper"]`.
 

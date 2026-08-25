@@ -26,6 +26,7 @@ class FakeArm:
     def __init__(self, positions=None):
         self.positions = list(positions or [0.0] * 6)
         self.moves = []
+        self.move_extras = []
         self.stopped = 0
         self.fail_next_move = False
 
@@ -34,10 +35,21 @@ class FakeArm:
 
         return JointPositions(values=self.positions)
 
-    async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
+    def _record_move(self, positions, extra):
+        """The bookkeeping both arm fakes share.
+
+        Split out so `StalledArm` can override only the part it means to
+        change. It previously duplicated this whole prologue to skip one
+        trailing line, which is how it came to need its own guard test -- the
+        `move_extras` append had to be remembered in two places.
+        """
         if self.fail_next_move:
             raise RuntimeError("arm move failed")
         self.moves.append(positions)
+        self.move_extras.append(extra)
+
+    async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
+        self._record_move(positions, extra)
         # Write into the existing vector rather than replacing it: a commanded
         # action can be narrower than the arm's joint count (gripper on its own
         # component), and replacing would silently shrink the arm.
@@ -65,10 +77,9 @@ class StalledArm(FakeArm):
     """
 
     async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
-        if self.fail_next_move:
-            raise RuntimeError("arm move failed")
-        self.moves.append(positions)
-        # Deliberately does NOT update self.positions -- the whole point.
+        self._record_move(positions, extra)
+        # Deliberately does NOT update self.positions -- the whole point, and
+        # now the only line this override exists to omit.
 
 
 class FakeCamera:
@@ -141,7 +152,10 @@ class FakeServo:
 
 class FakeGripper:
     def __init__(self, inputs=None, supports_inputs=True):
-        self.inputs = list(inputs or [0.0])
+        # `if inputs is None`, not `inputs or [...]`: an explicitly empty list is
+        # a meaningful fixture -- it is what a zero-DOF gripper model reports --
+        # and `or` collapsed it to the default, hiding the case entirely.
+        self.inputs = list([0.0] if inputs is None else inputs)
         self.supports_inputs = supports_inputs
         self.opened = 0
         self.grabbed = 0
@@ -162,3 +176,41 @@ class FakeGripper:
     async def grab(self, **kwargs):
         self.grabbed += 1
         return True
+
+
+class FakeDoCommandGripper:
+    """A gripper whose only proportional control is through ``DoCommand``.
+
+    Mirrors the contract both `devrel:so101:gripper` and
+    `viam:ufactory:gripper` implement: ``{"get": True}`` returns the current
+    position under some key, ``{"set": n}`` commands a new one. Deliberately
+    has no `get_current_inputs`/`go_to_inputs` -- that is the whole reason
+    this variant exists, and omitting them keeps a test that reaches for the
+    wrong API failing loudly.
+
+    `position` is untyped and simply echoed back, so a non-numeric or `None`
+    value (a driver returning a bad payload, or JSON null) reaches the
+    caller unchanged rather than needing a dedicated knob for it. Likewise
+    a driver answering under an unexpected key is just `read_key` set to
+    something other than what the caller configured. An unrecognized
+    command raises `AssertionError` -- kept rather than a bare `assert` so
+    it survives `-O` -- but note that inside the controller tick loop
+    (`src/vla/controller/service.py`), broad `except Exception` handlers
+    launder this into `last_error` text rather than letting it propagate as
+    a stack trace; a service-level test must assert on `last_error` to see
+    it.
+    """
+
+    def __init__(self, position=0.0, read_key="position"):
+        self.position = position
+        self.read_key = read_key
+        self.commands = []
+
+    async def do_command(self, command, *, timeout=None, **kwargs):
+        self.commands.append(dict(command))
+        if command.get("get") is True:
+            return {self.read_key: self.position}
+        if "set" in command:
+            self.position = command["set"]
+            return {self.read_key: self.position}
+        raise AssertionError(f"unexpected command {command!r}")

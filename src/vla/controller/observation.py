@@ -105,7 +105,7 @@ class ObservationBuilder:
         # budget and two serial camera reads can consume most of it.
         tasks: list[Any] = [self._read_camera(key) for key in keys]
         tasks.append(self._arm.get_joint_positions())
-        needs_gripper_read = self._gripper.in_state and self._gripper.arm_joint_index is None
+        needs_gripper_read = self._gripper.has_normalized_tail
         if needs_gripper_read:
             tasks.append(self._gripper.read())
 
@@ -280,7 +280,7 @@ class ObservationBuilder:
         if not self._gripper.in_state:
             return converted
 
-        if self._gripper.arm_joint_index is not None:
+        if not self._gripper.has_normalized_tail:
             idx = self._gripper.arm_joint_index
             if idx < 0 or idx >= len(joint_degrees):
                 raise ObservationError(

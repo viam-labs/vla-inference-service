@@ -76,7 +76,7 @@ from typing import Any
 
 from vla.config_util import ConfigError, as_bool, as_choice, as_float, as_int, as_str
 
-from .gripper import GRIPPER_TYPES
+from .gripper import GRIPPER_TYPES, GRIPPER_TYPES_NEEDING_DEPENDENCY
 from .observation import DEFAULT_DURATION_WARN_S, STALE_FRAME_WARN_S
 from .units import SUPPORTED_UNITS
 
@@ -326,6 +326,6 @@ class ControllerConfig:
     def dependencies(self) -> list[str]:
         deps = [self.policy_service, self.arm, *self.cameras.values()]
         name = self.gripper.get("name")
-        if self.gripper.get("type") in ("servo", "gripper") and name:
+        if self.gripper.get("type") in GRIPPER_TYPES_NEEDING_DEPENDENCY and name:
             deps.append(name)
         return deps

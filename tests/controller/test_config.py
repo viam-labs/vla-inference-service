@@ -18,6 +18,7 @@ given `fps`.
 import pytest
 
 from vla.controller.config import ConfigError, ControllerConfig, SafetyConfig
+from vla.controller.gripper import GRIPPER_TYPES, make_gripper_adapter
 
 
 BASE = {
@@ -222,11 +223,39 @@ def test_rejects_unknown_gripper_type():
         ControllerConfig.parse({**BASE, "gripper": {"type": "claw"}})
 
 
-@pytest.mark.parametrize("kind", ["arm_joint", "servo", "gripper", "none"])
+# Keyed by kind, not a positional/chained-conditional shape, so that adding a
+# new GRIPPER_TYPES entry without a matching key here fails loudly (KeyError)
+# in every test below that indexes it, instead of silently falling through a
+# stale branch the way an `if kind == ...` chain would.
+GRIPPER_EXTRA = {
+    "arm_joint": {"joint_index": 5},
+    "servo": {"name": "grip"},
+    "gripper": {"name": "grip"},
+    "do_command": {"name": "grip", "open_value": 95.0, "closed_value": 0.0},
+    "none": {},
+}
+
+
+@pytest.mark.parametrize("kind", GRIPPER_TYPES)
 def test_accepts_every_known_gripper_type(kind):
-    extra = {"joint_index": 5} if kind == "arm_joint" else {"name": "g"} if kind != "none" else {}
-    cfg = ControllerConfig.parse({**BASE, "gripper": {"type": kind, **extra}})
+    cfg = ControllerConfig.parse({**BASE, "gripper": {"type": kind, **GRIPPER_EXTRA[kind]}})
     assert cfg.gripper["type"] == kind
+
+
+@pytest.mark.parametrize("kind", GRIPPER_TYPES)
+def test_dependencies_cover_what_the_adapter_needs(kind):
+    """`dependencies()` must name every resource the built adapter will ask for.
+
+    It has to guess before any adapter exists, from a hardcoded tuple of type
+    strings; the adapter's own `dependency_name` is the truth, available only
+    after construction. Deriving the parametrization from GRIPPER_TYPES means a
+    new variant whose type was never added to that tuple fails here, at CI,
+    instead of as an AttributeError at robot start.
+    """
+    cfg = ControllerConfig.parse({**BASE, "gripper": {"type": kind, **GRIPPER_EXTRA[kind]}})
+    adapter = make_gripper_adapter(cfg.gripper, {"grip": object()})
+    if adapter.dependency_name:
+        assert adapter.dependency_name in cfg.dependencies()
 
 
 # ---------------------------------------------------------------------------

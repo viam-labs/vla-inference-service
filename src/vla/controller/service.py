@@ -352,7 +352,7 @@ class VLAController(Generic, EasyResource):
                 max_joint_delta_degs=s.max_joint_delta_degs,
                 max_start_delta_degs=s.max_start_delta_degs,
                 joint_limits_degs=s.joint_limits_degs,
-                gripper_in_degrees=(not gripper.in_state) or gripper.uses_degrees,
+                gripper_in_degrees=not gripper.has_normalized_tail,
             )
         )
 
@@ -411,14 +411,22 @@ class VLAController(Generic, EasyResource):
         happens on the *first real tick*, after the arm has already been
         commanded once -- breaking the refuse-before-motion discipline every
         other check in `_run()` maintains. Reads the gripper's own current
-        value and writes it straight back: a no-op for `InputsGripper`/
-        `ServoGripper` (they land on the same value already reported), and
-        for `ThresholdGripper` it is exactly the same "first write always
+        value and writes it straight back: a no-op for `ServoGripper` (it
+        lands on the same value already reported), and for `ThresholdGripper`
+        it is exactly the same "first write always
         actuates once" behavior that would happen on tick 1 regardless --
-        merely moved earlier, before any arm command. `arm_joint`/`none` have
-        no separate gripper component to probe.
+        merely moved earlier, before any arm command. Not a no-op for
+        `InputsGripper` either: its `read()` returns the driver's raw
+        frame-system value while its `write()` sends `_clamp_unit(value)`, so
+        any reading outside [0, 1] is written back changed. `DoCommandGripper` is
+        normally a no-op the same way too, but not always: `read()` clamps
+        to [0, 1], so a driver resting outside its configured endpoints
+        reads as an endpoint rather than its true position -- an so-101
+        resting at 98% (open_value=95) reads back as 0.0, and writing that
+        back commands 95, a real ~3% aperture move before any arm motion.
+        `arm_joint`/`none` have no separate gripper component to probe.
         """
-        if not gripper.in_state or gripper.arm_joint_index is not None:
+        if not gripper.has_normalized_tail:
             return
         value = await gripper.read()
         await gripper.write(value)
@@ -613,7 +621,19 @@ class VLAController(Generic, EasyResource):
 
             consecutive_starved_ticks = 0
 
-            degrees = to_degrees(np.asarray(action, dtype=np.float32), cfg.action_units)
+            # Convert the *driven joints* only. A normalized gripper channel
+            # (every variant except `arm_joint`) is already 0.0-1.0 and must
+            # not be scaled: under `action_units="radians"` an unconditional
+            # conversion multiplies it by ~57.3, so a policy output of 0.5
+            # becomes 28.6, the safety layer clamps it to 1.0, and the gripper
+            # sits fully closed on every tick. `observation.py`'s read side
+            # already splits this way (see its `# already normalized` tail);
+            # the write side has to match or the two disagree about units.
+            raw_action = np.asarray(action, dtype=np.float32)
+            head = len(raw_action) - (1 if gripper.has_normalized_tail else 0)
+            degrees = np.concatenate(
+                [to_degrees(raw_action[:head], cfg.action_units), raw_action[head:]]
+            )
 
             # Every joint the arm has, not just the driven ones: `positions`
             # below seeds from the *measured* values so an un-driven joint
@@ -657,8 +677,15 @@ class VLAController(Generic, EasyResource):
             # this point inference already succeeded and safety already
             # cleared the action, so there is no "try again next tick" that
             # would be safe -- the arm itself is reporting the fault.
-            await arm.move_to_joint_positions(JointPositions(values=target))
-            if gripper.in_state and gripper.arm_joint_index is None:
+            #
+            # `wait: False` because the next tick supersedes this setpoint: a driver
+            # that blocks until the arm physically settles (so-101's default) spends
+            # the entire tick budget waiting for a target we are about to replace.
+            # Free-form `extra`, so a driver that does not read the key ignores it.
+            await arm.move_to_joint_positions(
+                JointPositions(values=target), extra={"wait": False}
+            )
+            if gripper.has_normalized_tail:
                 await gripper.write(float(safe[-1]))
 
             last_tick = self._record_tick(last_tick)

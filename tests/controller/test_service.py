@@ -25,7 +25,7 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 from viam.proto.app.robot import ServiceConfig
 
-from tests.fakes import FakeArm, FakeCamera, FakeGripper, StalledArm
+from tests.fakes import FakeArm, FakeCamera, FakeDoCommandGripper, FakeGripper, StalledArm
 from vla.controller.service import VLAController
 from vla.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
@@ -106,6 +106,18 @@ class FakePolicyClient:
                 "latency_s": 0.001,
             }
         raise ValueError(name)
+
+
+# The one `do_command` gripper block every test below shares. so-101's scale:
+# percent, counting *up* toward open, which is inverted from this module's
+# `0.0 = fully open` convention -- so a fully-closed action of 1.0 maps to a
+# driver setpoint of 0.0. The assertions depend on that pair.
+_DO_COMMAND_GRIPPER = {
+    "type": "do_command",
+    "name": "g",
+    "open_value": 95.0,
+    "closed_value": 0.0,
+}
 
 
 def _config(**overrides):
@@ -418,6 +430,38 @@ async def test_delta_clamp_uses_measured_position_not_last_commanded():
             assert v == pytest.approx(8.0), list(move.values)
 
 
+async def test_radians_conversion_does_not_scale_a_normalized_gripper_channel():
+    """`action_units="radians"` must convert the driven joints only.
+
+    The gripper channel of every non-`arm_joint` variant is already 0.0-1.0.
+    Converting it too multiplies by ~57.3, so a policy output of 0.5 arrives as
+    28.6, the safety layer clamps it to 1.0, and the gripper sits fully closed
+    on every tick -- silently, with only a per-tick clamp warning. This is the
+    documented SO-100/101 configuration (radians checkpoint, degrees driver),
+    so it is the combination most likely to be run, and `observation.py`'s read
+    side already splits the conversion the same way.
+    """
+    arm = FakeArm(positions=[0.0] * 5)
+    g = FakeDoCommandGripper(position=95.0)
+    policy = FakePolicyClient(action_dim=6, action_value=0.5)
+    svc = _svc(
+        config=_config(
+            action_units="radians",
+            safety={"max_start_delta_degs": 1000.0},
+            gripper=_DO_COMMAND_GRIPPER,
+        ),
+        deps=_deps(policy=policy, arm=arm, g=g),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+    sets = [c["set"] for c in g.commands if "set" in c]
+    assert sets, g.commands
+    # 0.5 normalized on a 95/0 scale is the midpoint, 47.5. Scaled by 57.3 it
+    # would clamp to 1.0 and command 0.0 -- fully closed.
+    assert sets[-1] == pytest.approx(47.5), sets
+
+
 async def test_action_units_radians_are_converted_before_commanding_the_arm():
     # If action_units="radians" -> degrees conversion were skipped (an
     # identity mutation), a policy emitting pi/2 rad (~90deg) would be
@@ -526,8 +570,15 @@ async def test_gripper_write_happens_after_arm_move_for_non_arm_joint_gripper():
 
 
 async def test_gripper_write_order_is_after_arm_move_not_before():
-    """Both happening is necessary but not sufficient -- prove the order too:
-    a swap (write the gripper, then move the arm) must be caught."""
+    """Both happening is necessary but not sufficient -- prove the order too.
+
+    Asserts on a prefix, not on events[first_arm_idx + 1]: with ~8 ticks in
+    the sleep window, the looser index-based form is satisfied by the NEXT
+    tick's gripper write even when the in-tick order is swapped (write then
+    move) -- verified by mutation, see git history for this test. Only the
+    preflight probe's own write may precede the first arm move; within a
+    tick the gripper write must follow it immediately.
+    """
     events: list[str] = []
     arm = FakeArm(positions=[0.0] * 5)
     gripper = FakeGripper()
@@ -555,12 +606,13 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
 
-    # events[0] is the pre-flight probe's own gripper write, before any arm
-    # move -- expected and fine. What matters is that once the arm starts
-    # moving, its own tick's gripper write always comes right after it, not
-    # before.
-    first_arm_idx = events.index("arm")
-    assert events[first_arm_idx + 1] == "gripper", events
+    # Only the preflight write may precede the first arm move; within a tick
+    # the gripper write must follow it. Asserting on a prefix rather than on
+    # events[first_arm_idx + 1] is load-bearing: with ~8 ticks in the window,
+    # the looser form is satisfied by the NEXT tick's write even when the
+    # in-tick order is swapped.
+    assert events.index("arm") == 1, events
+    assert events[:3] == ["gripper", "arm", "gripper"], events
 
 
 async def test_gripper_incompatible_mode_is_caught_before_any_arm_motion():
@@ -580,6 +632,125 @@ async def test_gripper_incompatible_mode_is_caught_before_any_arm_motion():
     assert "go_to_inputs" in status["last_error"] or "does not implement" in status["last_error"]
     assert len(arm.moves) == 0, "the arm must never have been commanded before the gripper probe failed"
     assert arm.stopped >= 1
+
+
+async def test_do_command_gripper_is_driven_through_a_real_tick():
+    """5 driven joints + 1 gripper channel accounted for, and the gripper's
+    own component actually receives the policy's action."""
+    arm = FakeArm(positions=[0.0] * 5)
+    g = FakeDoCommandGripper(position=95.0)
+    policy = FakePolicyClient(action_dim=6, action_value=1.0)
+    svc = _svc(
+        config=_config(
+            gripper=_DO_COMMAND_GRIPPER
+        ),
+        deps=_deps(policy=policy, arm=arm, g=g),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    # Status BEFORE stop, and via its own command: `stop` returns {"ok": True}
+    # (service.py:171-172), so reading last_error off its result is a KeyError.
+    # This is the established pattern -- see test_service.py:455.
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["last_error"] == ""
+    # A policy action of 1.0 is fully closed, which on this driver's scale is 0.0.
+    sets = [c["set"] for c in g.commands if "set" in c]
+    assert sets, g.commands
+    assert sets[-1] == pytest.approx(0.0)
+
+
+async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
+    """Same ordering guarantee the other non-arm_joint variants have.
+
+    See test_gripper_write_order_is_after_arm_move_not_before for why this
+    asserts on a prefix rather than on events[first_arm_idx + 1]: with ~8
+    ticks in the sleep window, the index-based form is satisfied by the
+    NEXT tick's gripper write even when the in-tick order is swapped.
+    """
+    events = []
+    arm = FakeArm(positions=[0.0] * 5)
+    g = FakeDoCommandGripper(position=95.0)
+    policy = FakePolicyClient(action_dim=6, action_value=1.0)
+
+    real_move = arm.move_to_joint_positions
+    real_do = g.do_command
+
+    async def tracked_move(*a, **kw):
+        events.append("arm")
+        return await real_move(*a, **kw)
+
+    async def tracked_do(command, **kw):
+        if "set" in command:
+            events.append("gripper")
+        return await real_do(command, **kw)
+
+    arm.move_to_joint_positions = tracked_move
+    g.do_command = tracked_do
+
+    svc = _svc(
+        config=_config(
+            gripper=_DO_COMMAND_GRIPPER
+        ),
+        deps=_deps(policy=policy, arm=arm, g=g),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+    # Same prefix assertion as the sibling test above, for the same reason.
+    assert events.index("arm") == 1, events
+    assert events[:3] == ["gripper", "arm", "gripper"], events
+
+
+@pytest.mark.parametrize(
+    "gripper_block,gripper_factory,expected",
+    [
+        (
+            _DO_COMMAND_GRIPPER,
+            lambda: FakeDoCommandGripper(read_key="some_other_key"),
+            "some_other_key",
+        ),
+        (
+            {"type": "gripper", "name": "g", "mode": "inputs"},
+            lambda: FakeGripper(inputs=[]),
+            "no kinematic DOF",
+        ),
+    ],
+    ids=["do_command-read-key-mismatch", "zero-dof-inputs"],
+)
+async def test_a_failing_gripper_read_is_caught_before_any_arm_motion(
+    gripper_block, gripper_factory, expected
+):
+    """Both refusals have to surface at *startup*, not mid-episode.
+
+    `len(arm.moves) == 0` alone would pass even with `_preflight_gripper`
+    deleted: both of these are `read()` failures, and the tick loop's own
+    `gripper.read()` -- called from `ObservationBuilder.build()`, before any arm
+    command -- fails for the identical reason on tick 1. `camera.reads == 0` is
+    what actually pins it on the probe: `build()` reads the camera and the
+    gripper concurrently via `asyncio.gather`, so a failure surfacing from the
+    tick's own read would still show >= 1 camera read. Zero reads means the loop
+    -- and its `ObservationBuilder` -- never ran at all, which only the
+    pre-flight probe can produce. Adapter-level tests in `test_gripper.py`
+    cannot prove any of this.
+
+    `action_dim=6` matters: with 5 `state_joint_indices` and `in_state=True` the
+    expected dim is 6, and a mismatch would raise in `_check_action_dim` before
+    the probe -- passing the arm-motion assertion for entirely the wrong reason.
+    """
+    arm = FakeArm(positions=[0.0] * 5)
+    camera = FakeCamera()
+    policy = FakePolicyClient(action_dim=6)
+    svc = _svc(
+        config=_config(gripper=gripper_block),
+        deps=_deps(policy=policy, arm=arm, camera=camera, g=gripper_factory()),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert expected in status["last_error"]
+    assert len(arm.moves) == 0, "the arm must never move before the gripper probe fails"
+    assert arm.stopped >= 1
+    assert camera.reads == 0
 
 
 async def test_extra_configured_camera_not_needed_by_policy_is_ignored():
@@ -1810,3 +1981,36 @@ async def test_async_mode_warns_when_queue_threshold_too_low_for_observed_latenc
 
     messages = [r.message for r in caplog.records]
     assert any("queue_threshold=0" in m and "queue_threshold>=" in m for m in messages), messages
+
+
+@pytest.mark.parametrize("cls", [FakeArm, StalledArm])
+async def test_fake_arm_records_the_extra_it_was_called_with(cls):
+    """`extra` carries the driver-facing wait flag, so a fake that discards it
+    cannot verify what the controller actually sent. Both arm fakes record it:
+    `StalledArm` overrides the method wholesale, so its copy of the append is
+    the one an edit will forget.
+    """
+    from viam.proto.component.arm import JointPositions
+
+    arm = cls(positions=[0.0] * 6)
+    await arm.move_to_joint_positions(JointPositions(values=[0.0] * 6), extra={"wait": False})
+    assert arm.move_extras == [{"wait": False}]
+    assert len(arm.moves) == len(arm.move_extras)
+
+    arm2 = cls(positions=[0.0] * 6)
+    await arm2.move_to_joint_positions(JointPositions(values=[0.0] * 6))
+    assert arm2.move_extras == [None]
+    assert len(arm2.moves) == len(arm2.move_extras)
+
+
+async def test_arm_move_asks_the_driver_not_to_wait_for_settle():
+    """A driver that blocks until the arm settles burns the whole tick budget
+    waiting for a setpoint the next tick is about to replace. Drivers that do
+    not read `wait` ignore it."""
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(config=_config(), deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await asyncio.sleep(0.15)
+    await svc.do_command({"command": "stop"})
+    assert arm.move_extras, "the arm was never commanded"
+    assert all(e == {"wait": False} for e in arm.move_extras), arm.move_extras
