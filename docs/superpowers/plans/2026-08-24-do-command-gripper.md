@@ -615,6 +615,21 @@ async def test_do_command_read_errors_on_a_non_numeric_value(raw):
         await adapter.read()
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "inf", "-inf"],
+)
+async def test_do_command_read_refuses_a_non_finite_reading(raw):
+    """`_clamp_unit` would turn these into a fabricated rail reading -- nan and
+    +inf both land on 0.0, i.e. "confidently fully open" -- so they are refused
+    instead. Matches how `config_util.as_float` already treats non-finite
+    config values."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
+    with pytest.raises(GripperRuntimeError, match="non-finite"):
+        await adapter.read()
+
+
 async def test_do_command_read_emits_the_get_command():
     g = FakeDoCommandGripper(position=95.0)
     await _do_cmd(g).read()
@@ -651,6 +666,17 @@ Add to `DoCommandGripper`:
                 f"gripper {self.dependency_name!r} returned a non-numeric "
                 f"{self._read_key!r}: {value!r} ({type(value).__name__})"
             )
+        # Non-finite is refused rather than clamped: _clamp_unit would turn nan
+        # and +inf into 0.0 -- "confidently fully open" -- and -inf into 1.0,
+        # fabricating an endpoint reading. This mirrors config_util.as_float,
+        # which already rejects non-finite config values for the same reason.
+        if not math.isfinite(value):
+            raise GripperRuntimeError(
+                f"gripper {self.dependency_name!r} returned a non-finite "
+                f"{self._read_key!r}: {value!r}. A non-finite reading would clamp to a "
+                "fabricated endpoint and report a confidently wrong aperture to the "
+                "policy, so it is refused rather than silently normalized."
+            )
         # Clamped because the endpoints are a *calibration*, not a hard travel
         # limit: so-101 calls 95 fully open while the servo reaches 100.
         return _clamp_unit(
@@ -665,7 +691,7 @@ Add to `DoCommandGripper`:
 uv run pytest tests/controller/test_gripper.py -k "do_command_read" -v
 ```
 
-Expected: 14 passed — 3 (inverted scale) + 3 (xarm units) + 2 (clamp rails) + 1 (configured key) + 1 (absent key) + 3 (non-numeric: string, bool, json-null) + 1 (emits get).
+Expected: 17 passed — 3 (inverted scale) + 3 (xarm units) + 2 (clamp rails) + 1 (configured key) + 1 (absent key) + 3 (non-numeric: string, bool, json-null) + 3 (non-finite: nan, inf, -inf) + 1 (emits get).
 
 - [ ] **Step 5: Commit**
 
