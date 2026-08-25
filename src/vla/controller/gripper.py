@@ -38,6 +38,7 @@ described above, not a normalized aperture.
 from __future__ import annotations
 
 import abc
+import math
 from typing import Any, Mapping
 
 from vla.config_util import ConfigError, VLAError
@@ -319,6 +320,13 @@ class DoCommandGripper(GripperAdapter):
             raise GripperRuntimeError(
                 f"gripper {self.dependency_name!r} returned a non-numeric "
                 f"{self._read_key!r}: {value!r} ({type(value).__name__})"
+            )
+        if not math.isfinite(value):
+            raise GripperRuntimeError(
+                f"gripper {self.dependency_name!r} returned a non-finite "
+                f"{self._read_key!r}: {value!r}. A non-finite reading would clamp to a "
+                "fabricated endpoint and report a confidently wrong aperture to the "
+                "policy, so it is refused rather than silently normalized."
             )
         # Clamped because the endpoints are a *calibration*, not a hard travel
         # limit: so-101 calls 95 fully open while the servo reaches 100.

@@ -595,3 +595,18 @@ async def test_do_command_read_emits_the_get_command():
     g = FakeDoCommandGripper(position=95.0)
     await _do_cmd(g).read()
     assert g.commands == [{"get": True}]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "inf", "-inf"],
+)
+async def test_do_command_read_refuses_a_non_finite_reading(raw):
+    """`_clamp_unit` would turn these into a fabricated rail reading -- nan and
+    +inf both land on 0.0, i.e. "confidently fully open" -- so they are refused
+    instead. Matches how `config_util.as_float` already treats non-finite
+    config values."""
+    adapter = _do_cmd(FakeDoCommandGripper(position=raw))
+    with pytest.raises(GripperRuntimeError, match="non-finite"):
+        await adapter.read()
