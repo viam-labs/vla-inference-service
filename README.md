@@ -772,6 +772,52 @@ mise run test-all     # everything, including integration/differential (needs th
 uv sync --extra lerobot  # required once before test-all, or before running integration/differential directly
 ```
 
+### Validating a checkpoint — `tools/replay_eval.py`
+
+Open-loop action-error replay: feeds a training episode's own observations through
+the deployed `policy` service and diffs the predicted chunk against the actions the
+dataset recorded. This is the only check here with a ground-truth answer, and it is
+what separates a bad observation pipeline (units, joint order, camera assignment,
+image geometry, task string) from a weak policy — on a robot the two look identical.
+
+```bash
+uv pip install 'lerobot[dataset]'   # once; deliberately not in the `lerobot` extra
+export VIAM_API_KEY=... VIAM_API_KEY_ID=...
+
+# is the MODEL faithful?
+mise run replay-eval -- --address $FQDN --repo-id you/box-flaps --episode 0
+
+# is the PIPELINE faithful? same frames, your camera geometry + controller resize
+mise run replay-eval -- --address $FQDN --repo-id you/box-flaps --episode 0 \
+    --camera-resolution 640x480 --image-fit pad
+```
+
+If the dataset's image keys differ from the policy's slots — normal for a fine-tuned
+checkpoint, whose `camera1`/`camera2` slot names are what lerobot's
+`RenameObservationsProcessorStep` rewrote the dataset's own key names onto — map them
+explicitly:
+
+```bash
+mise run replay-eval -- --address $FQDN --repo-id you/box-flaps \
+    --key-map observation.images.realsense_cam=observation.images.camera1 \
+    --key-map observation.images.wrist=observation.images.camera2
+```
+
+The tool will not guess this, even when the counts match. Slot names carry no trace of
+which physical camera each one held, and a policy fed swapped views still produces
+confident, plausible motion — the hardest failure to spot on a robot. Run both
+orderings instead: the one with dramatically lower action error is correct, and it is
+also the ground truth for the controller's own `cameras` mapping.
+
+Read the two runs against each other, not either one's absolute value: clean model
+run + dirty pipeline run means the fault is entirely in observation wiring. Within a
+run, error at horizon offset `k=0` that is already large points at units or joint
+order; error that starts small and grows with `k` is ordinary open-loop drift.
+Low error here is **necessary but not sufficient** — it cannot detect compounding
+closed-loop error, only rule out the config faults.
+
+`--self-check` runs the metric and geometry paths offline, with no network or dataset.
+
 - `mise run test` runs `pytest -m 'not integration and not differential'` — this is the
   suite that must stay green (and torch-free) in a base `uv sync`, with no `lerobot`
   extra installed at all. It is the payoff for the `PolicyBackend` seam: everything

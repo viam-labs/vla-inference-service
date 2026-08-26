@@ -4,6 +4,11 @@ run = "rm -rf dist && uv build --wheel"
 [tasks.clean]
 run = "rm -rf dist module.tar.gz"
 
+[tasks.replay-eval]
+# Offline action-error replay against a training dataset. Needs the dataset
+# extra (`uv pip install 'lerobot[dataset]'`) and VIAM_API_KEY/_ID.
+run = "uv run python tools/replay_eval.py"
+
 [tasks.test]
 run = "uv run pytest -m 'not integration and not differential' -v"
 
