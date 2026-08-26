@@ -321,24 +321,33 @@ class CliPolicy:
     async def do_command(self, command: dict) -> dict:
         import json
         import subprocess
+        import time
 
         def call() -> dict:
-            proc = subprocess.run(
-                ["viam", "machines", "part", "run",
-                 "--part", self._part_id,
-                 "--method", "DoCommand",
-                 "--component", self._service,
-                 "--data", json.dumps({"command": command})],
-                capture_output=True, text=True,
-            )
-            out = proc.stdout
-            start = out.find("{")
-            if proc.returncode != 0 or start < 0:
-                raise SystemExit(
-                    f"viam CLI call failed (exit {proc.returncode}):\n"
-                    f"{(proc.stderr or out).strip()[:600]}"
+            # Each call is a fresh process and a fresh WebRTC handshake, and
+            # those fail transiently ("host appears to be offline") on a
+            # machine that is demonstrably up. A run is dozens of calls over
+            # several minutes, so one blip must not discard the whole thing.
+            last = ""
+            for attempt in range(3):
+                proc = subprocess.run(
+                    ["viam", "machines", "part", "run",
+                     "--part", self._part_id,
+                     "--method", "DoCommand",
+                     "--component", self._service,
+                     "--data", json.dumps({"command": command})],
+                    capture_output=True, text=True,
                 )
-            return json.loads(out[start:])["result"]
+                out = proc.stdout
+                start = out.find("{")
+                if proc.returncode == 0 and start >= 0:
+                    return json.loads(out[start:])["result"]
+                last = (proc.stderr or out).strip()[:600]
+                if attempt < 2:
+                    print(f"    (retry {attempt + 1}/2 after: {last.splitlines()[-1][:120]})",
+                          flush=True)
+                    time.sleep(5 * (attempt + 1))
+            raise SystemExit(f"viam CLI call failed after 3 attempts:\n{last}")
 
         return await asyncio.to_thread(call)
 
