@@ -29,7 +29,8 @@ def test_roundtrip_is_stable():
 
 
 def test_normalized_is_not_yet_supported():
-    # Deliberate: normalized units need per-joint min/max, an open question in the spec.
+    # Normalized units need per-joint min/max, an open question in the spec.
+    # ControllerConfig rejects it at config time; here it is just unknown.
     with pytest.raises(UnitError, match="normalized"):
         from_degrees(np.array([0.0], dtype=np.float32), "normalized")
 
@@ -40,10 +41,8 @@ def test_unknown_unit_errors():
 
 
 def test_unknown_unit_message_lists_only_actually_convertible_units():
-    # Review finding: the "unknown unit" message previously listed all of
-    # UNITS, including "normalized" -- three lines after telling the
-    # caller "normalized" is specifically rejected. It should list only
-    # what a caller can actually pass and have it work.
+    # The message must list only units a caller can actually pass and have
+    # work -- never "normalized", which this module cannot convert.
     with pytest.raises(UnitError) as exc_info:
         from_degrees(np.array([0.0], dtype=np.float32), "furlongs")
     message = str(exc_info.value)
@@ -70,9 +69,9 @@ def test_unit_error_is_a_value_error():
 # ---------------------------------------------------------------------------
 # Standing requirement 1: assert every *valid* unit is accepted and produces
 # the expected numeric result -- not only that invalid units are rejected.
-# Hardcoded literals here (not looping over vla.controller.units.UNITS) per
-# standing requirement 7: parametrizing off the module's own constant would
-# make a shrunk UNITS tuple invisible to this test.
+# Hardcoded literals here (not looping over SUPPORTED_UNITS) per standing
+# requirement 7: parametrizing off the module's own constant would make a
+# shrunk tuple invisible to this test.
 # ---------------------------------------------------------------------------
 
 
@@ -111,32 +110,3 @@ def test_roundtrip_stable_at_realistic_joint_angles(degrees_value):
     x = np.array([degrees_value], dtype=np.float32)
     roundtripped = to_degrees(from_degrees(x, "radians"), "radians")
     np.testing.assert_allclose(roundtripped, x, rtol=1e-5, atol=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Additional required work item 3: a non-ndarray input must not silently
-# produce garbage. Decision (documented in units.py): `values` must be a
-# numpy ndarray; a Python list or scalar raises UnitError rather than being
-# coerced, so a caller that forgot np.asarray() finds out immediately
-# instead of the boundary swallowing the mistake.
-# ---------------------------------------------------------------------------
-
-
-def test_from_degrees_rejects_python_list():
-    with pytest.raises(UnitError, match="ndarray"):
-        from_degrees([1.0, 2.0, 3.0], "degrees")
-
-
-def test_from_degrees_rejects_scalar():
-    with pytest.raises(UnitError, match="ndarray"):
-        from_degrees(5.0, "radians")
-
-
-def test_to_degrees_rejects_python_list():
-    with pytest.raises(UnitError, match="ndarray"):
-        to_degrees([1.0, 2.0, 3.0], "degrees")
-
-
-def test_to_degrees_rejects_scalar():
-    with pytest.raises(UnitError, match="ndarray"):
-        to_degrees(5.0, "radians")

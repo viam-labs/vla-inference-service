@@ -1,9 +1,7 @@
 """Assemble one policy observation from Viam cameras and the arm.
 
-Camera reads use the real installed-sdk API, `get_images()` (plural),
-returning `(Sequence[NamedImage], ResponseMetadata)` -- not the `get_image()`
-singular an earlier plan draft assumed, which does not exist on viam-sdk
-0.80.0.
+Camera reads use `get_images()` (plural), returning `(Sequence[NamedImage],
+ResponseMetadata)`. There is no `get_image()` singular on viam-sdk 0.80.0.
 
 Reads are gathered, not sequential: at 10 Hz the whole tick has a 100 ms
 budget, and two serial camera reads alone can consume most of it. A camera

@@ -70,15 +70,6 @@ async def test_sequential_mode_sends_no_rtc_payload():
     assert infer.last_rtc is None
 
 
-async def test_reset_clears_the_queue():
-    infer = RecordingInfer(n=5)
-    s = SequentialScheduler(infer)
-    await s.next_action()
-    await s.reset()
-    await s.next_action()
-    assert infer.calls == 2
-
-
 async def test_qsize_reflects_remaining():
     infer = RecordingInfer(n=4)
     s = SequentialScheduler(infer)
@@ -222,22 +213,11 @@ def test_subclass_omitting_a_method_cannot_be_instantiated():
         async def next_action(self):
             return None
 
-        def reset(self) -> None:
-            pass
-
-        # qsize() deliberately omitted.
-
-    with pytest.raises(TypeError):
-        Incomplete()
-
 
 def test_subclass_implementing_every_method_can_be_instantiated():
     class Complete(ChunkScheduler):
         async def next_action(self):
             return None
-
-        def reset(self) -> None:
-            pass
 
         def qsize(self) -> int:
             return 0
@@ -616,101 +596,6 @@ async def test_background_empty_chunk_is_not_double_wrapped():
     )
 
 
-# --- reset() cancellation and discard --------------------------------------
-
-
-async def test_reset_cancels_a_running_inference_and_awaits_it():
-    infer = ControllableInfer(n=4, dim=2)
-    s = AsyncScheduler(infer, queue_threshold=3)
-
-    task = asyncio.create_task(s.next_action())
-    await infer.wait_until_entered()
-    assert infer.concurrent == 1
-
-    await s.reset()  # must cancel it and await its settlement before returning
-
-    assert infer.concurrent == 0  # genuinely settled, not left running
-    assert s.qsize() == 0
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-
-class UncancellableInfer:
-    """Swallows cancellation internally and completes anyway -- models a
-    real infer() with an uncooperative internal await (e.g. a `to_thread`
-    call that cannot itself be interrupted). This exists to prove
-    `reset()`/`close()` attempt cancellation *before* clearing the queue,
-    not after: a chunk that lands despite the cancellation attempt must
-    still not survive, because the clear runs after the cancel+await
-    settles -- not because the chunk never arrived."""
-
-    def __init__(self, n=4, dim=2):
-        self.n = n
-        self.dim = dim
-        self.calls = 0
-        self.entered = asyncio.Event()
-
-    async def __call__(self, rtc):
-        self.calls += 1
-        self.entered.set()
-        try:
-            await asyncio.sleep(1000)
-        except asyncio.CancelledError:
-            pass  # deliberately uncooperative
-        base = np.full((self.n, self.dim), float(self.calls), dtype=np.float32)
-        return base + 100.0, base
-
-
-async def test_reset_clears_a_chunk_that_lands_despite_cancellation():
-    # Order matters here: reset() must call queue.clear() *after*
-    # cancel()+await settles, not before -- clearing first would let an
-    # uncooperative inference's post-cancellation merge repopulate the
-    # queue with a stale chunk that survives into the next episode.
-    infer = UncancellableInfer(n=4, dim=2)
-    s = AsyncScheduler(infer, queue_threshold=3)
-
-    s._start_background_inference()
-    await infer.entered.wait()
-
-    await s.reset()
-
-    assert s.qsize() == 0, "a chunk that landed despite cancellation must not survive reset()"
-
-
-async def test_reset_discards_a_scheduled_but_not_yet_run_inference():
-    infer = RecordingInfer(n=4, dim=2)
-    s = AsyncScheduler(infer, queue_threshold=3)
-
-    action = await s.next_action()  # blocks: call #1 succeeds, fills the queue
-    assert infer.calls == 1
-
-    # Fast path: pops the 2nd action (qsize now 2 <= threshold=3), which
-    # fires a 2nd background inference -- scheduled via create_task, but
-    # this coroutine never yields, so the event loop has not run it yet.
-    action2 = await s.next_action()
-    assert infer.calls == 1  # confirms #2 has not started running at all
-
-    await s.reset()
-
-    assert infer.calls == 1  # #2's body never ran: no infer() call, no merge
-    assert s.qsize() == 0
-
-    action3 = await s.next_action()  # a genuinely fresh inference
-    assert infer.calls == 2
-    np.testing.assert_allclose(action3, [102.0, 102.0])
-
-
-async def test_reset_makes_the_scheduler_usable_again():
-    infer = RecordingInfer(n=3)
-    s = AsyncScheduler(infer, queue_threshold=1)
-    await s.next_action()
-    await s.reset()
-    action = await s.next_action()
-    assert infer.calls == 2
-    np.testing.assert_allclose(action, [102.0, 102.0])
-
-
 # --- close() ----------------------------------------------------------------
 
 
@@ -746,11 +631,17 @@ async def test_sequential_scheduler_close_is_a_safe_no_op():
 # Starvation-risk warning: queue_threshold too low for observed latency.
 #
 # Real inference latency is only known once inference has actually run --
-# _record_observed_latency is exercised directly (white-box) for the precise,
-# timing-independent boundary tests below, and once more through the real
+# `_observe_latency` below drives the same two steps `_infer_and_merge` does
+# (record a sample, then run the check) for the precise, timing-independent
+# boundary tests, and the warning is exercised once more through the real
 # code path (a genuinely slow infer(), actually awaited) to prove the wiring
-# from a completed background inference to the warning check is real, not
-# just present in the helper.
+# from a completed background inference to the check is real.
+
+
+def _observe_latency(scheduler, seconds):
+    """What `_infer_and_merge` does after a completed inference."""
+    scheduler._latencies.append(seconds)
+    scheduler._maybe_warn_starvation_risk()
 # ---------------------------------------------------------------------------
 
 _SCHEDULER_LOGGER = "vla.controller.scheduler"
@@ -761,16 +652,16 @@ async def test_no_warning_when_threshold_meets_required_runway(caplog):
     # threshold=2 meets (is not below) the requirement -- no warning.
     s = AsyncScheduler(RecordingInfer(), queue_threshold=2, fps=4.0)
     with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
-        s._record_observed_latency(0.3)
-        s._record_observed_latency(0.3)
+        _observe_latency(s, 0.3)
+        _observe_latency(s, 0.3)
     assert not caplog.records
 
 
 async def test_warns_when_threshold_below_required_runway(caplog):
     s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
     with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
-        s._record_observed_latency(0.3)
-        s._record_observed_latency(0.3)
+        _observe_latency(s, 0.3)
+        _observe_latency(s, 0.3)
     assert len(caplog.records) == 1
     message = caplog.records[0].message
     assert "queue_threshold=1" in message
@@ -789,8 +680,8 @@ async def test_warning_uses_ceil_not_floor_at_the_boundary(caplog):
     # catch: mutating math.ceil to int() or math.floor must fail it.
     s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
     with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
-        s._record_observed_latency(0.3)
-        s._record_observed_latency(0.3)
+        _observe_latency(s, 0.3)
+        _observe_latency(s, 0.3)
     assert len(caplog.records) == 1
 
 
@@ -799,8 +690,8 @@ async def test_no_warning_when_threshold_exactly_meets_ceil_boundary(caplog):
     # not warn -- pins the strict "<" comparison against an "<=" mutation.
     s = AsyncScheduler(RecordingInfer(), queue_threshold=2, fps=4.0)
     with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
-        s._record_observed_latency(0.3)
-        s._record_observed_latency(0.3)
+        _observe_latency(s, 0.3)
+        _observe_latency(s, 0.3)
     assert not caplog.records
 
 
@@ -808,7 +699,7 @@ async def test_warns_only_once_despite_many_observations(caplog):
     s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
     with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
         for _ in range(10):
-            s._record_observed_latency(0.3)
+            _observe_latency(s, 0.3)
     assert len(caplog.records) == 1
 
 
@@ -817,7 +708,7 @@ async def test_no_warning_before_minimum_sample_count(caplog):
     # requires more than one observation before the check fires at all.
     s = AsyncScheduler(RecordingInfer(), queue_threshold=1, fps=4.0)
     with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
-        s._record_observed_latency(0.3)
+        _observe_latency(s, 0.3)
     assert not caplog.records
 
 

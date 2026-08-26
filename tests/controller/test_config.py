@@ -96,8 +96,10 @@ def test_servo_gripper_adds_dependency():
     assert "grip" in cfg.dependencies()
 
 
-def test_gripper_mode_adds_dependency():
-    cfg = ControllerConfig.parse({**BASE, "gripper": {"type": "gripper", "name": "g2"}})
+def test_do_command_gripper_adds_dependency():
+    cfg = ControllerConfig.parse(
+        {**BASE, "gripper": {"type": "do_command", "name": "g2", "open_value": 95, "closed_value": 0}}
+    )
     assert "g2" in cfg.dependencies()
 
 
