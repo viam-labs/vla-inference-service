@@ -86,6 +86,55 @@ def compute_errors(predicted: np.ndarray, recorded: np.ndarray) -> dict:
     }
 
 
+def sample_starts(n_frames: int, horizon: int, stride: int, limit: int) -> list[int]:
+    """Choose window start frames, spreading `limit` across the whole episode.
+
+    Stops `horizon` before the end so no window is compared against padding.
+    When `limit` truncates, it subsamples EVENLY rather than taking a prefix:
+    a prefix biases every sample toward the start of the episode, which is
+    precisely the axis errors_by_position measures, and would report the
+    early-task error as if it were the whole picture.
+    """
+    starts = list(range(0, max(0, n_frames - horizon), stride))
+    if limit and len(starts) > limit:
+        idx = np.linspace(0, len(starts) - 1, limit).round().astype(int)
+        starts = [starts[i] for i in sorted(set(idx.tolist()))]
+    return starts
+
+
+def errors_by_position(
+    predicted: np.ndarray, truth: np.ndarray, starts: list[int], n_frames: int, buckets: int = 4
+) -> list[dict]:
+    """Group each sample's error by where in the episode it was taken.
+
+    A policy that has learned the approach but not the finish is worse at the
+    end of the episode specifically, and a single mean over the whole run
+    hides that completely. Bucketing by start frame is what separates "this
+    checkpoint is weak" from "this checkpoint is weak at the last subtask".
+
+    Position is a fraction of the FULL episode, not of the sampled range, so
+    the numbers mean what they say -- with the consequence that the final
+    `horizon` frames can never be a window start, and the last bucket
+    therefore stops short of 1.0. `max_frac` reports where it actually ends
+    so a thin top bucket is visible rather than silently reassuring.
+    """
+    per_sample = np.linalg.norm(predicted - truth, axis=2).mean(axis=1)
+    frac = np.asarray(starts, dtype=float) / max(1, n_frames - 1)
+    edges = np.linspace(0.0, 1.0, buckets + 1)
+    out = []
+    for i in range(buckets):
+        lo, hi = float(edges[i]), float(edges[i + 1])
+        sel = (frac >= lo) & (frac < hi) if i < buckets - 1 else (frac >= lo)
+        out.append({
+            "lo": lo,
+            "hi": hi,
+            "n": int(sel.sum()),
+            "l2_mean": float(per_sample[sel].mean()) if sel.any() else float("nan"),
+            "max_frac": float(frac[sel].max()) if sel.any() else float("nan"),
+        })
+    return out
+
+
 def naive_baselines(
     recorded: np.ndarray, states: np.ndarray, starts: list[int], horizon: int
 ) -> dict[str, np.ndarray]:
@@ -278,6 +327,25 @@ def report(metrics: dict, label: str) -> None:
                 "     re-check the --key-map ordering and the image geometry before "
                 "concluding the checkpoint is weak."
             )
+    if metrics.get("by_position"):
+        print("error by position in the episode (mean L2 per sample):")
+        for b in metrics["by_position"]:
+            if b["n"] == 0:
+                print(f"  [{b['lo']:.2f},{b['hi']:.2f})  no samples")
+                continue
+            print(f"  [{b['lo']:.2f},{b['hi']:.2f})  n={b['n']:<3d} mean L2 {b['l2_mean']:8.3f}"
+                  f"   (starts reach {b['max_frac']:.2f})")
+        tail = metrics["by_position"][-1]
+        rest = [b for b in metrics["by_position"][:-1] if b["n"]]
+        if tail["n"] and rest:
+            rest_mean = sum(b["l2_mean"] * b["n"] for b in rest) / sum(b["n"] for b in rest)
+            delta = (tail["l2_mean"] - rest_mean) / rest_mean * 100
+            print(f"  last bucket vs the rest: {tail['l2_mean']:.3f} vs {rest_mean:.3f}"
+                  f"  ({delta:+.0f}%)")
+            if delta > 25:
+                print("  !! markedly worse at the end of the episode -- the failure is the "
+                      "final subtask,\n     not the task as a whole. More demos OF THAT PHASE "
+                      "beat more training steps.")
     print("per-joint error (MAE / MSE):")
     for j, (mae, mse) in enumerate(zip(metrics["mae_by_joint"], metrics["mse_by_joint"])):
         print(f"  joint {j}: {mae:8.4f} / {mse:10.4f}")
@@ -401,9 +469,7 @@ async def run(args) -> int:
 
         # Only starts where a full ground-truth window exists -- a short tail
         # window would silently compare against padding.
-        starts = list(range(0, max(0, len(frames) - horizon), args.stride))
-        if args.limit:
-            starts = starts[: args.limit]
+        starts = sample_starts(len(frames), horizon, args.stride, args.limit)
         if not starts:
             raise SystemExit(
                 f"episode has {len(frames)} frames, shorter than the {horizon}-step "
@@ -453,6 +519,7 @@ async def run(args) -> int:
         predicted = np.stack(preds)
         truth = np.stack([recorded[t : t + horizon] for t in starts])
         metrics = compute_errors(predicted, truth)
+        metrics["by_position"] = errors_by_position(predicted, truth, starts, len(frames))
         metrics["baselines"] = {
             name: compute_errors(pred, truth)
             for name, pred in naive_baselines(
@@ -586,6 +653,32 @@ def self_check() -> int:
     # docstring says to read it at k>0.
     truth2 = np.stack([rec[t : t + 50] for t in st2])
     assert compute_errors(bl["repeat action at t"], truth2)["l2_first_step"] == 0.0
+
+    # errors_by_position: bucketing, and that it actually localises error.
+    rec2 = np.zeros((400, 6), np.float32)
+    pos_starts = [0, 100, 200, 300]
+    truth3 = np.stack([rec2[t : t + 50] for t in pos_starts])
+    pred3 = truth3.copy()
+    pred3[3] += 10.0  # only the last-quarter sample is wrong
+    got = errors_by_position(pred3, truth3, pos_starts, 400)
+    assert [b["n"] for b in got] == [1, 1, 1, 1], [b["n"] for b in got]
+    assert got[0]["l2_mean"] == 0.0 and got[1]["l2_mean"] == 0.0
+    assert got[3]["l2_mean"] > 20.0, got[3]["l2_mean"]
+    assert abs(got[3]["max_frac"] - 300 / 399) < 1e-6
+    # An empty top bucket must be reported, not crash or silently vanish.
+    empty = errors_by_position(truth3[:3], truth3[:3], [0, 10, 20], 400)
+    assert empty[-1]["n"] == 0 and np.isnan(empty[-1]["l2_mean"])
+    assert [b["n"] for b in empty] == [3, 0, 0, 0]
+
+    # sample_starts: never past the ground-truth edge, and --limit must not
+    # collapse coverage onto the start of the episode.
+    assert sample_starts(400, 50, 20, 0) == list(range(0, 350, 20))
+    spread = sample_starts(621, 50, 20, 16)
+    assert len(spread) <= 16
+    assert max(spread) > 0.75 * (621 - 50), f"--limit truncated coverage: {max(spread)}"
+    assert all(t + 50 <= 621 for t in spread)
+    assert sample_starts(60, 50, 20, 0) == [0]
+    assert sample_starts(40, 50, 20, 0) == []
 
     print("self-check OK")
     return 0
