@@ -57,45 +57,89 @@ from vla.wire import encode_image, encode_vector
 # --------------------------------------------------------------------------
 
 
-def compute_errors(predicted: np.ndarray, recorded: np.ndarray) -> dict:
+def compute_errors(
+    predicted: np.ndarray, recorded: np.ndarray, mask: np.ndarray | None = None
+) -> dict:
     """Compare stacked chunks against ground truth.
 
     Both are (n_samples, horizon, action_dim). Returns the two cuts that
     actually localize a fault: error against horizon offset k (does it start
     wrong, or drift?) and error per action dimension (which joint?).
+
+    `mask` is (n_samples, horizon) of bools marking which steps have ground
+    truth. It is how truncated windows are supported: a window that runs off
+    the end of the episode keeps its real steps and masks the rest, instead of
+    the window being dropped entirely (which made the last quarter of every
+    short episode unmeasurable). Every statistic below is computed over
+    unmasked entries only, and `n_by_offset` records how many samples each
+    offset actually had, because a truncated series thins out with k and a
+    mean over three samples should not read like a mean over thirty.
     """
     if predicted.shape != recorded.shape:
         raise ValueError(f"shape mismatch: {predicted.shape} vs {recorded.shape}")
     if predicted.ndim != 3:
         raise ValueError(f"expected (samples, horizon, dim), got {predicted.shape}")
+    if mask is None:
+        mask = np.ones(predicted.shape[:2], dtype=bool)
+    elif mask.shape != predicted.shape[:2]:
+        raise ValueError(f"mask shape {mask.shape} != {predicted.shape[:2]}")
+    if not mask.any():
+        raise ValueError("mask excludes every step; nothing to compare")
 
-    err = predicted - recorded
+    err = np.where(mask[:, :, None], predicted - recorded, 0.0)
     # L2 across the action vector, per (sample, k) -- the "how wrong is this
     # commanded pose" number, in the action's own units.
     l2 = np.linalg.norm(err, axis=2)
+
+    n_by_offset = mask.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        l2_by_offset = np.where(n_by_offset > 0, l2.sum(axis=0) / n_by_offset, np.nan)
+    valid_steps = int(mask.sum())
+    flat = l2[mask]
+    # per-joint means divide by (valid steps), not by every slot in the array
+    sq = np.where(mask[:, :, None], (predicted - recorded) ** 2, 0.0)
+    ab = np.where(mask[:, :, None], np.abs(predicted - recorded), 0.0)
     return {
         "n_samples": int(predicted.shape[0]),
         "horizon": int(predicted.shape[1]),
         "action_dim": int(predicted.shape[2]),
-        "l2_by_offset": l2.mean(axis=0),          # (horizon,)
-        "mse_by_joint": (err ** 2).mean(axis=(0, 1)),  # (dim,)
-        "mae_by_joint": np.abs(err).mean(axis=(0, 1)),
-        "l2_mean": float(l2.mean()),
-        "l2_first_step": float(l2[:, 0].mean()),
-        "l2_p95": float(np.percentile(l2, 95)),
+        "valid_steps": valid_steps,
+        "truncated": bool((~mask).any()),
+        "n_by_offset": n_by_offset,
+        "l2_by_offset": l2_by_offset,
+        "mse_by_joint": sq.sum(axis=(0, 1)) / valid_steps,
+        "mae_by_joint": ab.sum(axis=(0, 1)) / valid_steps,
+        "l2_mean": float(flat.mean()),
+        "l2_first_step": float(l2[mask[:, 0], 0].mean()) if mask[:, 0].any() else float("nan"),
+        "l2_p95": float(np.percentile(flat, 95)),
     }
 
 
-def sample_starts(n_frames: int, horizon: int, stride: int, limit: int) -> list[int]:
+def sample_starts(
+    n_frames: int, horizon: int, stride: int, limit: int, min_overlap: int = 0
+) -> list[int]:
     """Choose window start frames, spreading `limit` across the whole episode.
 
-    Stops `horizon` before the end so no window is compared against padding.
+    With `min_overlap` 0, stops `horizon` before the end so every window has
+    full ground truth. That is safe but blind: a 50-step window at 10 fps
+    cannot start in the last 5 s of an episode, so on a 20 s episode the whole
+    final quarter is unreachable and reports as "no samples" -- 16 of 125
+    box-opener episodes are that short.
+
+    A positive `min_overlap` admits windows that run off the end, requiring
+    only that many real steps to grade against; compute_errors masks the rest.
+    That trades a comparable metric for reach, so the two are never mixed:
+    truncated windows contain fewer high-k steps, and high-k steps are where
+    the error lives, so a truncated run scores LOWER for reasons that have
+    nothing to do with the policy.
+
     When `limit` truncates, it subsamples EVENLY rather than taking a prefix:
     a prefix biases every sample toward the start of the episode, which is
     precisely the axis errors_by_position measures, and would report the
     early-task error as if it were the whole picture.
     """
-    starts = list(range(0, max(0, n_frames - horizon), stride))
+    reach = n_frames - (min_overlap if min_overlap > 0 else horizon)
+    starts = list(range(0, max(0, reach), stride))
     if limit and len(starts) > limit:
         idx = np.linspace(0, len(starts) - 1, limit).round().astype(int)
         starts = [starts[i] for i in sorted(set(idx.tolist()))]
@@ -103,7 +147,8 @@ def sample_starts(n_frames: int, horizon: int, stride: int, limit: int) -> list[
 
 
 def errors_by_position(
-    predicted: np.ndarray, truth: np.ndarray, starts: list[int], n_frames: int, buckets: int = 4
+    predicted: np.ndarray, truth: np.ndarray, starts: list[int], n_frames: int,
+    buckets: int = 4, mask: np.ndarray | None = None,
 ) -> list[dict]:
     """Group each sample's error by where in the episode it was taken.
 
@@ -118,7 +163,11 @@ def errors_by_position(
     therefore stops short of 1.0. `max_frac` reports where it actually ends
     so a thin top bucket is visible rather than silently reassuring.
     """
-    per_sample = np.linalg.norm(predicted - truth, axis=2).mean(axis=1)
+    if mask is None:
+        mask = np.ones(predicted.shape[:2], dtype=bool)
+    l2 = np.where(mask, np.linalg.norm(predicted - truth, axis=2), 0.0)
+    counts = mask.sum(axis=1)
+    per_sample = np.where(counts > 0, l2.sum(axis=1) / np.maximum(counts, 1), np.nan)
     frac = np.asarray(starts, dtype=float) / max(1, n_frames - 1)
     edges = np.linspace(0.0, 1.0, buckets + 1)
     out = []
@@ -300,6 +349,16 @@ def report(metrics: dict, label: str) -> None:
         f"samples={metrics['n_samples']}  horizon={metrics['horizon']}  "
         f"action_dim={metrics['action_dim']}"
     )
+    if metrics.get("truncated"):
+        full = metrics["n_samples"] * metrics["horizon"]
+        print(
+            f"TRUNCATED SERIES: {metrics['valid_steps']}/{full} steps had ground truth.\n"
+            "  Windows running off the end of the episode were kept and graded on the\n"
+            "  steps that exist. This reaches the end of short episodes, but the numbers\n"
+            "  are NOT comparable to a full-window run -- fewer high-k steps means a\n"
+            "  lower score for reasons unrelated to the policy. Compare truncated to\n"
+            "  truncated only."
+        )
     print(f"mean L2 per step      : {metrics['l2_mean']:.4f}")
     print(f"  at offset k=0       : {metrics['l2_first_step']:.4f}   <- immediate action")
     print(f"  p95                 : {metrics['l2_p95']:.4f}")
@@ -307,9 +366,15 @@ def report(metrics: dict, label: str) -> None:
     curve = metrics["l2_by_offset"]
     idx = sorted({0, 1, 4, 9, 24, len(curve) - 1})
     print("mean L2 by horizon offset:")
+    counts = metrics.get("n_by_offset")
+    peak = np.nanmax(curve) if np.isfinite(curve).any() else 1.0
     for k in idx:
-        bar = "#" * int(round(40 * curve[k] / max(curve.max(), 1e-9)))
-        print(f"  k={k:<3} {curve[k]:8.4f}  {bar}")
+        if not np.isfinite(curve[k]):
+            print(f"  k={k:<3}   (no samples reach this offset)")
+            continue
+        bar = "#" * int(round(40 * curve[k] / max(peak, 1e-9)))
+        tail = f"  n={int(counts[k])}" if counts is not None and metrics.get("truncated") else ""
+        print(f"  k={k:<3} {curve[k]:8.4f}  {bar}{tail}")
     if metrics.get("baselines"):
         print("vs. predictors that never call the policy:")
         policy_mean = metrics["l2_mean"]
@@ -469,7 +534,7 @@ async def run(args) -> int:
 
         # Only starts where a full ground-truth window exists -- a short tail
         # window would silently compare against padding.
-        starts = sample_starts(len(frames), horizon, args.stride, args.limit)
+        starts = sample_starts(len(frames), horizon, args.stride, args.limit, args.min_overlap)
         if not starts:
             raise SystemExit(
                 f"episode has {len(frames)} frames, shorter than the {horizon}-step "
@@ -517,11 +582,21 @@ async def run(args) -> int:
             )
 
         predicted = np.stack(preds)
-        truth = np.stack([recorded[t : t + horizon] for t in starts])
-        metrics = compute_errors(predicted, truth)
-        metrics["by_position"] = errors_by_position(predicted, truth, starts, len(frames))
+        # Windows are padded to `horizon` and masked, rather than trimmed to a
+        # ragged list: every statistic then stays a plain array op, and the
+        # mask is the single place that knows a window ran off the end.
+        truth = np.zeros((len(starts), horizon, predicted.shape[2]), dtype=np.float32)
+        mask = np.zeros((len(starts), horizon), dtype=bool)
+        for i, t in enumerate(starts):
+            avail = min(horizon, len(recorded) - t)
+            truth[i, :avail] = recorded[t : t + avail]
+            mask[i, :avail] = True
+        metrics = compute_errors(predicted, truth, mask)
+        metrics["by_position"] = errors_by_position(
+            predicted, truth, starts, len(frames), mask=mask
+        )
         metrics["baselines"] = {
-            name: compute_errors(pred, truth)
+            name: compute_errors(pred, truth, mask)
             for name, pred in naive_baselines(
                 recorded, np.stack(sampled_states), starts, horizon
             ).items()
@@ -680,6 +755,51 @@ def self_check() -> int:
     assert sample_starts(60, 50, 20, 0) == [0]
     assert sample_starts(40, 50, 20, 0) == []
 
+    # Masking: a full mask must reproduce the unmasked result exactly, and
+    # masked-out slots must not be able to influence anything.
+    t4 = rng.normal(size=(5, 50, 6)).astype(np.float32)
+    p4 = t4 + 0.3
+    full = np.ones((5, 50), bool)
+    a, b = compute_errors(p4, t4), compute_errors(p4, t4, full)
+    for key in ("l2_mean", "l2_first_step", "l2_p95"):
+        assert abs(a[key] - b[key]) < 1e-6, key
+    assert np.allclose(a["mse_by_joint"], b["mse_by_joint"])
+    assert not a["truncated"] and a["valid_steps"] == 250
+
+    part = full.copy(); part[:, 30:] = False
+    ref = compute_errors(p4[:, :30], t4[:, :30])
+    trunc = compute_errors(p4, t4, part)
+    assert abs(trunc["l2_mean"] - ref["l2_mean"]) < 1e-6
+    assert np.allclose(trunc["mse_by_joint"], ref["mse_by_joint"], atol=1e-6)
+    assert trunc["truncated"] and trunc["valid_steps"] == 150
+    assert list(trunc["n_by_offset"][:3]) == [5, 5, 5] and trunc["n_by_offset"][40] == 0
+    assert not np.isfinite(trunc["l2_by_offset"][40]), "an unreachable offset must be nan"
+
+    # Garbage in masked-out slots must change nothing.
+    poisoned = p4.copy(); poisoned[:, 30:] = 1e6
+    assert abs(compute_errors(poisoned, t4, part)["l2_mean"] - trunc["l2_mean"]) < 1e-6
+
+    try:
+        compute_errors(p4, t4, np.zeros((5, 50), bool))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an all-false mask must raise, not divide by zero")
+
+    # The whole point: a short episode's last quarter becomes reachable.
+    short_n = 187
+    assert sample_starts(short_n, 50, 20, 0) == list(range(0, 137, 20))
+    assert max(sample_starts(short_n, 50, 20, 0)) / (short_n - 1) < 0.75, "q4 unreachable, as documented"
+    deep = sample_starts(short_n, 50, 20, 0, min_overlap=10)
+    assert max(deep) / (short_n - 1) > 0.85, max(deep) / (short_n - 1)
+    # errors_by_position must then populate the top bucket
+    m5 = np.zeros((len(deep), 50), bool)
+    for i, t in enumerate(deep):
+        m5[i, : min(50, short_n - t)] = True
+    zeros = np.zeros((len(deep), 50, 6), np.float32)
+    got5 = errors_by_position(zeros, zeros, deep, short_n, mask=m5)
+    assert got5[-1]["n"] > 0, "truncation must make the last bucket reachable"
+
     print("self-check OK")
     return 0
 
@@ -703,6 +823,10 @@ def main() -> int:
     p.add_argument("--image-fit", default="pad", choices=("pad", "stretch"))
     p.add_argument("--image-encoding", default="jpeg", choices=("jpeg", "png", "raw"))
     p.add_argument("--jpeg-quality", type=int, default=90)
+    p.add_argument("--min-overlap", type=int, default=0, metavar="N",
+                   help="admit windows running off the episode end, needing N real steps "
+                        "to grade (default 0 = full windows only). Reaches the tail of "
+                        "short episodes; scores are NOT comparable to a full-window run.")
     args = p.parse_args()
 
     if args.self_check:
