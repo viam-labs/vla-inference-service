@@ -1,13 +1,33 @@
 """viam-labs:vla:controller -- the observation/inference/actuation loop.
 
-The arm is commanded via ``await arm.move_to_joint_positions(JointPositions(
-values=...))`` -- a single ``JointPositions``, no options. Installed viam-sdk
-0.80.0 (the latest on PyPI) has no ``move_through_joint_positions`` and
-nothing consumes ``MoveOptions``; both exist only in an unreleased dev
-checkout. The velocity ceiling therefore lives entirely in the safety layer's
-per-tick ``max_joint_delta_degs`` clamp (derived from
-``max_vel_degs_per_sec`` by ``ControllerConfig``), logged once at
-``reconfigure()`` so an operator can see what their limit implies.
+Two action spaces share this loop. They differ in four places -- the
+observation's state half, the safety layer, the arm call, and the unit
+conversion -- and in nothing else: the scheduler, action queue, pacing,
+starvation bounds, status reporting, and async/RTC modes are common.
+
+``action_space="joints"`` (the default) commands the arm via ``await
+arm.move_to_joint_positions(JointPositions(values=...))`` -- a single
+``JointPositions``, no options. Installed viam-sdk 0.80.0 (the latest on
+PyPI) has no ``move_through_joint_positions`` and nothing consumes
+``MoveOptions``; both exist only in an unreleased dev checkout. The velocity
+ceiling therefore lives entirely in the safety layer's per-tick
+``max_joint_delta_degs`` clamp (derived from ``max_vel_degs_per_sec`` by
+``ControllerConfig``), logged once at ``reconfigure()`` so an operator can
+see what their limit implies.
+
+``action_space="delta-ee"`` reads the tool pose from ``get_end_position()``,
+builds the 9-dim state the dataset stored, and treats the policy's 6-dim
+output as a body-frame pose delta: it is composed onto the *measured* pose
+with ``pose.state_compose`` and written with ``arm.move_to_position``. The
+same "the per-tick clamp is the velocity limit" argument applies with more
+force there, because ``move_to_position`` has no notion of a tick at all --
+see ``CartesianSafetyLayer``. Joint limits on that path are enforced by the
+arm driver's own IK rather than by this service; ``move_to_position`` is the
+arm component method, not the motion service, so there is no obstacle
+avoidance either.
+
+A ``move_to_position`` refusal is the one arm-command failure this loop does
+not treat as immediately fatal -- see ``_command_pose``.
 
 ``safety.stop_on_error`` governs exactly one boundary: whether a failure while
 *producing the next action* (camera read, observation assembly, or the policy
@@ -49,6 +69,7 @@ from typing import Any, ClassVar, Mapping, Sequence
 import numpy as np
 from typing_extensions import Self
 from viam.proto.app.robot import ServiceConfig
+from viam.proto.common import Pose
 from viam.proto.component.arm import JointPositions
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
@@ -57,12 +78,13 @@ from viam.services.generic import Generic
 from viam.utils import struct_to_dict
 
 from ..wire import decode_matrix, encode_vector
-from .config import ControllerConfig
+from .config import DELTA_EE, DELTA_EE_ACTION_DIM, DELTA_EE_STATE_DIM, ControllerConfig
 from .gripper import GripperAdapter, make_gripper_adapter
 from .observation import ObservationBuilder
-from .safety import SafetyLayer, SafetyLimits
+from .pose import orientation_vector, pose_state, state_compose, state_rotation
+from .safety import CartesianLimits, CartesianSafetyLayer, SafetyLayer, SafetyLimits
 from .scheduler import AsyncScheduler, ChunkScheduler, SequentialScheduler
-from .units import to_degrees
+from .units import to_degrees, to_working
 
 LOGGER = logging.getLogger(__name__)
 
@@ -126,6 +148,9 @@ class VLAController(Generic, EasyResource):
         self._log_velocity_budget()
 
     def _log_velocity_budget(self) -> None:
+        if self._cfg.action_space == DELTA_EE:
+            self._log_cartesian_budget()
+            return
         s = self._cfg.safety
         if s.max_vel_degs_per_sec is not None:
             LOGGER.info(
@@ -142,6 +167,31 @@ class VLAController(Generic, EasyResource):
                 s.max_joint_delta_degs,
                 self._cfg.fps,
             )
+
+    def _log_cartesian_budget(self) -> None:
+        """The delta-EE half of the same disclosure.
+
+        Logged in both directions -- the configured ceiling and the tool speed
+        it implies -- because `move_to_position` accepts no speed argument, so
+        the per-tick clamp times fps is the only speed limit there is, and an
+        operator has no other place to read it off.
+        """
+        s = self._cfg.safety
+        fps = self._cfg.fps
+        LOGGER.info(
+            "safety: max_tcp_delta_mm=%.6f mm and max_tcp_rot_delta_rads=%.6f rad per tick "
+            "at fps=%.4f, implying at most %.4f mm/s of tool travel and %.4f rad/s of tool "
+            "rotation (%s); joint limits on this path are enforced by the arm driver's IK, "
+            "not by this service",
+            s.max_tcp_delta_mm,
+            s.max_tcp_rot_delta_rads,
+            fps,
+            s.max_tcp_delta_mm * fps,
+            s.max_tcp_rot_delta_rads * fps,
+            "derived from the configured velocities"
+            if (s.max_tcp_vel_mms_per_sec is not None or s.max_tcp_rot_vel_rads_per_sec is not None)
+            else "no max_tcp_vel_mms_per_sec / max_tcp_rot_vel_rads_per_sec configured",
+        )
 
     @staticmethod
     def _key(dep_key: Any) -> str:
@@ -333,8 +383,15 @@ class VLAController(Generic, EasyResource):
         )
         return derived
 
-    def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer:
+    def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer | CartesianSafetyLayer:
         s = self._cfg.safety
+        if self._cfg.action_space == DELTA_EE:
+            return CartesianSafetyLayer(
+                CartesianLimits(
+                    max_tcp_delta_mm=s.max_tcp_delta_mm,
+                    max_tcp_rot_delta_rads=s.max_tcp_rot_delta_rads,
+                )
+            )
         return SafetyLayer(
             SafetyLimits(
                 max_joint_delta_degs=s.max_joint_delta_degs,
@@ -346,6 +403,9 @@ class VLAController(Generic, EasyResource):
 
     def _check_action_dim(self, specs: dict[str, Any], gripper: GripperAdapter) -> None:
         cfg = self._cfg
+        if cfg.action_space == DELTA_EE:
+            self._check_delta_ee_dims(specs)
+            return
         expected_dim = len(cfg.state_joint_indices) + (1 if gripper.in_state else 0)
         actual_dim = int(specs["action_dim"])
         if actual_dim == expected_dim:
@@ -366,6 +426,38 @@ class VLAController(Generic, EasyResource):
             f"describes {expected_dim} ({len(cfg.state_joint_indices)} joints + "
             f"{'1 gripper' if gripper.in_state else 'no gripper'})"
         )
+
+    @staticmethod
+    def _check_delta_ee_dims(specs: dict[str, Any]) -> None:
+        """Refuse a checkpoint whose vectors are not the delta-EE layout.
+
+        Both widths are fixed by the dataset contract rather than by config,
+        so this is a straight equality check and not the negotiation
+        `_check_action_dim` performs for joints. It earns its place because
+        every downstream mistake it prevents is silent: a 7-dim action would
+        have its extra channel dropped by `state_compose`'s slicing, and a
+        state of the wrong width would be Gram-Schmidt'd out of whatever six
+        numbers happened to land in `state[3:9]` -- both produce arm motion.
+
+        `state_dim` is `None` for a checkpoint that declares no
+        `observation.state` feature at all, which cannot be a delta-EE
+        checkpoint; it is reported as the mismatch it is rather than skipped.
+        """
+        action_dim = int(specs["action_dim"])
+        if action_dim != DELTA_EE_ACTION_DIM:
+            raise RuntimeError(
+                f"action_dim mismatch: action_space={DELTA_EE!r} needs a checkpoint emitting "
+                f"{DELTA_EE_ACTION_DIM} dimensions [dx, dy, dz, drx, dry, drz], but the policy "
+                f"emits {action_dim}"
+            )
+        state_dim = specs.get("state_dim")
+        if state_dim is None or int(state_dim) != DELTA_EE_STATE_DIM:
+            raise RuntimeError(
+                f"state_dim mismatch: action_space={DELTA_EE!r} needs a checkpoint whose "
+                f"observation.state is {DELTA_EE_STATE_DIM} dimensions "
+                "[x, y, z, r00, r01, r02, r10, r11, r12], but the policy declares "
+                f"{state_dim!r}"
+            )
 
     def _check_joint_indices(self, measured: list[float], gripper: GripperAdapter) -> None:
         """Refuse before any motion if config references a joint the arm
@@ -442,8 +534,17 @@ class VLAController(Generic, EasyResource):
             image_sizes = self._image_sizes(specs)
 
             arm = self._resource(cfg.arm)
-            measured = list((await arm.get_joint_positions()).values)
-            self._check_joint_indices(measured, gripper)
+            if cfg.action_space == DELTA_EE:
+                # The delta-EE equivalent of the joint-index check below:
+                # refuse before any motion if the arm cannot supply the one
+                # reading this action space is built on. A driver that does
+                # not implement `get_end_position` (or returns something that
+                # is not a Pose) must fail here, not on the first tick after
+                # the loop has already reported "running".
+                await self._check_end_position(arm)
+            else:
+                measured = list((await arm.get_joint_positions()).values)
+                self._check_joint_indices(measured, gripper)
             await self._preflight_gripper(gripper)
 
             # Only cameras the policy actually asked for: a camera configured
@@ -461,6 +562,7 @@ class VLAController(Generic, EasyResource):
                 image_encoding=cfg.image_encoding,
                 jpeg_quality=cfg.jpeg_quality,
                 image_fit=cfg.image_fit,
+                action_space=cfg.action_space,
                 duration_warn_s=cfg.duration_warn_s,
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
             )
@@ -522,6 +624,7 @@ class VLAController(Generic, EasyResource):
         last_tick = time.perf_counter()
         consecutive_failures = 0
         consecutive_starved_ticks = 0
+        consecutive_rejected_moves = 0
 
         while True:
             tick_started = time.perf_counter()
@@ -590,75 +693,213 @@ class VLAController(Generic, EasyResource):
 
             consecutive_starved_ticks = 0
 
-            # Convert the *driven joints* only. A normalized gripper channel
-            # (every variant except `arm_joint`) is already 0.0-1.0 and must
-            # not be scaled: under `action_units="radians"` an unconditional
-            # conversion multiplies it by ~57.3, so a policy output of 0.5
-            # becomes 28.6, the safety layer clamps it to 1.0, and the gripper
-            # sits fully closed on every tick. `observation.py`'s read side
-            # already splits this way (see its `# already normalized` tail);
-            # the write side has to match or the two disagree about units.
-            raw_action = np.asarray(action, dtype=np.float32)
-            head = len(raw_action) - (1 if gripper.has_normalized_tail else 0)
-            degrees = np.concatenate(
-                [to_degrees(raw_action[:head], cfg.action_units), raw_action[head:]]
-            )
-
-            # Every joint the arm has, not just the driven ones: `positions`
-            # below seeds from the *measured* values so an un-driven joint
-            # (state_joint_indices need not be contiguous, or cover every
-            # joint -- a 5-DoF policy on a 6-joint arm is a legitimate
-            # config) holds its measured position rather than being sent an
-            # implicit 0.0, and so each driven value lands on the joint it
-            # was actually clamped against.
-            measured = list((await arm.get_joint_positions()).values)
-            joint_current = [measured[i] for i in cfg.state_joint_indices]
-            if gripper.arm_joint_index is not None:
-                joint_current.append(measured[gripper.arm_joint_index])
-            elif gripper.in_state:
-                joint_current.append(await gripper.read())
-            current = np.asarray(joint_current, dtype=np.float32)
-
-            if first:
-                # Unconditionally fatal, not gated by stop_on_error: refusing
-                # beats slowly moving somewhere nobody asked for, and there is
-                # no tick to "skip" before the very first command.
-                self._safety.check_start(degrees, current)
+            if cfg.action_space == DELTA_EE:
+                if await self._command_pose(arm, action):
+                    consecutive_rejected_moves = 0
+                else:
+                    consecutive_rejected_moves += 1
+                    if consecutive_rejected_moves > cfg.starvation_grace_ticks:
+                        raise RuntimeError(
+                            f"{consecutive_rejected_moves} consecutive move_to_position "
+                            "refusals exceeded starvation_grace_ticks="
+                            f"{cfg.starvation_grace_ticks}; stopping"
+                        )
+            else:
+                await self._command_joints(arm, gripper, action, check_start=first)
                 first = False
-
-            safe = self._safety.apply(degrees, current)
-
-            # Positional writes silently mis-map: `move_to_joint_positions`
-            # has no notion of "only these joints", so a dense list built
-            # from `safe` alone would land clamped slot i on arm joint i --
-            # not arm joint `state_joint_indices[i]` -- scrambling the
-            # mapping and voiding the delta clamp whenever the two differ.
-            # Building `target` from `measured` and overwriting only the
-            # driven slots keeps every value on the joint it was computed
-            # for, and holds every other joint at its measured position.
-            target = list(measured)
-            for slot, joint_idx in enumerate(cfg.state_joint_indices):
-                target[joint_idx] = float(safe[slot])
-            if gripper.arm_joint_index is not None:
-                target[gripper.arm_joint_index] = float(safe[-1])
-
-            # Arm/gripper command failures are unconditionally fatal too: by
-            # this point inference already succeeded and safety already
-            # cleared the action, so there is no "try again next tick" that
-            # would be safe -- the arm itself is reporting the fault.
-            #
-            # `wait: False` because the next tick supersedes this setpoint: a driver
-            # that blocks until the arm physically settles (so-101's default) spends
-            # the entire tick budget waiting for a target we are about to replace.
-            # Free-form `extra`, so a driver that does not read the key ignores it.
-            await arm.move_to_joint_positions(
-                JointPositions(values=target), extra={"wait": False}
-            )
-            if gripper.has_normalized_tail:
-                await gripper.write(float(safe[-1]))
 
             last_tick = self._record_tick(last_tick)
             await self._pace(tick_started, period)
+
+    async def _command_joints(
+        self, arm: Any, gripper: GripperAdapter, action: np.ndarray, *, check_start: bool
+    ) -> None:
+        """One tick of `action_space="joints"`: clamp, then write joint angles."""
+        cfg = self._cfg
+
+        # Convert the *driven joints* only. A normalized gripper channel
+        # (every variant except `arm_joint`) is already 0.0-1.0 and must
+        # not be scaled: under `action_units="radians"` an unconditional
+        # conversion multiplies it by ~57.3, so a policy output of 0.5
+        # becomes 28.6, the safety layer clamps it to 1.0, and the gripper
+        # sits fully closed on every tick. `observation.py`'s read side
+        # already splits this way (see its `# already normalized` tail);
+        # the write side has to match or the two disagree about units.
+        raw_action = np.asarray(action, dtype=np.float32)
+        head = len(raw_action) - (1 if gripper.has_normalized_tail else 0)
+        degrees = np.concatenate(
+            [to_degrees(raw_action[:head], cfg.action_units), raw_action[head:]]
+        )
+
+        # Every joint the arm has, not just the driven ones: `positions`
+        # below seeds from the *measured* values so an un-driven joint
+        # (state_joint_indices need not be contiguous, or cover every
+        # joint -- a 5-DoF policy on a 6-joint arm is a legitimate
+        # config) holds its measured position rather than being sent an
+        # implicit 0.0, and so each driven value lands on the joint it
+        # was actually clamped against.
+        measured = list((await arm.get_joint_positions()).values)
+        joint_current = [measured[i] for i in cfg.state_joint_indices]
+        if gripper.arm_joint_index is not None:
+            joint_current.append(measured[gripper.arm_joint_index])
+        elif gripper.in_state:
+            joint_current.append(await gripper.read())
+        current = np.asarray(joint_current, dtype=np.float32)
+
+        if check_start:
+            # Unconditionally fatal, not gated by stop_on_error: refusing
+            # beats slowly moving somewhere nobody asked for, and there is
+            # no tick to "skip" before the very first command.
+            self._safety.check_start(degrees, current)
+
+        safe = self._safety.apply(degrees, current)
+
+        # Positional writes silently mis-map: `move_to_joint_positions`
+        # has no notion of "only these joints", so a dense list built
+        # from `safe` alone would land clamped slot i on arm joint i --
+        # not arm joint `state_joint_indices[i]` -- scrambling the
+        # mapping and voiding the delta clamp whenever the two differ.
+        # Building `target` from `measured` and overwriting only the
+        # driven slots keeps every value on the joint it was computed
+        # for, and holds every other joint at its measured position.
+        target = list(measured)
+        for slot, joint_idx in enumerate(cfg.state_joint_indices):
+            target[joint_idx] = float(safe[slot])
+        if gripper.arm_joint_index is not None:
+            target[gripper.arm_joint_index] = float(safe[-1])
+
+        # Arm/gripper command failures are unconditionally fatal too: by
+        # this point inference already succeeded and safety already
+        # cleared the action, so there is no "try again next tick" that
+        # would be safe -- the arm itself is reporting the fault.
+        #
+        # `wait: False` because the next tick supersedes this setpoint: a driver
+        # that blocks until the arm physically settles (so-101's default) spends
+        # the entire tick budget waiting for a target we are about to replace.
+        # Free-form `extra`, so a driver that does not read the key ignores it.
+        await arm.move_to_joint_positions(
+            JointPositions(values=target), extra={"wait": False}
+        )
+        if gripper.has_normalized_tail:
+            await gripper.write(float(safe[-1]))
+
+    async def _command_pose(self, arm: Any, action: np.ndarray) -> bool:
+        """One tick of `action_space="delta-ee"`. Returns False if the arm refused.
+
+        The composition is delegated to `pose.state_compose` rather than
+        rewritten here, and that is load-bearing rather than tidiness. Two
+        mistakes it forecloses both produce smooth, plausible, wrong motion:
+        reading the state's six rotation numbers as matrix *columns* instead
+        of rows (on the recorded data the two differ by 0.05-0.06, so neither
+        a no-op nor obviously broken), and LEFT-multiplying the delta, which
+        applies it in the world frame when the dataset's action is body-frame.
+
+        Composed against the *measured* pose, freshly read, for the same
+        reason the joints path clamps against measured joints: an arm that is
+        lagging its setpoint must not have deltas accumulate on top of a
+        position it never reached.
+
+        A `move_to_position` refusal is bounded rather than fatal, which is
+        the one place this path departs from "arm command failures are
+        unconditionally fatal". The joints path can only be refused by
+        hardware, because its target is the measured position plus a small
+        clamped delta and is therefore always inside joint space. This call
+        additionally runs the driver's inverse kinematics, which can refuse a
+        kinematically unreachable pose or a singularity while the hardware is
+        perfectly healthy -- and refuses *before* commanding motion, so the
+        arm is stationary and safe. Since the action is relative, skipping the
+        tick self-heals: the next tick re-reads the measured pose and composes
+        a fresh delta onto it. `_loop` bounds consecutive refusals by
+        `starvation_grace_ticks` (4 ticks, 400 ms at 10 fps, by default), so a
+        genuinely stuck arm still halts promptly.
+        """
+        delta = to_working(np.asarray(action, dtype=np.float32), self._cfg.action_units)
+        safe = self._safety.apply(delta)
+
+        pose = await arm.get_end_position()
+        current = self._pose_state_of(pose)
+        target = state_compose(current, safe)
+        vector = orientation_vector(state_rotation(target))
+        commanded = Pose(
+            x=float(target[0]),
+            y=float(target[1]),
+            z=float(target[2]),
+            o_x=vector["o_x"],
+            o_y=vector["o_y"],
+            o_z=vector["o_z"],
+            theta=vector["theta"],
+        )
+
+        try:
+            await arm.move_to_position(commanded)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = str(exc)
+            LOGGER.error(
+                "arm refused move_to_position for x=%.3f y=%.3f z=%.3f "
+                "o=(%.4f, %.4f, %.4f) theta=%.3f deg: %s; holding position and "
+                "recomposing from the measured pose next tick",
+                commanded.x,
+                commanded.y,
+                commanded.z,
+                commanded.o_x,
+                commanded.o_y,
+                commanded.o_z,
+                commanded.theta,
+                exc,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _pose_state_of(pose: Any) -> np.ndarray:
+        """The 9-dim state of a live `Pose`, in working units (mm, unitless).
+
+        Deliberately *not* unit-converted, unlike the copy `ObservationBuilder`
+        sends the policy: this one is only ever an operand of `state_compose`,
+        whose other operand is the already-converted delta, and both are in
+        working units by then. Converting here and back would be a round trip
+        with nothing on the far side of it.
+        """
+        return pose_state(
+            {
+                "pose": {
+                    "x": pose.x,
+                    "y": pose.y,
+                    "z": pose.z,
+                    "o_x": pose.o_x,
+                    "o_y": pose.o_y,
+                    "o_z": pose.o_z,
+                    "theta": pose.theta,
+                }
+            }
+        )
+
+    async def _check_end_position(self, arm: Any) -> None:
+        """Refuse before any motion if the arm cannot supply an `EndPosition`.
+
+        The delta-EE counterpart of `_check_joint_indices`: config parsing has
+        no access to the arm, so this is the first point in the lifecycle that
+        can find out whether the configured arm implements the one read this
+        action space depends on. Doing the full decode (not merely calling the
+        method) means a driver returning a degenerate orientation vector also
+        fails here rather than on the first tick.
+        """
+        try:
+            pose = await arm.get_end_position()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"action_space={DELTA_EE!r} needs the arm's end position, but "
+                f"get_end_position() failed: {exc}"
+            ) from exc
+        try:
+            self._pose_state_of(pose)
+        except (AttributeError, ValueError) as exc:
+            raise RuntimeError(
+                f"action_space={DELTA_EE!r} could not read a pose from the arm's "
+                f"get_end_position() result {pose!r}: {exc}"
+            ) from exc
 
     async def close(self) -> None:
         await self._stop()

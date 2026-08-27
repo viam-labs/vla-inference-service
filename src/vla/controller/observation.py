@@ -17,6 +17,14 @@ faults:
     when the camera returned it. Catches a camera silently serving a
     buffered stale frame, which a fast-but-wrong read cannot reveal via
     duration alone.
+
+The state half of an observation is the one place `action_space` reaches into
+this module. `"joints"` selects `state_joint_indices` out of
+`get_joint_positions()` and appends the gripper channel; `"delta-ee"` reads
+`get_end_position()` instead and turns that one pose into the 9-vector the
+dataset stored (`pose.pose_state`), with no gripper channel to append. The
+camera half is identical either way -- both read the same gathered frames
+through the same `_encode`.
 """
 
 from __future__ import annotations
@@ -34,7 +42,8 @@ from vla.config_util import VLAError
 from vla.wire import WireError, encode_image
 
 from .gripper import GripperAdapter
-from .units import from_degrees
+from .pose import pose_state
+from .units import VectorUnits, from_degrees, from_working
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,11 +84,16 @@ class ObservationBuilder:
         arm: Any,
         gripper: GripperAdapter,
         state_joint_indices: Sequence[int],
-        state_units: str,
+        state_units: str | VectorUnits,
         image_sizes: Mapping[str, tuple[int, int]],
         image_encoding: str = "jpeg",
         jpeg_quality: int = 90,
         image_fit: str = "pad",
+        # Compared against the literal, the way `image_fit` already is:
+        # `config.py` owns this vocabulary (`ACTION_SPACES`) and imports this
+        # module for its warning constants, so importing it back would be a
+        # cycle.
+        action_space: str = "joints",
         duration_warn_s: float = DEFAULT_DURATION_WARN_S,
         stale_frame_warn_s: float = STALE_FRAME_WARN_S,
     ) -> None:
@@ -92,6 +106,7 @@ class ObservationBuilder:
         self._encoding = image_encoding
         self._quality = jpeg_quality
         self._fit = image_fit
+        self._delta_ee = action_space == "delta-ee"
         self._duration_warn_s = duration_warn_s
         self._stale_frame_warn_s = stale_frame_warn_s
 
@@ -102,7 +117,11 @@ class ObservationBuilder:
         # Gathered, not sequential: at 10 Hz the whole tick has a 100 ms
         # budget and two serial camera reads can consume most of it.
         tasks: list[Any] = [self._read_camera(key) for key in keys]
-        tasks.append(self._arm.get_joint_positions())
+        # One arm read either way, so the gather shape below is unchanged:
+        # delta-EE needs the tool pose where joints mode needs joint angles.
+        tasks.append(
+            self._arm.get_end_position() if self._delta_ee else self._arm.get_joint_positions()
+        )
         needs_gripper_read = self._gripper.has_normalized_tail
         if needs_gripper_read:
             tasks.append(self._gripper.read())
@@ -113,12 +132,15 @@ class ObservationBuilder:
         if needs_gripper_read:
             gripper_value = results[-1]
             results = results[:-1]
-        joints = results[-1]
+        arm_reading = results[-1]
         frame_results = results[: len(keys)]
 
         for key, result in zip(keys, frame_results):
             self._raise_if_failed(result, f"camera {key!r} read failed")
-        self._raise_if_failed(joints, "arm joint read failed")
+        self._raise_if_failed(
+            arm_reading,
+            "arm end-position read failed" if self._delta_ee else "arm joint read failed",
+        )
         if needs_gripper_read:
             self._raise_if_failed(gripper_value, "gripper read failed")
 
@@ -135,7 +157,11 @@ class ObservationBuilder:
                     self._stale_frame_warn_s,
                 )
 
-        state = self._build_state(list(joints.values), gripper_value)
+        state = (
+            self._build_pose_state(arm_reading)
+            if self._delta_ee
+            else self._build_state(list(arm_reading.values), gripper_value)
+        )
 
         duration = time.perf_counter() - started
         if duration > self._duration_warn_s:
@@ -215,6 +241,22 @@ class ObservationBuilder:
                     Image.fromarray(arr).resize((target_w, target_h), Image.BILINEAR),
                     dtype=np.uint8,
                 )
+            elif self._fit == "stretch_bicubic":
+                # Same geometry as "stretch", EVO1's resampler. EVO1 resizes
+                # every frame to a square inside the policy with
+                # `tvf.resize(..., BICUBIC, antialias=True)`
+                # (lerobot/policies/evo1/internvl3_embedder.py's
+                # `_batched_resize_01`), whose docstring states it exists to
+                # mirror InternVL3's reference `Image.resize` -- so the exact
+                # PIL equivalent is a plain bicubic resize, which is what this
+                # is. Measured against that torchvision call on random frames:
+                # bicubic differs by a mean of 0.13-0.29/255, BILINEAR
+                # ("stretch") by 3.3-13.1/255, an order of magnitude worse.
+                # See tests/controller/test_observation_differential.py.
+                arr = np.asarray(
+                    Image.fromarray(arr).resize((target_w, target_h), Image.BICUBIC),
+                    dtype=np.uint8,
+                )
             elif self._fit == "pad":
                 arr = self._resize_with_pad(arr, target_h, target_w)
             else:
@@ -291,3 +333,45 @@ class ObservationBuilder:
             tail = np.asarray([gripper_value], dtype=np.float32)  # already normalized
 
         return np.concatenate([converted, tail])
+
+    def _build_pose_state(self, pose: Any) -> np.ndarray:
+        """The 9-dim delta-EE state from one `EndPosition` reading.
+
+        `pose_state` is the vendored converter code, called with the payload
+        shape it was written against (`{"pose": {...}}`, the export JSON) so
+        the copy stays usable without an adapter of its own -- the protobuf
+        `Pose` carries exactly those seven fields, `theta` in degrees, and the
+        SDK's `get_end_position` returns the same message the recording
+        captured.
+
+        Only the position is unit-converted. The six rotation components are
+        direction cosines and dimensionless whatever the checkpoint's units;
+        `state_units` validation pins that segment to "unitless" so the
+        multiply here is by 1.0 and stays a no-op rather than a silent scale.
+        """
+        try:
+            state = pose_state(
+                {
+                    "pose": {
+                        "x": pose.x,
+                        "y": pose.y,
+                        "z": pose.z,
+                        "o_x": pose.o_x,
+                        "o_y": pose.o_y,
+                        "o_z": pose.o_z,
+                        "theta": pose.theta,
+                    }
+                }
+            )
+        except AttributeError as exc:
+            raise ObservationError(
+                f"arm end position is not a Pose (missing {exc}); "
+                "action_space='delta-ee' needs an arm whose get_end_position() "
+                "returns viam.proto.common.Pose"
+            ) from exc
+        except ValueError as exc:
+            # pose_rotation refuses a zero-length orientation vector, which
+            # describes no rotation at all -- a driver bug or an uninitialized
+            # pose, never something to compose a delta onto.
+            raise ObservationError(f"arm end position has no usable orientation: {exc}") from exc
+        return from_working(state.astype(np.float32), self._units)

@@ -9,6 +9,11 @@ dependencies = [
     "numpy>=2.0.0,<2.3.0",
     "pillow>=10.0.0",
     "typing-extensions>=4.12.2",
+    # Rotation algebra for action_space="delta-ee" (src/vla/controller/pose.py).
+    # A core dependency, not part of the `lerobot` extra: the controller runs
+    # the pose composition itself and can be deployed on a machine that never
+    # loads a checkpoint (the policy service may live elsewhere).
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]

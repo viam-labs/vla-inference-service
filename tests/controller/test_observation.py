@@ -24,6 +24,7 @@ from vla.controller.observation import (
     ObservationBuilder,
     ObservationError,
 )
+from vla.controller.units import UnitSegment, VectorUnits
 from vla.wire import decode_image
 from tests.fakes import FakeArm, FakeCamera, FakeServo
 
@@ -385,3 +386,184 @@ async def test_unset_captured_at_does_not_log_a_staleness_warning(caplog):
         await _builder(cameras={"observation.images.top": cam}).build()
 
     assert not any("stale" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# action_space="delta-ee": the state half comes from EndPosition, not joints.
+# ---------------------------------------------------------------------------
+
+DELTA_EE_STATE_UNITS = VectorUnits(
+    (UnitSegment(3, "millimeters"), UnitSegment(6, "unitless"))
+)
+
+# The same golden the vendored converter produces for `default_pose()`; see
+# tests/controller/test_pose.py for where these nine numbers come from.
+GOLDEN_POSE_STATE = [
+    305.4, -12.75, 231.9,
+    0.25131573681340424, 0.9678053401860794, 0.013900501330621543,
+    0.9676379716235207, -0.250883026320044, -0.027100977414377246,
+]
+
+
+def _encode_only(frame: np.ndarray, image_fit: str, size=(224, 224)) -> dict:
+    """Run just `_encode` for one fit, with no cameras and no arm involved."""
+    return ObservationBuilder(
+        cameras={},
+        arm=FakeArm(),
+        gripper=make_gripper_adapter({"type": "none"}, {}),
+        state_joint_indices=[],
+        state_units=DELTA_EE_STATE_UNITS,
+        image_sizes={"k": size},
+        image_encoding="raw",
+        image_fit=image_fit,
+        action_space="delta-ee",
+    )._encode("k", frame)
+
+
+def _pose_builder(**kw):
+    defaults = dict(
+        cameras={"observation.images.top": FakeCamera()},
+        arm=FakeArm(positions=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+        gripper=make_gripper_adapter({"type": "none"}, {}),
+        state_joint_indices=[],
+        state_units=DELTA_EE_STATE_UNITS,
+        image_sizes={"observation.images.top": (224, 224)},
+        image_encoding="jpeg",
+        jpeg_quality=90,
+        image_fit="stretch_bicubic",
+        action_space="delta-ee",
+    )
+    defaults.update(kw)
+    return ObservationBuilder(**defaults)
+
+
+async def test_builds_the_nine_dim_state_from_a_known_pose():
+    obs = await _pose_builder().build()
+    assert obs.state.shape == (9,)
+    np.testing.assert_allclose(obs.state, GOLDEN_POSE_STATE, rtol=1e-6, atol=1e-6)
+
+
+async def test_the_state_holds_matrix_rows_not_columns():
+    """The transpose canary at the observation boundary.
+
+    `test_pose.py` proves `pose_state` stores rows; this proves the builder
+    did not helpfully transpose on the way past. Both are needed: the state
+    reaches the policy through here, and a transpose applied at either layer
+    produces the same plausible, wrong observation.
+    """
+    from vla.controller.pose import pose_rotation
+
+    obs = await _pose_builder().build()
+    rotation = pose_rotation(
+        {"o_x": 0.0139, "o_y": -0.0271, "o_z": -0.9995, "theta": 41.7}
+    ).as_matrix()
+
+    np.testing.assert_allclose(obs.state[3:], rotation[:2, :].reshape(6), rtol=1e-6, atol=1e-6)
+    assert not np.allclose(obs.state[3:], rotation[:, :2].T.reshape(6), atol=1e-4)
+
+
+async def test_delta_ee_never_reads_joint_positions():
+    """One arm read per tick, and it must be the right one.
+
+    Reading joints as well would double the arm traffic inside a 100 ms
+    budget for a value nothing on this path consumes.
+    """
+
+    class CountingArm(FakeArm):
+        def __init__(self):
+            super().__init__()
+            self.joint_reads = 0
+
+        async def get_joint_positions(self, **kwargs):
+            self.joint_reads += 1
+            return await super().get_joint_positions(**kwargs)
+
+    arm = CountingArm()
+    await _pose_builder(arm=arm).build()
+    assert arm.joint_reads == 0
+
+
+async def test_a_translation_in_metres_scales_only_the_position():
+    obs = await _pose_builder(
+        state_units=VectorUnits((UnitSegment(3, "meters"), UnitSegment(6, "unitless")))
+    ).build()
+    np.testing.assert_allclose(obs.state[:3], [0.3054, -0.01275, 0.2319], rtol=1e-5)
+    np.testing.assert_allclose(obs.state[3:], GOLDEN_POSE_STATE[3:], rtol=1e-6, atol=1e-6)
+
+
+async def test_a_failing_end_position_read_names_the_right_call():
+    class BrokenArm(FakeArm):
+        async def get_end_position(self, **kwargs):
+            raise RuntimeError("no pose for you")
+
+    with pytest.raises(ObservationError, match="end-position read failed"):
+        await _pose_builder(arm=BrokenArm()).build()
+
+
+async def test_a_zero_orientation_vector_is_refused_rather_than_composed_onto():
+    """An all-zero orientation vector describes no rotation at all.
+
+    A driver returning one is broken or uninitialized; Gram-Schmidt would
+    reject it later anyway, but only after the frame had been assembled and
+    sent.
+    """
+    from viam.proto.common import Pose
+
+    arm = FakeArm(pose=Pose(x=1.0, y=2.0, z=3.0, o_x=0.0, o_y=0.0, o_z=0.0, theta=0.0))
+    with pytest.raises(ObservationError, match="no usable orientation"):
+        await _pose_builder(arm=arm).build()
+
+
+async def test_a_non_pose_end_position_is_refused_with_an_actionable_message():
+    class WrongTypeArm(FakeArm):
+        async def get_end_position(self, **kwargs):
+            return object()
+
+    with pytest.raises(ObservationError, match="get_end_position"):
+        await _pose_builder(arm=WrongTypeArm()).build()
+
+
+# ---------------------------------------------------------------------------
+# image_fit="stretch_bicubic"
+# ---------------------------------------------------------------------------
+
+
+def test_stretch_bicubic_fills_the_declared_shape_without_padding():
+    """EVO1's training frames had no bars; the controller must not add any.
+
+    Asserted against "pad" on the same source so the comparison is between
+    the two fits rather than against a hand-computed constant: a 4:3 frame
+    into a square target leaves 56 fully black rows under "pad" and none
+    under any stretch.
+    """
+    frame = np.full((480, 640, 3), 255, dtype=np.uint8)
+
+    stretched = decode_image(_encode_only(frame, "stretch_bicubic"))
+    padded = decode_image(_encode_only(frame, "pad"))
+
+    assert stretched.shape == padded.shape == (224, 224, 3)
+    assert (padded.max(axis=(1, 2)) == 0).sum() == 56
+    assert (stretched.max(axis=(1, 2)) == 0).sum() == 0
+
+
+def test_stretch_bicubic_is_not_the_same_pixels_as_stretch():
+    """Bilinear and bicubic are different resamplers, and the difference is
+    the whole reason this mode exists rather than reusing "stretch"."""
+    frame = np.random.default_rng(0).integers(0, 256, (480, 640, 3), dtype=np.uint8)
+    assert not np.array_equal(
+        decode_image(_encode_only(frame, "stretch_bicubic")),
+        decode_image(_encode_only(frame, "stretch")),
+    )
+
+
+def test_a_frame_already_at_the_declared_shape_is_never_resampled():
+    """The exact-parity case, and the one a real deployment should hit.
+
+    When the camera matches the dataset's resolution the controller must do
+    nothing at all -- any resample here is pure train/inference skew that no
+    choice of resampler can undo.
+    """
+    frame = np.random.default_rng(1).integers(0, 256, (224, 224, 3), dtype=np.uint8)
+    np.testing.assert_array_equal(
+        decode_image(_encode_only(frame, "stretch_bicubic")), frame
+    )

@@ -25,7 +25,15 @@ import pytest
 from google.protobuf.struct_pb2 import Struct
 from viam.proto.app.robot import ServiceConfig
 
-from tests.fakes import FakeArm, FakeCamera, FakeDoCommandGripper, StalledArm
+from tests.fakes import (
+    FakeArm,
+    FakeCamera,
+    FakeDoCommandGripper,
+    PoselessArm,
+    RefusingArm,
+    StalledArm,
+    default_pose,
+)
 from vla.controller.service import VLAController
 from vla.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
@@ -53,8 +61,13 @@ class FakePolicyClient:
         extra_image_shapes=None,
         error="",
         action_value=0.0,
+        state_dim=None,
     ):
         self.action_dim = action_dim
+        # Defaults to action_dim, matching FakePolicyBackend: for joints the
+        # two are the same width. delta-ee is the first case where they are
+        # not (9-dim state, 6-dim action), so it must be settable.
+        self.state_dim = action_dim if state_dim is None else state_dim
         self.n = n
         self.state = state
         self.relative = relative
@@ -76,7 +89,7 @@ class FakePolicyClient:
                 key: [3.0, 224.0, 224.0] for key in self.image_feature_keys
             }
             input_features.update(self.extra_image_shapes)
-            input_features["observation.state"] = [float(self.action_dim)]
+            input_features["observation.state"] = [float(self.state_dim)]
             # Numbers are floats on purpose. A real call crosses gRPC, and
             # protobuf Struct stores every number as a double, so the
             # controller never sees ints here. Returning ints would hide
@@ -84,6 +97,7 @@ class FakePolicyClient:
             return {
                 "policy_type": "fake",
                 "action_dim": float(self.action_dim),
+                "state_dim": float(self.state_dim),
                 "n_action_steps": float(self.n),
                 "input_features": input_features,
                 "output_features": {"action": [float(self.action_dim)]},
@@ -2020,3 +2034,337 @@ async def test_arm_move_asks_the_driver_not_to_wait_for_settle():
     await svc.do_command({"command": "stop"})
     assert arm.move_extras, "the arm was never commanded"
     assert all(e == {"wait": False} for e in arm.move_extras), arm.move_extras
+
+
+# ---------------------------------------------------------------------------
+# action_space="delta-ee"
+#
+# The joints path is exercised by everything above. These cover the four
+# places the two spaces diverge -- observation source, safety layer, arm call,
+# unit conversion -- plus the one behaviour that has no joints counterpart: a
+# `move_to_position` refusal being survivable.
+# ---------------------------------------------------------------------------
+
+
+def _delta_ee_config(**overrides):
+    attrs = {
+        "policy_service": "p",
+        "arm": "a",
+        "cameras": {"observation.images.top": "cam"},
+        "action_space": "delta-ee",
+        "fps": 50.0,
+    }
+    attrs.update(overrides)
+    s = Struct()
+    s.update(attrs)
+    return ServiceConfig(
+        name="c", api="rdk:service:generic", model="viam-labs:vla:controller", attributes=s
+    )
+
+
+def _delta_ee_policy(**kw):
+    """A checkpoint shaped like the xarm-open-box-eedelta one: 9 in, 6 out."""
+    kw.setdefault("action_dim", 6)
+    kw.setdefault("state_dim", 9)
+    return FakePolicyClient(**kw)
+
+
+async def _wait_for_first_pose_move(arm, timeout=2.0):
+    await _wait_until(lambda: arm.pose_moves, "the arm's first pose move", timeout=timeout)
+
+
+async def test_delta_ee_commands_move_to_position_not_joint_positions():
+    arm = FakeArm()
+    svc = _svc(
+        _delta_ee_config(),
+        _deps(policy=_delta_ee_policy(action_value=0.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    await svc.do_command({"command": "stop"})
+
+    assert arm.pose_moves, "the delta-ee path must use move_to_position"
+    assert arm.moves == [], "it must never write joint positions"
+
+
+async def test_delta_ee_composes_the_delta_onto_the_measured_pose():
+    """The end-to-end conversion, checked against the converter's own math.
+
+    A zero delta is the sharpest version of this: the commanded pose must be
+    the measured one, to floating point. Anything that transposes, inverts, or
+    world-frames the rotation moves the tool while the policy asked for
+    nothing.
+    """
+    from vla.controller.pose import orientation_vector, pose_state, state_rotation
+
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(),
+        _deps(policy=_delta_ee_policy(action_value=0.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    await svc.do_command({"command": "stop"})
+
+    expected = orientation_vector(state_rotation(pose_state({"pose": {
+        "x": 305.4, "y": -12.75, "z": 231.9,
+        "o_x": 0.0139, "o_y": -0.0271, "o_z": -0.9995, "theta": 41.7,
+    }})))
+    commanded = arm.pose_moves[0]
+    assert commanded.x == pytest.approx(305.4, abs=1e-4)
+    assert commanded.y == pytest.approx(-12.75, abs=1e-4)
+    assert commanded.z == pytest.approx(231.9, abs=1e-4)
+    assert commanded.o_x == pytest.approx(expected["o_x"], abs=1e-6)
+    assert commanded.o_y == pytest.approx(expected["o_y"], abs=1e-6)
+    assert commanded.o_z == pytest.approx(expected["o_z"], abs=1e-6)
+    assert commanded.theta == pytest.approx(expected["theta"], abs=1e-4)
+
+
+async def test_delta_ee_translation_lands_where_state_compose_puts_it():
+    """A non-zero translation delta, through the controller's own code path.
+
+    `action_value=2.0` makes every channel 2.0, so the position must advance
+    by exactly 2 mm on each axis. The ceilings are raised so nothing clamps
+    and the composition itself is what is visible.
+    """
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(
+            safety={"max_tcp_delta_mm": 1000.0, "max_tcp_rot_delta_rads": 100.0}
+        ),
+        _deps(policy=_delta_ee_policy(action_value=2.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    await svc.do_command({"command": "stop"})
+
+    commanded = arm.pose_moves[0]
+    assert commanded.x == pytest.approx(307.4, abs=1e-3)
+    assert commanded.y == pytest.approx(-10.75, abs=1e-3)
+    assert commanded.z == pytest.approx(233.9, abs=1e-3)
+
+
+async def test_delta_ee_ticks_compound_onto_the_previous_pose():
+    """Relative actions only work if each tick reads the arm again."""
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(
+            safety={"max_tcp_delta_mm": 1000.0, "max_tcp_rot_delta_rads": 100.0}
+        ),
+        _deps(policy=_delta_ee_policy(action_value=1.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.pose_moves) >= 3, "three pose moves")
+    await svc.do_command({"command": "stop"})
+
+    xs = [p.x for p in arm.pose_moves[:3]]
+    assert xs[1] == pytest.approx(xs[0] + 1.0, abs=1e-3)
+    assert xs[2] == pytest.approx(xs[1] + 1.0, abs=1e-3)
+
+
+async def test_the_cartesian_clamp_fires_on_an_over_large_delta():
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(safety={"max_tcp_delta_mm": 5.0}),
+        _deps(policy=_delta_ee_policy(action_value=100.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+
+    assert status["clamp_counts"]["translation"] >= 1
+    # 100 mm on each of three axes is a 173.2 mm step; clamped to a 5 mm
+    # total, and along the same heading because the clamp scales rather than
+    # clips.
+    commanded = arm.pose_moves[0]
+    step = np.linalg.norm([commanded.x - 305.4, commanded.y + 12.75, commanded.z - 231.9])
+    assert float(step) == pytest.approx(5.0, abs=1e-3)
+
+
+async def test_delta_ee_reports_clamp_counts_in_status_like_the_joints_path():
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(),
+        _deps(policy=_delta_ee_policy(action_value=0.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["clamp_counts"] == {}
+
+
+async def test_action_units_in_metres_and_degrees_are_converted_before_composing():
+    """The per-segment conversion, proven end to end.
+
+    Every channel is 0.002. Read as metres and degrees -- what this config
+    declares -- the position advances 2 mm and the rotation by 3.5e-5 rad.
+    Read as the working units instead, the position would advance 0.002 mm
+    and the rotation by 0.002 rad: both are asserted against, because a
+    conversion that fired on the wrong segment would hit exactly one of them.
+    """
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(
+            action_units={"translation": "meters", "rotation": "degrees"},
+            safety={"max_tcp_delta_mm": 1000.0, "max_tcp_rot_delta_rads": 100.0},
+        ),
+        _deps(policy=_delta_ee_policy(action_value=0.002), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    await svc.do_command({"command": "stop"})
+
+    from vla.controller.pose import pose_state, state_delta
+
+    commanded = arm.pose_moves[0]
+    assert commanded.x == pytest.approx(307.4, abs=1e-4)
+    assert commanded.x != pytest.approx(305.402, abs=1e-4), "translation was not converted"
+
+    before = pose_state({"pose": {
+        "x": 305.4, "y": -12.75, "z": 231.9,
+        "o_x": 0.0139, "o_y": -0.0271, "o_z": -0.9995, "theta": 41.7,
+    }})
+    after = pose_state({"pose": {
+        "x": commanded.x, "y": commanded.y, "z": commanded.z,
+        "o_x": commanded.o_x, "o_y": commanded.o_y,
+        "o_z": commanded.o_z, "theta": commanded.theta,
+    }})
+    rotated = float(np.linalg.norm(state_delta(before, after)[3:]))
+    assert rotated == pytest.approx(np.deg2rad(0.002) * np.sqrt(3), rel=1e-3)
+    assert rotated != pytest.approx(0.002 * np.sqrt(3), rel=1e-3), "rotation read as radians"
+
+
+async def test_the_policys_state_is_the_nine_dim_pose_vector():
+    """What actually goes over the wire to the policy service."""
+    from vla.wire import decode_vector
+
+    class RecordingPolicy(FakePolicyClient):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.states = []
+
+        async def do_command(self, command, **kwargs):
+            if command.get("command") == "infer":
+                self.states.append(decode_vector(command["state"]))
+            return await super().do_command(command, **kwargs)
+
+    policy = RecordingPolicy(action_dim=6, state_dim=9, action_value=0.0)
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(_delta_ee_config(), _deps(policy=policy, arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    await svc.do_command({"command": "stop"})
+
+    assert policy.states[0].shape == (9,)
+    np.testing.assert_allclose(policy.states[0][:3], [305.4, -12.75, 231.9], rtol=1e-5)
+
+
+# --- dimension and capability refusals, all before any motion --------------
+
+
+async def test_refuses_a_checkpoint_whose_action_is_not_six_dimensional():
+    arm = FakeArm()
+    svc = _svc(
+        _delta_ee_config(), _deps(policy=_delta_ee_policy(action_dim=7), arm=arm)
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "action_dim mismatch" in status["last_error"]
+    assert arm.pose_moves == []
+
+
+async def test_refuses_a_checkpoint_whose_state_is_not_nine_dimensional():
+    arm = FakeArm()
+    svc = _svc(
+        _delta_ee_config(), _deps(policy=_delta_ee_policy(state_dim=6), arm=arm)
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "state_dim mismatch" in status["last_error"]
+    assert arm.pose_moves == []
+
+
+async def test_refuses_an_arm_that_cannot_report_its_end_position():
+    """Before any motion, the way `_check_joint_indices` does for joints."""
+    arm = PoselessArm()
+    svc = _svc(_delta_ee_config(), _deps(policy=_delta_ee_policy(), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "get_end_position" in status["last_error"]
+    assert arm.pose_moves == []
+
+
+async def test_refuses_an_arm_whose_pose_has_a_degenerate_orientation():
+    from viam.proto.common import Pose
+
+    arm = FakeArm(pose=Pose(x=1.0, y=2.0, z=3.0, o_x=0.0, o_y=0.0, o_z=0.0, theta=0.0))
+    svc = _svc(_delta_ee_config(), _deps(policy=_delta_ee_policy(), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "zero length" in status["last_error"]
+    assert arm.pose_moves == []
+
+
+# --- move_to_position refusals ---------------------------------------------
+
+
+async def test_a_planning_failure_does_not_wedge_the_loop():
+    """An unreachable target is survivable; the joints path has no analogue.
+
+    `move_to_position` runs the driver's IK, which can decline a
+    kinematically unreachable pose while the hardware is fine -- and declines
+    before commanding motion. Because the action is relative, the next tick
+    recomposes from the measured pose, so skipping is self-healing.
+    """
+    arm = RefusingArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(starvation_grace_ticks=100),
+        _deps(policy=_delta_ee_policy(action_value=0.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: arm.refusals >= 3, "three refused moves")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+
+    assert status["state"] == "running", "a refusal must not halt the loop"
+    assert arm.refusals >= 3, "the loop must keep trying"
+
+
+async def test_consecutive_planning_failures_are_bounded():
+    """Survivable is not unbounded: a genuinely stuck arm must still halt."""
+    arm = RefusingArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(starvation_grace_ticks=2),
+        _deps(policy=_delta_ee_policy(action_value=0.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "move_to_position refusals" in status["last_error"]
+    assert arm.stopped >= 1, "the arm must be stopped on the way out"
+
+
+async def test_a_recovered_planning_failure_resets_the_counter():
+    """One bad tick in the middle of a good episode must not accumulate."""
+    arm = FakeArm(pose=default_pose())
+    arm.fail_next_pose_move = True
+    svc = _svc(
+        _delta_ee_config(starvation_grace_ticks=1),
+        _deps(policy=_delta_ee_policy(action_value=0.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.pose_moves) >= 3, "three successful moves")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["state"] == "running"
+
+
+async def test_the_startup_log_states_the_implied_tool_speed_and_the_joint_limit_source(caplog):
+    """`move_to_position` takes no speed argument, so the log is the only
+    place an operator can read what their per-tick ceiling implies."""
+    with caplog.at_level(logging.INFO):
+        _svc(_delta_ee_config(fps=10.0), _deps(policy=_delta_ee_policy()))
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any("400.0000 mm/s" in m for m in messages)
+    assert any("arm driver" in m for m in messages)
