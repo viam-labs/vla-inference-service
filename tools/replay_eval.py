@@ -25,6 +25,14 @@ Two comparisons worth running:
 If (1) is clean and (2) is not, the fault is entirely in observation wiring.
 Compare the two error curves, not either one's absolute value.
 
+Flow-matching policies sample an unseeded noise vector, so the SAME observation
+gives a different chunk every call -- on box-opener the draw-to-draw disagreement
+is roughly half the ground-truth error. A single-draw run therefore cannot
+resolve anything smaller than that. `--repeats N` averages the error over N
+draws per window and prints the spread it averaged away:
+
+  tools/replay_eval.py --part-id $PART --repo-id you/box-flaps --repeats 5
+
 Credentials come from the environment, the standard Viam convention:
     export VIAM_API_KEY=...  VIAM_API_KEY_ID=...
 
@@ -144,6 +152,52 @@ def sample_starts(
         idx = np.linspace(0, len(starts) - 1, limit).round().astype(int)
         starts = [starts[i] for i in sorted(set(idx.tolist()))]
     return starts
+
+
+def repeat_starts(starts: list[int], repeats: int) -> list[int]:
+    """Duplicate each window start so it is drawn `repeats` times.
+
+    The policy is stochastic, so the quantity worth reporting is the EXPECTED
+    error of one draw -- which means averaging errors across draws, never
+    averaging the chunks first. Averaging chunks would measure the error of the
+    mean prediction, a different and much more flattering number than anything
+    the robot ever executes.
+
+    Expanding the sample list is how that is done here: every downstream
+    statistic already means over samples, so N duplicated starts give exactly
+    the mean single-draw error, with the standard error cut by sqrt(N), and no
+    metric function needs to learn about draws.
+    """
+    if repeats < 1:
+        raise ValueError(f"repeats must be >= 1, got {repeats}")
+    return [t for t in starts for _ in range(repeats)]
+
+
+def between_draw_spread(
+    predicted: np.ndarray, repeats: int, mask: np.ndarray | None = None
+) -> float:
+    """Mean L2 of a single draw from the mean of its own window's draws.
+
+    This is the noise floor, and without it a run is unreadable: a few percent
+    between two conditions is indistinguishable from the sampler. Quoted next
+    to the headline it says how much of the headline is real -- with N draws the
+    standard error of the mean is about this over sqrt(N).
+
+    Draws of one window are consecutive rows (see repeat_starts), so the
+    grouping is a reshape, and every window's draws share one mask.
+    """
+    if repeats < 2:
+        return float("nan")
+    n = predicted.shape[0] // repeats
+    if mask is None:
+        mask = np.ones(predicted.shape[:2], dtype=bool)
+    g = predicted.reshape(n, repeats, *predicted.shape[1:])
+    gm = mask.reshape(n, repeats, -1)[:, 0]
+    dev = np.linalg.norm(g - g.mean(axis=1, keepdims=True), axis=3)
+    counts = np.maximum(gm.sum(axis=1), 1)
+    per_window = np.where(gm[:, None, :], dev, 0.0).sum(axis=(1, 2)) / (repeats * counts)
+    live = gm.any(axis=1)
+    return float(per_window[live].mean()) if live.any() else float("nan")
 
 
 def errors_by_position(
@@ -360,6 +414,15 @@ def report(metrics: dict, label: str) -> None:
             "  truncated only."
         )
     print(f"mean L2 per step      : {metrics['l2_mean']:.4f}")
+    reps = int(metrics.get("repeats", 1))
+    if reps > 1:
+        spread = metrics.get("between_draw_spread", float("nan"))
+        print(
+            f"  between-draw spread : {spread:.4f}   <- sampler noise, averaged over "
+            f"{reps} draws/window\n"
+            f"     the mean above therefore carries a standard error of roughly "
+            f"{spread / np.sqrt(reps):.4f} (spread/sqrt(N))."
+        )
     print(f"  at offset k=0       : {metrics['l2_first_step']:.4f}   <- immediate action")
     print(f"  p95                 : {metrics['l2_p95']:.4f}")
 
@@ -540,7 +603,9 @@ async def run(args) -> int:
                 f"episode has {len(frames)} frames, shorter than the {horizon}-step "
                 "chunk; nothing to compare"
             )
-        print(f"sampling {len(starts)} start frames (stride {args.stride})\n")
+        draws = repeat_starts(starts, args.repeats)
+        extra = f" x {args.repeats} draws each" if args.repeats > 1 else ""
+        print(f"sampling {len(starts)} start frames (stride {args.stride}){extra}\n")
 
         camera_hw = None
         if args.camera_resolution:
@@ -549,7 +614,7 @@ async def run(args) -> int:
 
         preds = []
         sampled_states = []
-        for n, t in enumerate(starts, 1):
+        for n, t in enumerate(draws, 1):
             frame = frames[t]
             images = {}
             for key in image_keys:
@@ -569,6 +634,8 @@ async def run(args) -> int:
 
             # Independent samples: reset so no per-episode policy state leaks
             # from the previous call and makes the curve look better than it is.
+            # Per DRAW, not per window -- repeated draws of one window must be
+            # as independent as two different windows are.
             await policy.do_command({"command": "reset"})
             cmd = build_infer_command(images, state, task, args.image_encoding, args.jpeg_quality)
             result = await policy.do_command(cmd)
@@ -576,7 +643,7 @@ async def run(args) -> int:
             chunk = np.asarray(result["actions"]["rows"], dtype=np.float32)
             preds.append(chunk[:horizon])
             print(
-                f"  [{n}/{len(starts)}] frame {t}  latency {result['latency_s']:.2f}s  "
+                f"  [{n}/{len(draws)}] frame {t}  latency {result['latency_s']:.2f}s  "
                 f"L2(k=0) {np.linalg.norm(chunk[0] - recorded[t]):.4f}",
                 flush=True,
             )
@@ -585,20 +652,22 @@ async def run(args) -> int:
         # Windows are padded to `horizon` and masked, rather than trimmed to a
         # ragged list: every statistic then stays a plain array op, and the
         # mask is the single place that knows a window ran off the end.
-        truth = np.zeros((len(starts), horizon, predicted.shape[2]), dtype=np.float32)
-        mask = np.zeros((len(starts), horizon), dtype=bool)
-        for i, t in enumerate(starts):
+        truth = np.zeros((len(draws), horizon, predicted.shape[2]), dtype=np.float32)
+        mask = np.zeros((len(draws), horizon), dtype=bool)
+        for i, t in enumerate(draws):
             avail = min(horizon, len(recorded) - t)
             truth[i, :avail] = recorded[t : t + avail]
             mask[i, :avail] = True
         metrics = compute_errors(predicted, truth, mask)
+        metrics["repeats"] = args.repeats
+        metrics["between_draw_spread"] = between_draw_spread(predicted, args.repeats, mask)
         metrics["by_position"] = errors_by_position(
-            predicted, truth, starts, len(frames), mask=mask
+            predicted, truth, draws, len(frames), mask=mask
         )
         metrics["baselines"] = {
             name: compute_errors(pred, truth, mask)
             for name, pred in naive_baselines(
-                recorded, np.stack(sampled_states), starts, horizon
+                recorded, np.stack(sampled_states), draws, horizon
             ).items()
         }
         label = "dataset frames verbatim"
@@ -800,6 +869,37 @@ def self_check() -> int:
     got5 = errors_by_position(zeros, zeros, deep, short_n, mask=m5)
     assert got5[-1]["n"] > 0, "truncation must make the last bucket reachable"
 
+    # --repeats: the expansion must be a pure duplication (repeats=1 changes
+    # nothing at all), and the averaged metric must be the mean single-draw
+    # error, not the error of the mean chunk -- the whole point of averaging
+    # errors instead of chunks.
+    base = sample_starts(400, 50, 20, 8)
+    assert repeat_starts(base, 1) == base
+    r3 = repeat_starts(base, 3)
+    assert len(r3) == 3 * len(base)
+    assert r3[:3] == [base[0]] * 3, r3[:3]      # draws of one window are adjacent
+    assert sorted(r3) == sorted(base * 3)
+
+    t6 = np.zeros((2, 50, 6), np.float32)
+    draws_a, draws_b = t6 + 1.0, t6 - 1.0       # equal and opposite errors
+    stacked = np.stack([draws_a[0], draws_b[0], draws_a[1], draws_b[1]])
+    truth6 = np.stack([t6[0], t6[0], t6[1], t6[1]])
+    single = compute_errors(stacked, truth6)["l2_mean"]
+    assert abs(single - np.sqrt(6)) < 1e-5, single
+    # averaging the CHUNKS first would have given exactly 0 here; it does not.
+    assert abs(compute_errors(stacked.reshape(2, 2, 50, 6).mean(axis=1), t6)["l2_mean"]) < 1e-6
+
+    # Between-draw spread: zero for identical draws, positive when they differ,
+    # nan when there is nothing to compare.
+    assert np.isnan(between_draw_spread(stacked, 1))
+    assert between_draw_spread(np.repeat(draws_a, 2, axis=0), 2) == 0.0
+    # two draws at +/-1 on 6 dims sit sqrt(6) from their own mean
+    assert abs(between_draw_spread(stacked, 2) - np.sqrt(6)) < 1e-5, between_draw_spread(stacked, 2)
+    # masked-out steps must not contribute, however wild they are
+    m6 = np.ones((4, 50), bool); m6[:, 30:] = False
+    wild = stacked.copy(); wild[0, 30:] = 1e6
+    assert abs(between_draw_spread(wild, 2, m6) - np.sqrt(6)) < 1e-5
+
     print("self-check OK")
     return 0
 
@@ -815,6 +915,11 @@ def main() -> int:
     p.add_argument("--episode", type=int, default=0)
     p.add_argument("--stride", type=int, default=10, help="frames between sampled starts (default: 10)")
     p.add_argument("--limit", type=int, default=0, help="stop after N samples (0 = all)")
+    p.add_argument("--repeats", type=int, default=1, metavar="N",
+                   help="draw each window N times and average the ERRORS (default 1). "
+                        "The policy's sampler is unseeded, so one draw per window is "
+                        "about half noise; N draws cut that by sqrt(N) and the report "
+                        "quotes the spread it averaged away.")
     p.add_argument("--task", default=None, help="override the dataset's task string")
     p.add_argument("--key-map", action="append", metavar="DATASET_KEY=POLICY_SLOT",
                    help="feed a dataset image key into a policy slot; repeatable")
@@ -831,6 +936,8 @@ def main() -> int:
 
     if args.self_check:
         return self_check()
+    if args.repeats < 1:
+        p.error("--repeats must be >= 1")
     if not args.repo_id:
         p.error("--repo-id required (or use --self-check)")
     if bool(args.address) == bool(args.part_id):
