@@ -97,3 +97,111 @@ def test_padding_is_never_on_the_bottom_or_right(src_h, src_w, tgt_h, tgt_w):
     assert right == tgt_w - 1, "content must reach the right edge; padding goes on the left"
     assert np.all(ours[:top] == 0), "the top padding band must be black"
     assert np.all(ours[:, :left] == 0), "the left padding band must be black"
+
+
+# ---------------------------------------------------------------------------
+# image_fit="stretch_bicubic" vs EVO1's own resize.
+#
+# `_batched_resize_01` (lerobot/policies/evo1/internvl3_embedder.py) is what
+# actually runs on every frame inside an EVO1 policy. Its docstring states it
+# exists to mirror InternVL3's reference PIL preprocessing -- `Image.resize`
+# with the default (bicubic) resampler -- so the claim under test is that the
+# controller's PIL bicubic reproduces it, and that the pre-existing "stretch"
+# (BILINEAR) does not.
+#
+# This runs on the *controller* side rather than testing lerobot: the
+# controller resizes a live camera frame onto the checkpoint's declared shape
+# before the policy ever sees it, so a resampler mismatch here compounds with
+# the policy's own resize into train/inference skew nothing downstream reports.
+# ---------------------------------------------------------------------------
+
+# Frames are random noise on purpose: it is the adversarial input for a
+# resampler comparison. Natural images agree far more closely, so a tolerance
+# that holds here holds everywhere that matters.
+RESAMPLE_CASES = [
+    (480, 640, 448),  # a 4:3 camera onto EVO1's native 448
+    (1080, 1920, 448),  # heavy downscale
+    (224, 224, 448),  # upscale from a square
+    (300, 300, 448),  # non-power-of-two square
+]
+
+# Mean absolute difference of 0.30/255 across a whole frame. Empirically PIL
+# and torchvision agree to 0.13-0.29 on random noise; BILINEAR is 3.3-13.1
+# away, so this threshold separates "the same resampler" from "a different
+# one" by an order of magnitude and is not a fudge factor.
+_MEAN_TOLERANCE = 0.30
+
+
+def _evo1_resize(frame: np.ndarray, image_size: int) -> np.ndarray:
+    """Exactly what `_batched_resize_01` does, on one frame."""
+    import torchvision.transforms.functional as tvf
+    from torchvision.transforms.functional import InterpolationMode
+
+    images = torch.from_numpy(frame).permute(2, 0, 1).float().div_(255.0).unsqueeze(0)
+    pixels_u8 = (images * 255.0).clamp(0, 255).to(torch.uint8)
+    resized = tvf.resize(
+        pixels_u8, [image_size, image_size], interpolation=InterpolationMode.BICUBIC, antialias=True
+    )
+    return resized.squeeze(0).permute(1, 2, 0).numpy()
+
+
+def _fit(frame: np.ndarray, image_fit: str, size: int) -> np.ndarray:
+    from tests.fakes import FakeArm
+    from vla.controller.gripper import make_gripper_adapter
+    from vla.controller.units import UnitSegment, VectorUnits
+    from vla.wire import decode_image
+
+    builder = ObservationBuilder(
+        cameras={},
+        arm=FakeArm(),
+        gripper=make_gripper_adapter({"type": "none"}, {}),
+        state_joint_indices=[],
+        state_units=VectorUnits((UnitSegment(3, "millimeters"), UnitSegment(6, "unitless"))),
+        image_sizes={"k": (size, size)},
+        image_encoding="raw",
+        image_fit=image_fit,
+        action_space="delta-ee",
+    )
+    return decode_image(builder._encode("k", frame))
+
+
+@pytest.mark.parametrize(("src_h", "src_w", "size"), RESAMPLE_CASES)
+def test_stretch_bicubic_reproduces_evo1s_resize(src_h, src_w, size):
+    pytest.importorskip("lerobot.policies.evo1.internvl3_embedder")
+    frame = np.random.default_rng(src_h * src_w).integers(
+        0, 256, (src_h, src_w, 3), dtype=np.uint8
+    )
+
+    ours = _fit(frame, "stretch_bicubic", size)
+    theirs = _evo1_resize(frame, size)
+
+    assert ours.shape == theirs.shape == (size, size, 3)
+    mean_error = float(np.abs(ours.astype(np.int32) - theirs.astype(np.int32)).mean())
+    assert mean_error < _MEAN_TOLERANCE, (
+        f"stretch_bicubic diverged from EVO1's resize by {mean_error:.4f}/255; "
+        "the controller and the policy are no longer using the same resampler"
+    )
+
+
+@pytest.mark.parametrize(("src_h", "src_w", "size"), RESAMPLE_CASES)
+def test_the_bilinear_stretch_would_not_have_passed(src_h, src_w, size):
+    """The half that makes the test above mean something.
+
+    Without this, `_MEAN_TOLERANCE` could be loose enough to accept any
+    resampler at all and nobody would know. This pins that the pre-existing
+    "stretch" -- the obvious thing to reuse -- fails the same threshold by an
+    order of magnitude, which is why a third fit exists.
+    """
+    pytest.importorskip("lerobot.policies.evo1.internvl3_embedder")
+    frame = np.random.default_rng(src_h * src_w).integers(
+        0, 256, (src_h, src_w, 3), dtype=np.uint8
+    )
+
+    bilinear = _fit(frame, "stretch", size)
+    theirs = _evo1_resize(frame, size)
+
+    mean_error = float(np.abs(bilinear.astype(np.int32) - theirs.astype(np.int32)).mean())
+    assert mean_error > _MEAN_TOLERANCE * 5, (
+        f"BILINEAR is now within {mean_error:.4f}/255 of EVO1's resize; if that is "
+        "genuinely true, `stretch_bicubic` no longer earns its place"
+    )

@@ -1,7 +1,16 @@
 """Bounded-motion checks applied to every action before it reaches the arm.
 
 This is the last line of defense between a policy's output and a real robot
-arm. Order matters and is deliberately fixed:
+arm. There is one layer per action space, because the two command the arm
+through different SDK calls with different guarantees:
+
+  - `SafetyLayer` -- `action_space="joints"`, absolute joint targets in
+    degrees written with `move_to_joint_positions`.
+  - `CartesianSafetyLayer` -- `action_space="delta-ee"`, a per-tick pose
+    delta in millimetres and radians composed onto the measured
+    `EndPosition` and written with `move_to_position`.
+
+`SafetyLayer`'s order matters and is deliberately fixed:
 
   1. Reject NaN/inf in the whole vector -- fail the chunk, never clamp it.
   2. Dimension check against the current measured position.
@@ -172,3 +181,118 @@ class SafetyLayer:
             out[gripper_idx] = clamped
 
         return out
+
+
+@dataclass(frozen=True)
+class CartesianLimits:
+    """Per-tick ceilings on a delta-EE action, in working units (mm, radians).
+
+    The defaults come from the recorded per-tick statistics of the dataset
+    these checkpoints are trained on (`xarm-open-box-eedelta`, 34,670 frames
+    at 10 fps):
+
+    | quantity    | median  | p99     | max     | default here |
+    | ----------- | ------- | ------- | ------- | ------------ |
+    | translation | 9.31 mm | 28.4 mm | 96.8 mm | 40 mm        |
+    | rotation    | 0.0142  | 0.0807  | 0.3246  | 0.12 rad     |
+
+    Each default sits about 1.4x above the p99, so ordinary in-distribution
+    motion never clamps and the counter stays a genuine signal, and well
+    below the largest single tick in the recording, which at 10 fps would be
+    968 mm/s of tool travel. Clamping *below* the observed maximum is the
+    deliberate half of that choice: the recorded extremes are a handful of
+    frames out of 34,670, so reproducing them at full driver speed buys
+    nothing and a policy that emits one every tick is out of distribution,
+    not in a hurry.
+    """
+
+    max_tcp_delta_mm: float = 40.0
+    max_tcp_rot_delta_rads: float = 0.12
+
+
+class CartesianSafetyLayer:
+    """Per-tick magnitude clamp on a delta-EE action. THE velocity limit.
+
+    `move_to_position` carries no notion of "this delta represents one 100 ms
+    tick" -- it takes a pose and drives to it at whatever speed the driver
+    chooses -- so a policy emitting an out-of-distribution delta would have it
+    executed at full driver speed. Bounding the delta is therefore the only
+    thing standing between a bad chunk and a fast, large tool motion, exactly
+    as `SafetyLayer`'s `max_joint_delta_degs` is for the joints path (see item
+    5 of the module docstring). `ControllerConfig` derives these ceilings from
+    the operator-facing `max_tcp_vel_mms_per_sec` /
+    `max_tcp_rot_vel_rads_per_sec` divided by `fps`, the same way it derives
+    `max_joint_delta_degs`.
+
+    Both clamps scale the whole 3-vector by a single factor rather than
+    clipping component-wise. Component-wise clipping would change the
+    *direction* of the commanded motion -- a delta of (100, 100, 0) mm would
+    come out as (40, 40, 0), which happens to stay on the same diagonal, but
+    (100, 10, 0) would come out (40, 10, 0), a different heading than the
+    policy asked for. In joint space that reshaping is the definition of a
+    per-joint limit; in Cartesian space the direction is the physical path of
+    the tool, so preserving it and shortening the step is the only clamp that
+    means "go the same way, less far". The same argument applies to the
+    rotation vector, where the norm is the angle and the direction is the
+    axis: scaling keeps the axis and reduces the angle.
+
+    What this layer does NOT cover, stated plainly so nobody assumes
+    otherwise: joint limits. `joint_limits_degs` has no Cartesian analogue,
+    and an out-of-range or unreachable target is refused by the arm driver's
+    own IK rather than here (`move_to_position` is the component method, not
+    the motion service, so there is no obstacle avoidance either).
+    `ControllerConfig` rejects `joint_limits_degs` under this action space
+    rather than accepting a limit it would silently never apply.
+
+    `clamp_counts` is keyed the same way `SafetyLayer`'s is (`translation` /
+    `rotation`) so `VLAController._status()` reports both layers identically.
+    """
+
+    def __init__(self, limits: CartesianLimits) -> None:
+        self.limits = limits
+        self.clamp_counts: Counter[str] = Counter()
+
+    def apply(self, delta: np.ndarray) -> np.ndarray:
+        """Clamp a 6-dim `[dx, dy, dz, drx, dry, drz]` action in mm and radians.
+
+        Raises `SafetyError` for non-finite input or a wrong dimension;
+        otherwise always returns a fresh 6-vector, clamping rather than
+        rejecting an out-of-range but finite delta -- the same contract
+        `SafetyLayer.apply` keeps.
+        """
+        out = np.asarray(delta, dtype=np.float64).copy()
+        if out.shape != (6,):
+            raise SafetyError(
+                f"a delta-ee action must have 6 dimensions [dx, dy, dz, drx, dry, drz], "
+                f"got shape {out.shape}"
+            )
+        if not np.all(np.isfinite(out)):
+            raise SafetyError(f"action must be finite (no NaN/inf); got {delta}")
+
+        out[0:3] = self._scaled(
+            out[0:3], self.limits.max_tcp_delta_mm, "translation", "mm"
+        )
+        out[3:6] = self._scaled(
+            out[3:6], self.limits.max_tcp_rot_delta_rads, "rotation", "rad"
+        )
+        return out
+
+    def _scaled(
+        self, vector: np.ndarray, ceiling: float, kind: str, unit: str
+    ) -> np.ndarray:
+        magnitude = float(np.linalg.norm(vector))
+        if magnitude <= ceiling:
+            return vector
+        self.clamp_counts[kind] += 1
+        LOGGER.warning(
+            "%s clamp engaged: |delta| %.4f %s exceeds the per-tick ceiling of %.4f %s, "
+            "scaling the step down along the same %s; persistent clamping usually means "
+            "wrong units or a checkpoint trained at a different fps",
+            kind,
+            magnitude,
+            unit,
+            ceiling,
+            unit,
+            "heading" if kind == "translation" else "axis",
+        )
+        return vector * (ceiling / magnitude)
