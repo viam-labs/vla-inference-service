@@ -12,23 +12,58 @@ from __future__ import annotations
 import numpy as np
 
 
+def default_pose(x=305.4, y=-12.75, z=231.9, o_x=0.0139, o_y=-0.0271, o_z=-0.9995, theta=41.7):
+    """A near-vertical tool pose in the shape an xarm reports it.
+
+    Not the identity, and deliberately so. `o_z` near -1 with a non-zero
+    `theta` is the regime the recorded dataset actually sits in, and it is the
+    regime where a transposed rotation matrix is *closest* to being mistaken
+    for the real one -- the rows and columns of this pose's matrix differ by
+    0.047, small enough to look like noise and far too large to be one.
+    """
+    from viam.proto.common import Pose
+
+    return Pose(x=x, y=y, z=z, o_x=o_x, o_y=o_y, o_z=o_z, theta=theta)
+
+
 class FakeArm:
     """Duck-types `viam.components.arm.Arm` as it exists in the INSTALLED SDK.
 
     The installed viam-sdk 0.80.0 -- the latest on PyPI -- exposes only
-    `get_joint_positions`, `move_to_joint_positions`, `stop`, and
-    `get_kinematics`. It has NO `move_through_joint_positions`, and `MoveOptions`
-    is a generated proto type that no method consumes; both exist only in the
-    unreleased dev checkout. This fake deliberately omits them, so a caller that
-    reaches for the newer API fails here rather than on a robot.
+    `get_joint_positions`, `move_to_joint_positions`, `get_end_position`,
+    `move_to_position`, `stop`, and `get_kinematics`. It has NO
+    `move_through_joint_positions`, and `MoveOptions` is a generated proto type
+    that no method consumes; both exist only in the unreleased dev checkout.
+    This fake deliberately omits them, so a caller that reaches for the newer
+    API fails here rather than on a robot.
+
+    The pose half backs `action_space="delta-ee"`. `move_to_position` snaps the
+    reported pose to whatever was commanded, mirroring how
+    `move_to_joint_positions` snaps `positions` -- so a test that ticks twice
+    sees the second delta composed onto the first result, which is the property
+    the relative action space depends on. `PoselessArm` and `RefusingArm` below
+    cover the two ways a real driver declines.
     """
 
-    def __init__(self, positions=None):
+    def __init__(self, positions=None, pose=None):
         self.positions = list(positions or [0.0] * 6)
         self.moves = []
         self.move_extras = []
         self.stopped = 0
         self.fail_next_move = False
+        self.pose = pose if pose is not None else default_pose()
+        self.pose_moves = []
+        self.fail_next_pose_move = False
+
+    async def get_end_position(self, **kwargs):
+        return self.pose
+
+    async def move_to_position(self, pose, *, extra=None, timeout=None, **kwargs):
+        if self.fail_next_pose_move:
+            self.fail_next_pose_move = False
+            raise RuntimeError("arm could not plan to the requested pose")
+        self.pose_moves.append(pose)
+        self.pose = pose
 
     async def get_joint_positions(self, **kwargs):
         from viam.proto.component.arm import JointPositions
@@ -80,6 +115,37 @@ class StalledArm(FakeArm):
         self._record_move(positions, extra)
         # Deliberately does NOT update self.positions -- the whole point, and
         # now the only line this override exists to omit.
+
+
+class PoselessArm(FakeArm):
+    """An arm whose driver does not implement `get_end_position`.
+
+    Real drivers signal this by raising, not by returning `None`, so this
+    raises. The controller must refuse at startup rather than on the first
+    tick.
+    """
+
+    async def get_end_position(self, **kwargs):
+        raise NotImplementedError("this arm does not report an end position")
+
+
+class RefusingArm(FakeArm):
+    """An arm whose IK refuses every `move_to_position`.
+
+    The kinematically-unreachable-target case: the driver declines *before*
+    commanding motion, so the arm is stationary and the reported pose never
+    changes. `refusals` counts the attempts, which is what proves the loop
+    kept ticking rather than halting on the first one.
+    """
+
+    def __init__(self, positions=None, pose=None):
+        super().__init__(positions=positions, pose=pose)
+        self.refusals = 0
+
+    async def move_to_position(self, pose, *, extra=None, timeout=None, **kwargs):
+        self.refusals += 1
+        raise RuntimeError("cannot plan to the requested pose: target unreachable")
+
 
 
 class FakeCamera:

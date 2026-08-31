@@ -617,3 +617,267 @@ def test_config_error_is_the_shared_config_util_type():
     from vla.config_util import ConfigError as SharedConfigError
 
     assert ConfigError is SharedConfigError
+
+
+# ---------------------------------------------------------------------------
+# action_space
+#
+# The first half of this section is the back-compat guard: every default an
+# existing joints deployment relies on, asserted by value, so a change to the
+# delta-ee branch that leaks into the shared path fails here.
+# ---------------------------------------------------------------------------
+
+DELTA_EE_BASE = {
+    "policy_service": "vla-policy",
+    "arm": "my-arm",
+    "cameras": {"observation.images.top": "cam-top"},
+    "action_space": "delta-ee",
+}
+
+
+def test_action_space_defaults_to_joints():
+    assert ControllerConfig.parse(BASE).action_space == "joints"
+
+
+def test_an_existing_joints_config_is_unaffected_in_every_field():
+    """Byte-for-byte the config an already-deployed machine produces.
+
+    Written out by value rather than compared against a golden object,
+    because the failure this guards against is precisely a default silently
+    moving -- and a golden built from the same code would move with it.
+    """
+    cfg = ControllerConfig.parse(BASE)
+    assert cfg.action_space == "joints"
+    assert cfg.state_joint_indices == [0, 1, 2, 3, 4]
+    assert cfg.state_units == "degrees"
+    assert cfg.action_units == "degrees"
+    assert cfg.image_fit == "pad"
+    assert cfg.safety.max_joint_delta_degs == 8.0
+    assert cfg.safety.max_start_delta_degs == 15.0
+    assert cfg.safety.max_vel_degs_per_sec is None
+    assert cfg.safety.joint_limits_degs is None
+    assert cfg.safety.stop_on_error is True
+
+
+def test_rejects_an_unknown_action_space():
+    with pytest.raises(ConfigError, match="action_space"):
+        ControllerConfig.parse({**BASE, "action_space": "cartesian"})
+
+
+def test_delta_ee_parses_with_no_state_joint_indices():
+    cfg = ControllerConfig.parse(DELTA_EE_BASE)
+    assert cfg.action_space == "delta-ee"
+    assert cfg.state_joint_indices == []
+
+
+def test_delta_ee_rejects_leftover_state_joint_indices():
+    """Rejected, not ignored: the field describes a state layout that no
+    longer exists on this path, and silence would be the only signal."""
+    with pytest.raises(ConfigError, match="state_joint_indices"):
+        ControllerConfig.parse({**DELTA_EE_BASE, "state_joint_indices": [0, 1, 2]})
+
+
+def test_joints_still_requires_state_joint_indices():
+    with pytest.raises(ConfigError, match="state_joint_indices is required"):
+        ControllerConfig.parse({k: v for k, v in BASE.items() if k != "state_joint_indices"})
+
+
+@pytest.mark.parametrize("gripper_type", [t for t in GRIPPER_TYPES if t != "none"])
+def test_delta_ee_rejects_every_gripper_variant(gripper_type):
+    with pytest.raises(ConfigError, match="no gripper channel"):
+        ControllerConfig.parse({**DELTA_EE_BASE, "gripper": {"type": gripper_type, "name": "g"}})
+
+
+def test_delta_ee_accepts_an_explicit_none_gripper():
+    assert ControllerConfig.parse({**DELTA_EE_BASE, "gripper": {"type": "none"}}).gripper == {
+        "type": "none"
+    }
+
+
+# --- image_fit -------------------------------------------------------------
+
+
+def test_delta_ee_defaults_image_fit_to_stretch_bicubic():
+    """EVO1 does not pad; padding would feed it bars its training data lacked."""
+    assert ControllerConfig.parse(DELTA_EE_BASE).image_fit == "stretch_bicubic"
+
+
+def test_joints_still_defaults_image_fit_to_pad():
+    assert ControllerConfig.parse(BASE).image_fit == "pad"
+
+
+def test_an_explicit_image_fit_overrides_the_action_space_default():
+    assert ControllerConfig.parse({**DELTA_EE_BASE, "image_fit": "pad"}).image_fit == "pad"
+    assert (
+        ControllerConfig.parse({**BASE, "image_fit": "stretch_bicubic"}).image_fit
+        == "stretch_bicubic"
+    )
+
+
+# --- units -----------------------------------------------------------------
+
+
+def test_delta_ee_units_default_to_the_converters_own():
+    cfg = ControllerConfig.parse(DELTA_EE_BASE)
+    assert [(s.size, s.unit) for s in cfg.state_units.segments] == [
+        (3, "millimeters"),
+        (6, "unitless"),
+    ]
+    assert [(s.size, s.unit) for s in cfg.action_units.segments] == [
+        (3, "millimeters"),
+        (3, "radians"),
+    ]
+
+
+def test_delta_ee_units_accept_a_checkpoint_in_metres_and_degrees():
+    cfg = ControllerConfig.parse(
+        {
+            **DELTA_EE_BASE,
+            "state_units": {"translation": "meters"},
+            "action_units": {"translation": "meters", "rotation": "degrees"},
+        }
+    )
+    assert [s.unit for s in cfg.state_units.segments] == ["meters", "unitless"]
+    assert [s.unit for s in cfg.action_units.segments] == ["meters", "degrees"]
+
+
+def test_delta_ee_rejects_the_plain_string_unit_form():
+    """One unit cannot describe a vector that mixes mm with radians.
+
+    Accepting the string and applying it to the whole vector is how a
+    translation in millimetres gets multiplied by pi/180.
+    """
+    with pytest.raises(ConfigError, match="must be an object"):
+        ControllerConfig.parse({**DELTA_EE_BASE, "action_units": "radians"})
+
+
+def test_delta_ee_rejects_a_non_unitless_state_rotation():
+    """The state's rotation half is direction cosines under every checkpoint."""
+    with pytest.raises(ConfigError, match="state_units.rotation"):
+        ControllerConfig.parse({**DELTA_EE_BASE, "state_units": {"rotation": "radians"}})
+
+
+def test_delta_ee_rejects_an_unknown_units_key():
+    with pytest.raises(ConfigError, match="unknown key"):
+        ControllerConfig.parse({**DELTA_EE_BASE, "action_units": {"gripper": "normalized"}})
+
+
+def test_delta_ee_rejects_a_nonsense_translation_unit():
+    with pytest.raises(ConfigError, match="action_units.translation"):
+        ControllerConfig.parse({**DELTA_EE_BASE, "action_units": {"translation": "radians"}})
+
+
+def test_joints_units_are_still_plain_strings():
+    cfg = ControllerConfig.parse({**BASE, "state_units": "radians", "action_units": "radians"})
+    assert cfg.state_units == "radians"
+    assert cfg.action_units == "radians"
+
+
+# --- safety ----------------------------------------------------------------
+
+
+def test_delta_ee_safety_defaults_come_from_the_recorded_statistics():
+    s = ControllerConfig.parse(DELTA_EE_BASE).safety
+    assert s.max_tcp_delta_mm == 40.0
+    assert s.max_tcp_rot_delta_rads == 0.12
+    assert s.max_tcp_vel_mms_per_sec is None
+    assert s.max_tcp_rot_vel_rads_per_sec is None
+    assert s.stop_on_error is True
+
+
+def test_delta_ee_derives_the_per_tick_ceilings_from_the_velocity_knobs():
+    """Same rule as the joints path: the velocity is the operator-facing knob."""
+    s = ControllerConfig.parse(
+        {
+            **DELTA_EE_BASE,
+            "fps": 20.0,
+            "safety": {
+                "max_tcp_vel_mms_per_sec": 300.0,
+                "max_tcp_rot_vel_rads_per_sec": 1.0,
+            },
+        }
+    ).safety
+    assert s.max_tcp_delta_mm == pytest.approx(15.0)
+    assert s.max_tcp_rot_delta_rads == pytest.approx(0.05)
+
+
+def test_delta_ee_accepts_a_velocity_and_a_matching_per_tick_ceiling():
+    s = ControllerConfig.parse(
+        {
+            **DELTA_EE_BASE,
+            "fps": 10.0,
+            "safety": {"max_tcp_vel_mms_per_sec": 400.0, "max_tcp_delta_mm": 40.0},
+        }
+    ).safety
+    assert s.max_tcp_delta_mm == pytest.approx(40.0)
+    assert s.max_tcp_vel_mms_per_sec == 400.0
+
+
+def test_delta_ee_refuses_a_velocity_that_contradicts_the_per_tick_ceiling():
+    with pytest.raises(ConfigError, match="max_tcp_vel_mms_per_sec"):
+        ControllerConfig.parse(
+            {
+                **DELTA_EE_BASE,
+                "fps": 10.0,
+                "safety": {"max_tcp_vel_mms_per_sec": 400.0, "max_tcp_delta_mm": 12.0},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "key", ["max_joint_delta_degs", "max_start_delta_degs", "max_vel_degs_per_sec"]
+)
+def test_delta_ee_rejects_joint_space_safety_knobs(key):
+    with pytest.raises(ConfigError, match=key):
+        ControllerConfig.parse({**DELTA_EE_BASE, "safety": {key: 5.0}})
+
+
+def test_delta_ee_rejects_joint_limits_rather_than_silently_dropping_them():
+    """`move_to_position` has no joint-limit hook, so this config would be
+    inert; an inert safety limit is the worst possible outcome."""
+    with pytest.raises(ConfigError, match="joint_limits_degs"):
+        ControllerConfig.parse(
+            {**DELTA_EE_BASE, "safety": {"joint_limits_degs": [[-90.0, 90.0]] * 6}}
+        )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "max_tcp_delta_mm",
+        "max_tcp_rot_delta_rads",
+        "max_tcp_vel_mms_per_sec",
+        "max_tcp_rot_vel_rads_per_sec",
+    ],
+)
+def test_joints_rejects_cartesian_safety_knobs(key):
+    """Symmetric with the above -- an inert Cartesian knob is equally bad."""
+    with pytest.raises(ConfigError, match=key):
+        ControllerConfig.parse({**BASE, "safety": {key: 5.0}})
+
+
+@pytest.mark.parametrize("key", ["max_tcp_delta_mm", "max_tcp_rot_delta_rads"])
+def test_delta_ee_rejects_nonpositive_ceilings(key):
+    with pytest.raises(ConfigError, match=key):
+        ControllerConfig.parse({**DELTA_EE_BASE, "safety": {key: 0}})
+
+
+def test_delta_ee_still_honours_stop_on_error():
+    assert (
+        ControllerConfig.parse({**DELTA_EE_BASE, "safety": {"stop_on_error": False}})
+        .safety.stop_on_error
+        is False
+    )
+
+
+def test_delta_ee_dependencies_are_the_policy_arm_and_cameras():
+    assert ControllerConfig.parse(DELTA_EE_BASE).dependencies() == [
+        "vla-policy",
+        "my-arm",
+        "cam-top",
+    ]
+
+
+def test_safety_config_parse_still_defaults_to_the_joints_action_space():
+    """`SafetyConfig.parse` is called directly by existing tests and callers."""
+    assert SafetyConfig.parse({"max_joint_delta_degs": 3.0}, fps=10.0).max_joint_delta_degs == 3.0

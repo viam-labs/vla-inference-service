@@ -296,10 +296,11 @@ backoff for up to `policy_ready_timeout_s`.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
+| `action_space` | `joints` \| `delta-ee` | `"joints"` | What the checkpoint speaks. `joints` is absolute joint angles written with `move_to_joint_positions`. `delta-ee` is a per-tick end-effector pose delta composed onto the measured `EndPosition` and written with `move_to_position` — see [`action_space`](#action_space). |
 | `policy_service` | string | required | Name of the `viam-labs:vla:policy` dependency. |
 | `arm` | string | required | Name of the Viam `arm` component to drive. |
 | `cameras` | object (feature key → camera name) | required | Must cover every key the policy reports in `specs.image_feature_keys`. |
-| `state_joint_indices` | array of integers | required | Maps Viam joint order (base → end-effector) onto the state-vector position the checkpoint expects. Indices, not names — Viam joint names are not guaranteed to match LeRobot feature names. |
+| `state_joint_indices` | array of integers | required under `action_space: "joints"` | Maps Viam joint order (base → end-effector) onto the state-vector position the checkpoint expects. Indices, not names — Viam joint names are not guaranteed to match LeRobot feature names. Rejected under `delta-ee`, which builds its state from `EndPosition`. |
 | `gripper` | object | `{"type": "none"}` | Discriminated union — four variants, see below. |
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
@@ -307,23 +308,80 @@ backoff for up to `policy_ready_timeout_s`.
 | `queue_threshold` | integer | derived (`n_action_steps - 1`) | `mode: "async"` only: refill fires once the queue has this many actions left. Leave unset — the derived default is the highest useful value. See [Performance](#performance). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
-| `state_units` | `degrees` \| `radians` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). |
-| `action_units` | `degrees` \| `radians` | `"degrees"` | Unit the policy's action is expressed in. |
+| `state_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). Under `delta-ee` this is per-segment; see [Units](#units). |
+| `action_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit the policy's action is expressed in. Per-segment under `delta-ee`. |
 | `image_encoding` | `jpeg` \| `png` \| `raw` | `"jpeg"` | A debugging knob (JPEG artifacts vs. the training distribution), not a tuning one. |
 | `jpeg_quality` | integer, 0–100 | `90` | |
-| `image_fit` | `pad` \| `stretch` | `"pad"` | How a camera frame is resized onto the checkpoint's declared `(h, w)` whenever the frame's shape differs from it — see below. |
+| `image_fit` | `pad` \| `stretch` \| `stretch_bicubic` | `"pad"`, or `"stretch_bicubic"` under `delta-ee` | How a camera frame is resized onto the checkpoint's declared `(h, w)` whenever the frame's shape differs from it — see below. |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
-| `safety.max_joint_delta_degs` | number | `8.0` | Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
-| `safety.max_start_delta_degs` | number | `15.0` | `start` refuses outright if the first predicted action is farther than this from the current pose. |
-| `safety.max_vel_degs_per_sec` | number | — | Operator-facing velocity knob — see [Safety](#safety). |
-| `safety.joint_limits_degs` | array of `[min, max]` | — | One pair per action-vector dimension, **in action-vector order** (not Viam joint order) — see [Safety](#safety). |
+| `safety.max_joint_delta_degs` | number | `8.0` | `joints` only. Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
+| `safety.max_start_delta_degs` | number | `15.0` | `joints` only. `start` refuses outright if the first predicted action is farther than this from the current pose. |
+| `safety.max_vel_degs_per_sec` | number | — | `joints` only. Operator-facing velocity knob — see [Safety](#safety). |
+| `safety.joint_limits_degs` | array of `[min, max]` | — | `joints` only. One pair per action-vector dimension, **in action-vector order** (not Viam joint order) — see [Safety](#safety). |
+| `safety.max_tcp_delta_mm` | number | `40.0` | `delta-ee` only. Per-tick ceiling on `norm(delta[:3])`. Derived from `max_tcp_vel_mms_per_sec` when that is set instead. |
+| `safety.max_tcp_rot_delta_rads` | number | `0.12` | `delta-ee` only. Per-tick ceiling on `norm(delta[3:])`. |
+| `safety.max_tcp_vel_mms_per_sec` | number | — | `delta-ee` only. Operator-facing tool-speed knob; the per-tick ceiling is `vel / fps`. |
+| `safety.max_tcp_rot_vel_rads_per_sec` | number | — | `delta-ee` only. Same, for rotation. |
 | `safety.stop_on_error` | boolean | `true` | Whether a failure producing the next action (camera read, observation assembly, the policy call) halts the loop, or is logged and the tick skipped. |
+
+### `action_space`
+
+`"joints"`, the default, is what everything else in this README describes: the policy
+observes selected joint angles and emits absolute joint angles.
+
+`"delta-ee"` runs a checkpoint trained on **end-effector pose deltas** — an EVO1
+checkpoint from the `viam-labs/viam-sequence-to-lerobot` `action-space-delta-ee`
+converter, for instance. The vector layouts are fixed by that dataset contract, not
+by config:
+
+| | dims | layout |
+|---|---|---|
+| `observation.state` | 9 | `x, y, z` in millimetres as `EndPosition` reports them, then the first two **rows** of the tool's 3x3 rotation matrix, row-major |
+| `action` | 6 | `dx, dy, dz` in millimetres, then the **body-frame** relative rotation as an axis-angle vector in radians |
+
+Each tick: read `get_end_position()`, build the 9-vector, infer, convert the 6-vector
+into millimetres and radians, clamp its magnitude, compose it onto the *measured* pose,
+and call `arm.move_to_position`. Everything else — the scheduler, `mode`, chunk pacing,
+`starvation_grace_ticks`, `status` — behaves exactly as it does for `joints`.
+
+```json
+{
+  "action_space": "delta-ee",
+  "policy_service": "vla-policy",
+  "arm": "xarm",
+  "cameras": { "observation.images.top": "cam-top" },
+  "fps": 10.0,
+  "task": "open the box",
+  "safety": { "max_tcp_vel_mms_per_sec": 400.0 }
+}
+```
+
+Three keys are **rejected** rather than ignored under this action space, because each
+would be inert and silence is the worst possible signal for a safety limit or a state
+layout:
+
+- `state_joint_indices` — the observation comes from `EndPosition`, not from joints.
+- `gripper.type` other than `"none"` — the recording captured no gripper component and
+  no seventh joint, so the checkpoint has no jaw channel. Drive the gripper out of band.
+- every joint-space `safety` key — no enforcement path on `move_to_position`.
+
+The rejection is symmetric: the `safety.max_tcp_*` keys are refused under `"joints"`.
+
+**Unreachable poses do not kill the run.** `move_to_position` goes through the driver's
+inverse kinematics, which can decline a kinematically unreachable target or a
+singularity while the hardware is fine — and declines before commanding any motion.
+Because the action is relative, the next tick simply recomposes from the measured pose,
+so a refusal is logged and the tick skipped. Consecutive refusals are bounded by
+`starvation_grace_ticks`, so a genuinely stuck arm still halts.
 
 ### `image_fit`
 
-**Leave this at `"pad"`.** Most Viam cameras stream 16:9 while checkpoints often declare a
-square resolution, so a frame nearly always has to be reshaped. `"pad"` scales by
+**Leave this at its default for your action space.** Most Viam cameras stream 16:9 while
+checkpoints often declare a square resolution, so a frame nearly always has to be
+reshaped — and the right reshape depends on what the *policy* does with it internally.
+
+Under `action_space: "joints"` the default is `"pad"`, which scales by
 `ratio = max(cur_w / target_w, cur_h / target_h)` and fills the remainder with black on
 the **left and top** — matching lerobot's own `resize_with_pad`
 (`lerobot/policies/common/vla_utils.py:219`), which is smolvla's training-time convention,
@@ -336,6 +394,30 @@ square, distorting every object's proportions in a way no checkpoint trained on.
 against training geometry: **~8.3°** divergence over a 50-step chunk versus **~3.2–4.1°**
 for any aspect-preserving fit, about 2.5x worse. (Synthetic texture, so read those as an
 ordering rather than a precise bound.)
+
+`"stretch_bicubic"` is the default under `action_space: "delta-ee"`, and it exists because
+**EVO1 does not pad.** `_batched_resize_01`
+(`lerobot/policies/evo1/internvl3_embedder.py`) resizes straight to
+`(image_size, image_size)` — 448 by default — with bicubic interpolation and
+antialiasing, explicitly mirroring InternVL3's reference `Image.resize`. So EVO1's
+training frames were the *unpadded* dataset frame squashed to a square; padding here
+would hand it black bars that then get squashed along with the picture.
+
+`"stretch"` is not a substitute, because it is BILINEAR. Measured against
+`_batched_resize_01` on random frames, mean absolute difference per pixel:
+
+| controller fit | difference from EVO1's own resize |
+|---|---|
+| `stretch_bicubic` | 0.13–0.29 / 255 |
+| `stretch` | 3.3–13.1 / 255 |
+
+An order of magnitude apart, which is why there is a third fit rather than a reuse. Both
+halves of that comparison are pinned in
+`tests/controller/test_observation_differential.py`.
+
+Note this only bites when the camera's resolution differs from the checkpoint's declared
+shape. When they match, the controller does not resample at all and parity is exact.
+
 
 #### The declared resolution may not describe your cameras
 
@@ -607,7 +689,38 @@ a factor of ~57 (degrees vs. radians) or wildly rescaled (normalized vs. either)
 the safety layer's delta clamp will silently absorb into constant clamping. That is
 exactly why `clamp_counts` exists: see [Safety](#safety) below.
 
+### Per-segment units, under `action_space: "delta-ee"`
+
+A joint vector is one quantity end to end, which is why a single unit string describes
+it. A delta-EE vector is not: the 9-dim state is 3 lengths followed by 6 dimensionless
+rotation-matrix entries, and the 6-dim action is 3 lengths followed by 3 angles. So
+`state_units` and `action_units` become objects there, naming a unit per segment:
+
+```json
+{
+  "state_units":  { "translation": "millimeters", "rotation": "unitless" },
+  "action_units": { "translation": "millimeters", "rotation": "radians" }
+}
+```
+
+Those are the defaults — what the `viam-sequence-to-lerobot` converter emits — so a
+checkpoint built from it needs neither key. Set them only for a checkpoint recorded in
+other units, e.g. `{"translation": "meters", "rotation": "degrees"}`.
+
+`translation` accepts `millimeters` or `meters`; the action's `rotation` accepts
+`radians` or `degrees`. The state's `rotation` accepts only `unitless`, because those
+six numbers are direction cosines under every checkpoint — it is spelled out as a
+one-value field rather than hidden so that writing `"radians"` there is reported as an
+error instead of quietly ignored.
+
+Passing the plain string form under `delta-ee` is rejected. One unit cannot describe a
+vector that mixes millimetres with radians, and applying it to the whole thing is how a
+translation gets multiplied by pi/180.
+
 ## Safety
+
+Everything in this section describes `action_space: "joints"`; the delta-EE clamps are
+below it.
 
 Applied to every action, in this fixed order, before it reaches the arm:
 
@@ -657,6 +770,49 @@ the arm's actual current pose — a policy handed an unfamiliar initial pose can
 anything. `start` refuses outright if that first action exceeds
 `safety.max_start_delta_degs`. Refusing beats slowly moving the arm somewhere nobody
 asked for.
+
+### `action_space: "delta-ee"` — Cartesian clamps
+
+`move_to_position` carries no notion of "this delta represents one 100 ms tick". It takes
+a pose and drives to it at whatever speed the driver chooses. So a policy emitting an
+out-of-distribution delta would have it executed at full driver speed, and bounding the
+delta is the only thing standing between a bad chunk and a fast, large tool motion —
+exactly the role `max_joint_delta_degs` plays above.
+
+Two per-tick ceilings, on the magnitude of each half of the action:
+
+| | config key | default | per-tick statistics of the reference training data |
+|---|---|---|---|
+| translation, `norm(delta[:3])` | `safety.max_tcp_delta_mm` | 40 mm | median 9.31 mm, p99 28.40 mm, max 96.83 mm |
+| rotation, `norm(delta[3:])` | `safety.max_tcp_rot_delta_rads` | 0.12 rad | median 0.0142, p99 0.0807, max 0.3246 |
+
+Each default sits about 1.4x above the p99, so in-distribution motion never clamps and
+`clamp_counts` stays a real signal — and below the largest single tick in the recording,
+which at 10 fps would be 968 mm/s of tool travel. That second half is deliberate: those
+extremes are a handful of frames out of 34,670, and a policy emitting one every tick is
+out of distribution rather than in a hurry.
+
+As on the joints path, the operator-facing knob is a **velocity**
+(`safety.max_tcp_vel_mms_per_sec`, `safety.max_tcp_rot_vel_rads_per_sec`) and the
+per-tick ceiling is derived as `vel / fps`. Setting both is allowed only if they agree.
+`reconfigure()` logs the ceiling and the tool speed it implies, because
+`move_to_position` accepts no speed argument and there is nowhere else to read it off.
+
+Both clamps **scale** the 3-vector by a single factor rather than clipping it
+component-wise, so the commanded direction is preserved and only the step length
+shortens. Component-wise clipping would turn a `(100, 10, 0)` mm step into `(40, 10, 0)`
+— a different heading than the policy asked for. Counted as `clamp_counts["translation"]`
+and `clamp_counts["rotation"]`, reported by `status` exactly like the joints counters.
+
+There is no start-delta clamp here. A delta-EE action is already a delta, so the first
+tick's magnitude is the same quantity every later tick's clamp measures.
+
+**Joint limits are the arm driver's job on this path.** `safety.joint_limits_degs` has no
+Cartesian analogue and is rejected under this action space rather than accepted and
+ignored; out-of-range and unreachable targets are refused by the driver's own inverse
+kinematics when `move_to_position` is called. Note that `move_to_position` is the arm
+*component* method, not the motion service, so there is no obstacle avoidance on this
+path either.
 
 ## Performance
 
@@ -748,7 +904,16 @@ threshold fires the refill later, off a more recent — but riskier — observat
   would.
 - **`state_units`/`action_units: "normalized"` is unsupported.** It needs a source of
   per-joint min/max (dataset stats vs. explicit config) that is an open design question.
-  Only `degrees` and `radians` are accepted.
+  Only `degrees` and `radians` are accepted under `action_space: "joints"`.
+- **`action_space: "delta-ee"` has no gripper channel.** The reference recording captured
+  the arm's `EndPosition` and six joint values only — no gripper component, no seventh
+  joint — so the checkpoint cannot command jaw aperture and a non-`none` `gripper` block
+  is rejected. Drive the gripper out of band.
+- **Joint limits are not enforced by this service under `action_space: "delta-ee"`.**
+  `safety.joint_limits_degs` has no Cartesian analogue on the `move_to_position` path;
+  the arm driver's own inverse kinematics refuses out-of-range and unreachable targets.
+  `move_to_position` is the arm component method rather than the motion service, so
+  there is no obstacle avoidance on that path either.
 - **Relative-action checkpoints are refused under RTC**, not silently mishandled — RTC's
   prefix would need re-anchoring against the cached raw state that this module does not
   yet implement, and applying guidance in the wrong coordinate frame would produce
