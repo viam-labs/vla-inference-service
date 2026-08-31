@@ -17,14 +17,47 @@ from .prefix import normalize_prefix_length
 LOGGER = logging.getLogger(__name__)
 
 
+def _usable(device: str) -> bool:
+    """Check the device can actually execute a kernel, not merely that it exists.
+
+    `torch.cuda.is_available()` only reports that a driver and a device were
+    found -- it says nothing about whether this torch build carries kernels
+    for that device's compute capability. On a Jetson Orin (sm_87) with a
+    generic aarch64 wheel it returns True and then the first real kernel
+    launch dies with "no kernel image is available for execution on the
+    device", which under `device: "auto"` surfaced as a policy that failed to
+    load at warmup rather than one that quietly ran on CPU.
+
+    So probe with an actual tiny matmul. Cheap, and it is the same class of
+    operation the model will do.
+    """
+    import torch
+
+    try:
+        a = torch.ones((2, 2), device=device)
+        torch.mm(a, a).cpu()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning(
+            "%s reports as available but cannot execute a kernel (%s: %s); "
+            "falling back. Set `device` explicitly to override this probe.",
+            device,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
 def _select_device(requested: str) -> str:
     import torch
 
+    # An explicit request is honored without probing: an operator naming a
+    # device wants to see it fail loudly, not be silently downgraded.
     if requested != "auto":
         return requested
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and _usable("cuda"):
         return "cuda"
-    if torch.backends.mps.is_available():
+    if torch.backends.mps.is_available() and _usable("mps"):
         return "mps"
     return "cpu"
 

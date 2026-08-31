@@ -232,3 +232,77 @@ def test_advisory_warning_is_silent_once_the_camera_is_listed_as_unused(caplog):
 
     assert specs.image_feature_keys == fed
     assert [r.message for r in caplog.records if "unused_image_features" in r.message] == []
+
+
+class _FakeTorch:
+    """Enough torch surface for `_select_device`, with a controllable device.
+
+    `is_available()` reporting True while a kernel launch raises is not a
+    contrived combination -- it is exactly a Jetson Orin (sm_87) running a
+    generic aarch64 wheel that carries no kernels for its compute capability.
+    """
+
+    class _Backends:
+        class _MPS:
+            def __init__(self, available):
+                self._available = available
+
+            def is_available(self):
+                return self._available
+
+        def __init__(self, mps_available):
+            self.mps = self._MPS(mps_available)
+
+    def __init__(self, *, cuda_available, cuda_works, mps_available=False, mps_works=True):
+        self._works = {"cuda": cuda_works, "mps": mps_works}
+        self.cuda = SimpleNamespace(is_available=lambda: cuda_available)
+        self.backends = self._Backends(mps_available)
+        self.launched = []
+
+    def ones(self, shape, device):
+        self.launched.append(device)
+        if not self._works[device]:
+            raise RuntimeError("CUDA error: no kernel image is available for execution on the device")
+        return SimpleNamespace(cpu=lambda: None)
+
+    def mm(self, a, b):
+        return a
+
+
+def _select(monkeypatch, fake):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    from vla.policy.lerobot_backend import _select_device
+
+    return _select_device
+
+
+def test_auto_falls_back_to_cpu_when_cuda_cannot_run_a_kernel(monkeypatch):
+    fake = _FakeTorch(cuda_available=True, cuda_works=False)
+    assert _select(monkeypatch, fake)("auto") == "cpu"
+    assert fake.launched == ["cuda"], "must actually attempt a kernel, not just ask is_available()"
+
+
+def test_auto_uses_cuda_when_a_kernel_actually_runs(monkeypatch):
+    fake = _FakeTorch(cuda_available=True, cuda_works=True)
+    assert _select(monkeypatch, fake)("auto") == "cuda"
+
+
+def test_auto_falls_through_to_mps_when_cuda_is_unusable(monkeypatch):
+    fake = _FakeTorch(cuda_available=True, cuda_works=False, mps_available=True, mps_works=True)
+    assert _select(monkeypatch, fake)("auto") == "mps"
+    assert fake.launched == ["cuda", "mps"]
+
+
+def test_auto_reaches_cpu_when_neither_accelerator_works(monkeypatch):
+    fake = _FakeTorch(cuda_available=True, cuda_works=False, mps_available=True, mps_works=False)
+    assert _select(monkeypatch, fake)("auto") == "cpu"
+
+
+def test_an_explicit_device_is_never_probed_or_downgraded(monkeypatch):
+    # An operator naming a device wants it to fail loudly, not be silently
+    # swapped for something that happens to work.
+    fake = _FakeTorch(cuda_available=True, cuda_works=False)
+    assert _select(monkeypatch, fake)("cuda") == "cuda"
+    assert fake.launched == []

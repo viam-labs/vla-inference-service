@@ -4,6 +4,11 @@ run = "rm -rf dist && uv build --wheel"
 [tasks.clean]
 run = "rm -rf dist module.tar.gz"
 
+[tasks.replay-eval]
+# Offline action-error replay against a training dataset. Needs the dataset
+# extra (`uv pip install 'lerobot[dataset]'`) and VIAM_API_KEY/_ID.
+run = "uv run python tools/replay_eval.py"
+
 [tasks.test]
 run = "uv run pytest -m 'not integration and not differential' -v"
 
@@ -11,5 +16,16 @@ run = "uv run pytest -m 'not integration and not differential' -v"
 run = "uv run pytest -v"
 
 [tasks.package]
-run = "tar -czf module.tar.gz meta.json run.sh setup.sh dist/*.whl"
+# run.sh must NOT be executable in the working tree: the cloud builder treats an
+# executable `entrypoint` in the uploaded source as "module already pre-built"
+# and skips this task entirely (no wheel, no tarball, reload fails). So stage a
+# copy and set the exec bit only there -- `chmod +x run.sh` in place would put
+# the bit back on the tree the CLI uploads and re-break the cloud build.
+run = """
+rm -rf dist/pkg && mkdir -p dist/pkg/dist
+install -m 644 meta.json dist/pkg/
+install -m 755 run.sh setup.sh dist/pkg/
+install -m 644 dist/*.whl dist/pkg/dist/
+tar -czf module.tar.gz -C dist/pkg .
+"""
 depends = ["build"]
