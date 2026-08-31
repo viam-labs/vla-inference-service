@@ -25,6 +25,21 @@ Two comparisons worth running:
 If (1) is clean and (2) is not, the fault is entirely in observation wiring.
 Compare the two error curves, not either one's absolute value.
 
+`--action-space delta-ee` grades an end-effector-pose-delta checkpoint (state 9,
+action 6). It changes three things, because a whole-vector L2 would be
+meaningless there: the error is reported per SEGMENT (translation in mm,
+rotation in radians -- a single L2 over both is a translation metric with the
+rotation error rounded away, the two differing by ~500x in scale), the
+"don't move" baseline becomes the ZERO DELTA rather than the current state,
+and the default `--image-fit` follows the controller's (`stretch_bicubic`).
+`auto`, the default, infers it from the policy's declared dims.
+
+Note what this tool does NOT cover on that action space: it grades observation
+assembly and the policy, and nothing in the actuation half -- the Cartesian
+clamp, composing onto a live pose, the orientation-vector encode, or an IK
+refusal. Those need hardware, or the dataset's own recorded motion as a
+witness -- neither of which lives in this tool.
+
 Flow-matching policies sample an unseeded noise vector, so the SAME observation
 gives a different chunk every call -- on box-opener the draw-to-draw disagreement
 is roughly half the ground-truth error. A single-draw run therefore cannot
@@ -49,6 +64,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import os
 import sys
 from pathlib import Path
@@ -65,14 +82,53 @@ from vla.wire import encode_image, encode_vector
 # --------------------------------------------------------------------------
 
 
+# Action-vector segments, per action space. A segment is (label, start, stop,
+# unit), and every error statistic is computed once per segment.
+#
+# This exists because an L2 across a mixed-unit vector is not a distance. On
+# `delta-ee` the first three channels carry millimetres (recorded per-tick std
+# ~6-7) and the last three radians (std ~0.011-0.016) -- a ~500x scale gap, so
+# a whole-vector L2 is a translation metric with the rotation error rounded
+# away entirely. A checkpoint could be badly wrong about the wrist and the
+# headline number would not move.
+#
+# `joints` keeps a single whole-vector segment, so its numbers are bit-identical
+# to what this tool reported before segments existed.
+SEGMENTS = {
+    "delta-ee": (("translation", 0, 3, "mm"), ("rotation", 3, 6, "rad")),
+}
+DIM_NAMES = {"delta-ee": ["dx", "dy", "dz", "drx", "dry", "drz"]}
+
+
+def segments_for(action_space: str, action_dim: int):
+    return SEGMENTS.get(action_space) or (("action", 0, action_dim, ""),)
+
+
+def default_image_fit(action_space: str) -> str:
+    """The controller's own `image_fit` default for this action space.
+
+    Mirrored rather than imported: `config._default_image_fit` lives in the
+    controller package, and this tool must run against a checkpoint without
+    a controller configured. Grading through a different resize than the
+    controller uses would charge the policy for geometry it never sees.
+    """
+    return "stretch_bicubic" if action_space == "delta-ee" else "pad"
+
+
 def compute_errors(
-    predicted: np.ndarray, recorded: np.ndarray, mask: np.ndarray | None = None
+    predicted: np.ndarray,
+    recorded: np.ndarray,
+    mask: np.ndarray | None = None,
+    segments=None,
 ) -> dict:
     """Compare stacked chunks against ground truth.
 
     Both are (n_samples, horizon, action_dim). Returns the two cuts that
     actually localize a fault: error against horizon offset k (does it start
     wrong, or drift?) and error per action dimension (which joint?).
+
+    `segments` splits every statistic by unit -- see SEGMENTS. It defaults to
+    one whole-vector segment, which reproduces the pre-segment numbers exactly.
 
     `mask` is (n_samples, horizon) of bools marking which steps have ground
     truth. It is how truncated windows are supported: a window that runs off
@@ -104,6 +160,26 @@ def compute_errors(
         l2_by_offset = np.where(n_by_offset > 0, l2.sum(axis=0) / n_by_offset, np.nan)
     valid_steps = int(mask.sum())
     flat = l2[mask]
+
+    segs = segments or (("action", 0, predicted.shape[2], ""),)
+    seg_stats = {}
+    for label, start, stop, unit in segs:
+        s_l2 = np.linalg.norm(err[:, :, start:stop], axis=2)
+        s_flat = s_l2[mask]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            s_by_offset = np.where(
+                n_by_offset > 0, s_l2.sum(axis=0) / n_by_offset, np.nan
+            )
+        seg_stats[label] = {
+            "unit": unit,
+            "cols": (start, stop),
+            "l2_mean": float(s_flat.mean()),
+            "l2_first_step": (
+                float(s_l2[mask[:, 0], 0].mean()) if mask[:, 0].any() else float("nan")
+            ),
+            "l2_p95": float(np.percentile(s_flat, 95)),
+            "l2_by_offset": s_by_offset,
+        }
     # per-joint means divide by (valid steps), not by every slot in the array
     sq = np.where(mask[:, :, None], (predicted - recorded) ** 2, 0.0)
     ab = np.where(mask[:, :, None], np.abs(predicted - recorded), 0.0)
@@ -120,6 +196,11 @@ def compute_errors(
         "l2_mean": float(flat.mean()),
         "l2_first_step": float(l2[mask[:, 0], 0].mean()) if mask[:, 0].any() else float("nan"),
         "l2_p95": float(np.percentile(flat, 95)),
+        "segments": seg_stats,
+        # Whole-vector statistics are suppressed by `report` when this is set:
+        # summing mm and radians under one square root produces a number with
+        # no unit and no meaning.
+        "mixed_units": len(segs) > 1,
     }
 
 
@@ -239,7 +320,11 @@ def errors_by_position(
 
 
 def naive_baselines(
-    recorded: np.ndarray, states: np.ndarray, starts: list[int], horizon: int
+    recorded: np.ndarray,
+    states: np.ndarray,
+    starts: list[int],
+    horizon: int,
+    action_space: str = "joints",
 ) -> dict[str, np.ndarray]:
     """Predictors that use no policy at all, scored on the same windows.
 
@@ -256,13 +341,29 @@ def naive_baselines(
       episode-mean action -- the trajectory's centre of mass, ignoring the
                              observation entirely. A policy scoring like THIS
                              one is not reading its inputs.
+
+    "don't move" is action-space dependent, and getting it wrong here is not a
+    subtlety: under `delta-ee` the state is a 9-vector and the action a
+    6-vector, so tiling the state as a prediction is a shape error, and the
+    thing it was standing in for -- the arm staying put -- is expressed as the
+    ZERO DELTA instead. That is also the baseline that matters most for a
+    relative action space, and it is a hard one: the recorded median per-tick
+    motion on `xarm-open-box-eedelta` is only 9.4 mm, so predicting nothing at
+    all already scores well. A policy that does not clear zero is not
+    predicting motion.
     """
     tile = lambda rows: np.repeat(rows[:, None, :], horizon, axis=1)
+    dim = recorded.shape[1]
+    hold = (
+        np.zeros((len(starts), horizon, dim), dtype=recorded.dtype)
+        if action_space == "delta-ee"
+        else tile(states)
+    )
     return {
-        "hold current state": tile(states),
+        "zero delta" if action_space == "delta-ee" else "hold current state": hold,
         "repeat action at t": tile(recorded[starts]),
         "episode-mean action": np.broadcast_to(
-            recorded.mean(axis=0), (len(starts), horizon, recorded.shape[1])
+            recorded.mean(axis=0), (len(starts), horizon, dim)
         ).copy(),
     }
 
@@ -311,12 +412,18 @@ def through_camera_pipeline(
         return arr
     if fit == "pad":
         return ObservationBuilder._resize_with_pad(arr, target_hw[0], target_hw[1])
-    if fit == "stretch":
-        return np.asarray(
-            Image.fromarray(arr).resize((target_hw[1], target_hw[0]), Image.BILINEAR),
-            dtype=np.uint8,
-        )
-    raise ValueError(f"unknown image_fit {fit!r}")
+    # `stretch` and `stretch_bicubic` differ only in the resampler, and that is
+    # the whole point of having both: measured against EVO1's own internal
+    # resize, bicubic differs by 0.13-0.29/255 and BILINEAR by 3.3-13.1/255.
+    # Grading a delta-EE checkpoint through `stretch` would therefore charge
+    # the policy for a resampler the controller does not use.
+    resampler = {"stretch": Image.BILINEAR, "stretch_bicubic": Image.BICUBIC}.get(fit)
+    if resampler is None:
+        raise ValueError(f"unknown image_fit {fit!r}")
+    return np.asarray(
+        Image.fromarray(arr).resize((target_hw[1], target_hw[0]), resampler),
+        dtype=np.uint8,
+    )
 
 
 def resolve_key_map(
@@ -397,6 +504,19 @@ def build_infer_command(images: dict, state: np.ndarray, task: str, encoding: st
     }
 
 
+def _print_curve(curve, counts, truncated: bool, indent: str = "") -> None:
+    """The error-against-horizon-offset bars, for one segment."""
+    idx = sorted({0, 1, 4, 9, 24, len(curve) - 1})
+    peak = np.nanmax(curve) if np.isfinite(curve).any() else 1.0
+    for k in idx:
+        if not np.isfinite(curve[k]):
+            print(f"{indent}  k={k:<3}   (no samples reach this offset)")
+            continue
+        bar = "#" * int(round(40 * curve[k] / max(peak, 1e-9)))
+        tail = f"  n={int(counts[k])}" if counts is not None and truncated else ""
+        print(f"{indent}  k={k:<3} {curve[k]:8.4f}  {bar}{tail}")
+
+
 def report(metrics: dict, label: str) -> None:
     print(f"\n=== {label} ===")
     print(
@@ -413,70 +533,95 @@ def report(metrics: dict, label: str) -> None:
             "  lower score for reasons unrelated to the policy. Compare truncated to\n"
             "  truncated only."
         )
-    print(f"mean L2 per step      : {metrics['l2_mean']:.4f}")
-    reps = int(metrics.get("repeats", 1))
-    if reps > 1:
-        spread = metrics.get("between_draw_spread", float("nan"))
-        print(
-            f"  between-draw spread : {spread:.4f}   <- sampler noise, averaged over "
-            f"{reps} draws/window\n"
-            f"     the mean above therefore carries a standard error of roughly "
-            f"{spread / np.sqrt(reps):.4f} (spread/sqrt(N))."
-        )
-    print(f"  at offset k=0       : {metrics['l2_first_step']:.4f}   <- immediate action")
-    print(f"  p95                 : {metrics['l2_p95']:.4f}")
 
-    curve = metrics["l2_by_offset"]
-    idx = sorted({0, 1, 4, 9, 24, len(curve) - 1})
-    print("mean L2 by horizon offset:")
-    counts = metrics.get("n_by_offset")
-    peak = np.nanmax(curve) if np.isfinite(curve).any() else 1.0
-    for k in idx:
-        if not np.isfinite(curve[k]):
-            print(f"  k={k:<3}   (no samples reach this offset)")
-            continue
-        bar = "#" * int(round(40 * curve[k] / max(peak, 1e-9)))
-        tail = f"  n={int(counts[k])}" if counts is not None and metrics.get("truncated") else ""
-        print(f"  k={k:<3} {curve[k]:8.4f}  {bar}{tail}")
-    if metrics.get("baselines"):
-        print("vs. predictors that never call the policy:")
-        policy_mean = metrics["l2_mean"]
-        for name, b in metrics["baselines"].items():
-            verdict = "policy WORSE" if policy_mean >= b["l2_mean"] else "policy better"
+    segs = metrics.get("segments") or {}
+    reps = int(metrics.get("repeats", 1))
+    mixed = bool(metrics.get("mixed_units"))
+    if mixed:
+        print(
+            "\nThis action space mixes units, so there is no whole-vector L2 to quote:\n"
+            "  summing millimetres and radians under one square root gives a number with\n"
+            "  no unit, dominated by whichever segment happens to have the larger scale\n"
+            "  (here translation, by ~500x). Each segment is reported on its own below;\n"
+            "  compare a segment only against the same segment."
+        )
+
+    for name, seg in segs.items():
+        unit = f" {seg['unit']}" if seg["unit"] else ""
+        head = f"\n[{name}]{unit and '  (' + seg['unit'] + ')'}" if mixed else ""
+        if head:
+            print(head)
+        ind = "  " if mixed else ""
+        print(f"{ind}mean L2 per step      : {seg['l2_mean']:.4f}{unit}")
+        spread = seg.get("between_draw_spread")
+        if reps > 1 and spread is not None and np.isfinite(spread):
             print(
-                f"  {name:22s} mean L2 {b['l2_mean']:8.3f}  k=0 {b['l2_first_step']:7.3f}"
-                f"   -> {verdict}"
+                f"{ind}  between-draw spread : {spread:.4f}   <- sampler noise, averaged "
+                f"over {reps} draws/window\n"
+                f"{ind}     the mean above therefore carries a standard error of roughly "
+                f"{spread / np.sqrt(reps):.4f} (spread/sqrt(N))."
             )
-        beaten = [n for n, b in metrics["baselines"].items() if policy_mean >= b["l2_mean"]]
-        if beaten:
-            print(
-                f"  !! the policy does not beat {len(beaten)}/{len(metrics['baselines'])} of them. "
-                "It is not predicting motion better than a constant --\n"
-                "     re-check the --key-map ordering and the image geometry before "
-                "concluding the checkpoint is weak."
-            )
-    if metrics.get("by_position"):
-        print("error by position in the episode (mean L2 per sample):")
-        for b in metrics["by_position"]:
-            if b["n"] == 0:
-                print(f"  [{b['lo']:.2f},{b['hi']:.2f})  no samples")
-                continue
-            print(f"  [{b['lo']:.2f},{b['hi']:.2f})  n={b['n']:<3d} mean L2 {b['l2_mean']:8.3f}"
-                  f"   (starts reach {b['max_frac']:.2f})")
-        tail = metrics["by_position"][-1]
-        rest = [b for b in metrics["by_position"][:-1] if b["n"]]
-        if tail["n"] and rest:
-            rest_mean = sum(b["l2_mean"] * b["n"] for b in rest) / sum(b["n"] for b in rest)
-            delta = (tail["l2_mean"] - rest_mean) / rest_mean * 100
-            print(f"  last bucket vs the rest: {tail['l2_mean']:.3f} vs {rest_mean:.3f}"
-                  f"  ({delta:+.0f}%)")
-            if delta > 25:
-                print("  !! markedly worse at the end of the episode -- the failure is the "
-                      "final subtask,\n     not the task as a whole. More demos OF THAT PHASE "
-                      "beat more training steps.")
-    print("per-joint error (MAE / MSE):")
-    for j, (mae, mse) in enumerate(zip(metrics["mae_by_joint"], metrics["mse_by_joint"])):
-        print(f"  joint {j}: {mae:8.4f} / {mse:10.4f}")
+        print(f"{ind}  at offset k=0       : {seg['l2_first_step']:.4f}   <- immediate action")
+        print(f"{ind}  p95                 : {seg['l2_p95']:.4f}")
+        print(f"{ind}mean L2 by horizon offset:")
+        _print_curve(
+            seg["l2_by_offset"], metrics.get("n_by_offset"), bool(metrics.get("truncated")), ind
+        )
+
+        if metrics.get("baselines"):
+            print(f"{ind}vs. predictors that never call the policy:")
+            beaten = []
+            for bname, b in metrics["baselines"].items():
+                bseg = b["segments"][name]
+                worse = seg["l2_mean"] >= bseg["l2_mean"]
+                if worse:
+                    beaten.append(bname)
+                print(
+                    f"{ind}  {bname:22s} mean L2 {bseg['l2_mean']:8.3f}  "
+                    f"k=0 {bseg['l2_first_step']:7.3f}"
+                    f"   -> {'policy WORSE' if worse else 'policy better'}"
+                )
+            if beaten:
+                print(
+                    f"{ind}  !! the policy does not beat {len(beaten)}/"
+                    f"{len(metrics['baselines'])} of them. It is not predicting motion\n"
+                    f"{ind}     better than a constant -- re-check the --key-map ordering "
+                    "and the image geometry\n"
+                    f"{ind}     before concluding the checkpoint is weak."
+                )
+
+        buckets = (metrics.get("by_position") or {}).get(name)
+        if buckets:
+            print(f"{ind}error by position in the episode (mean L2 per sample):")
+            for b in buckets:
+                if b["n"] == 0:
+                    print(f"{ind}  [{b['lo']:.2f},{b['hi']:.2f})  no samples")
+                    continue
+                print(
+                    f"{ind}  [{b['lo']:.2f},{b['hi']:.2f})  n={b['n']:<3d} "
+                    f"mean L2 {b['l2_mean']:8.3f}   (starts reach {b['max_frac']:.2f})"
+                )
+            tail = buckets[-1]
+            rest = [b for b in buckets[:-1] if b["n"]]
+            if tail["n"] and rest:
+                rest_mean = sum(b["l2_mean"] * b["n"] for b in rest) / sum(b["n"] for b in rest)
+                delta = (tail["l2_mean"] - rest_mean) / rest_mean * 100
+                print(
+                    f"{ind}  last bucket vs the rest: {tail['l2_mean']:.3f} vs "
+                    f"{rest_mean:.3f}  ({delta:+.0f}%)"
+                )
+                if delta > 25:
+                    print(
+                        f"{ind}  !! markedly worse at the end of the episode -- the failure "
+                        "is the final subtask,\n"
+                        f"{ind}     not the task as a whole. More demos OF THAT PHASE beat "
+                        "more training steps."
+                    )
+
+    names = metrics.get("dim_names") or [f"joint {j}" for j in range(metrics["action_dim"])]
+    print("\nper-dimension error (MAE / MSE):")
+    for name, mae, mse in zip(names, metrics["mae_by_joint"], metrics["mse_by_joint"]):
+        print(f"  {name:<10s} {mae:8.4f} / {mse:10.4f}")
 
 
 # --------------------------------------------------------------------------
@@ -584,6 +729,12 @@ async def run(args) -> int:
         sizes = {k: tuple(int(v) for v in specs["input_features"][k][1:]) for k in image_keys}
         print(f"policy: {specs['policy_type']} on {specs['device']} ({specs['dtype']})")
         print(f"  image keys {image_keys}, horizon {horizon}, state_dim {state_dim}")
+        action_space = resolve_action_space(
+            args.action_space, int(specs["action_dim"]), state_dim
+        )
+        image_fit = args.image_fit or default_image_fit(action_space)
+        if args.camera_resolution:
+            print(f"image_fit: {image_fit}")
 
         key_map = resolve_key_map(args.key_map, image_keys, frames[0])
         if key_map != {k: k for k in image_keys}:
@@ -620,14 +771,21 @@ async def run(args) -> int:
             for key in image_keys:
                 arr = to_hwc_uint8(frame[key_map[key]])
                 if camera_hw is not None or arr.shape[:2] != sizes[key]:
-                    arr = through_camera_pipeline(arr, camera_hw, sizes[key], args.image_fit)
+                    arr = through_camera_pipeline(arr, camera_hw, sizes[key], image_fit)
                 images[key] = arr
 
             state = to_np(frame["observation.state"]).astype(np.float32)
             if state.shape[0] != state_dim:
+                hint = (
+                    "the dataset is not the one this checkpoint was trained on: "
+                    "action_space='delta-ee' fixes the state at 9 dims "
+                    "[x, y, z, r00, r01, r02, r10, r11, r12]"
+                    if action_space == "delta-ee"
+                    else "state_joint_indices is probably wrong"
+                )
                 raise SystemExit(
                     f"dataset observation.state has {state.shape[0]} dims, policy "
-                    f"expects {state_dim} -- state_joint_indices is probably wrong"
+                    f"expects {state_dim} -- {hint}"
                 )
 
             sampled_states.append(state)
@@ -658,26 +816,61 @@ async def run(args) -> int:
             avail = min(horizon, len(recorded) - t)
             truth[i, :avail] = recorded[t : t + avail]
             mask[i, :avail] = True
-        metrics = compute_errors(predicted, truth, mask)
+        segs = segments_for(action_space, predicted.shape[2])
+        metrics = compute_errors(predicted, truth, mask, segs)
         metrics["repeats"] = args.repeats
-        metrics["between_draw_spread"] = between_draw_spread(predicted, args.repeats, mask)
-        metrics["by_position"] = errors_by_position(
-            predicted, truth, draws, len(frames), mask=mask
-        )
+        metrics["dim_names"] = DIM_NAMES.get(action_space)
+        # Spread and by-position are sliced per segment rather than taught about
+        # segments: they take (samples, horizon, dim) arrays, so a column slice
+        # is the whole adaptation, and there is one implementation either way.
+        metrics["by_position"] = {}
+        for name, start, stop, _unit in segs:
+            metrics["segments"][name]["between_draw_spread"] = between_draw_spread(
+                predicted[:, :, start:stop], args.repeats, mask
+            )
+            metrics["by_position"][name] = errors_by_position(
+                predicted[:, :, start:stop],
+                truth[:, :, start:stop],
+                draws,
+                len(frames),
+                mask=mask,
+            )
         metrics["baselines"] = {
-            name: compute_errors(pred, truth, mask)
+            name: compute_errors(pred, truth, mask, segs)
             for name, pred in naive_baselines(
-                recorded, np.stack(sampled_states), draws, horizon
+                recorded, np.stack(sampled_states), draws, horizon, action_space
             ).items()
         }
         label = "dataset frames verbatim"
         if camera_hw is not None:
-            label = f"through {args.camera_resolution} camera + image_fit={args.image_fit}"
+            label = f"through {args.camera_resolution} camera + image_fit={image_fit}"
         report(metrics, label)
         return 0
     finally:
         if robot is not None:
             await robot.close()
+
+
+def resolve_action_space(declared: str, action_dim: int, state_dim: int | None) -> str:
+    """Which action space the checkpoint speaks, from `--action-space`.
+
+    `auto` infers it from the declared widths, because the delta-EE dataset
+    contract fixes both: action 6, state 9. A joints checkpoint cannot collide
+    with that -- its state is the selected joints plus at most one gripper
+    channel, so a 6-dim action implies a 6- or 7-dim state, never 9.
+
+    The inference is printed rather than silent. It picks the units every
+    number in the report is quoted in, and a wrong guess there would relabel
+    radians as millimetres.
+    """
+    if declared != "auto":
+        return declared
+    inferred = "delta-ee" if (action_dim == 6 and state_dim == 9) else "joints"
+    print(
+        f"action space: {inferred} (inferred from action_dim={action_dim}, "
+        f"state_dim={state_dim}; pass --action-space to override)"
+    )
+    return inferred
 
 
 def to_np(x) -> np.ndarray:
@@ -900,6 +1093,112 @@ def self_check() -> int:
     wild = stacked.copy(); wild[0, 30:] = 1e6
     assert abs(between_draw_spread(wild, 2, m6) - np.sqrt(6)) < 1e-5
 
+    # ---------------------------------------------------------------- delta-ee
+    # Segmented metrics. The point is that a rotation-only error must be
+    # visible: with a single whole-vector L2 it is not, which is the bug this
+    # segmentation exists to fix.
+    segs = segments_for("delta-ee", 6)
+    assert segs == (("translation", 0, 3, "mm"), ("rotation", 3, 6, "rad")), segs
+    assert segments_for("joints", 7) == (("action", 0, 7, ""),)
+    assert default_image_fit("delta-ee") == "stretch_bicubic"
+    assert default_image_fit("joints") == "pad"
+
+    t7 = np.zeros((4, 50, 6), np.float32)
+    p7 = t7.copy()
+    p7[:, :, 3:] += 0.01                      # 0.01 rad on each rotation channel
+    m7 = compute_errors(p7, t7, None, segs)
+    assert m7["mixed_units"]
+    assert m7["segments"]["translation"]["l2_mean"] == 0.0
+    assert abs(m7["segments"]["rotation"]["l2_mean"] - 0.01 * np.sqrt(3)) < 1e-6
+    # ... and the whole-vector number this replaces would have reported the
+    # same 0.017 whether the error were radians or millimetres.
+    p8 = t7.copy(); p8[:, :, :3] += 10.0      # 10 mm on each translation channel
+    m8 = compute_errors(p8, t7, None, segs)
+    assert m8["segments"]["rotation"]["l2_mean"] == 0.0
+    assert abs(m8["segments"]["translation"]["l2_mean"] - 10.0 * np.sqrt(3)) < 1e-4
+    # A single segment must reproduce the whole-vector statistics exactly.
+    one = compute_errors(p8, t7, None, segments_for("joints", 6))
+    for key in ("l2_mean", "l2_first_step", "l2_p95"):
+        assert abs(one["segments"]["action"][key] - one[key]) < 1e-6, key
+    assert not one["mixed_units"]
+    # Masking must apply per segment too.
+    m9mask = np.ones((4, 50), bool); m9mask[:, 25:] = False
+    poisoned = p7.copy(); poisoned[:, 25:] = 1e6
+    m9 = compute_errors(poisoned, t7, m9mask, segs)
+    assert abs(m9["segments"]["rotation"]["l2_mean"] - 0.01 * np.sqrt(3)) < 1e-6
+
+    # "don't move" under delta-ee is the zero delta, and must not be the state:
+    # the state is 9-wide there, so tiling it would be a shape error.
+    rec6 = rng.normal(size=(120, 6)).astype(np.float32)
+    st9 = rng.normal(size=(4, 9)).astype(np.float32)  # 4 rows: reused by the report smoke test
+    bd = naive_baselines(rec6, st9, [0, 10, 20], 50, "delta-ee")
+    assert set(bd) == {"zero delta", "repeat action at t", "episode-mean action"}, set(bd)
+    assert bd["zero delta"].shape == (3, 50, 6)
+    assert not bd["zero delta"].any(), "the zero-delta baseline must be zero"
+    # The old baseline would have raised here rather than scoring anything.
+    try:
+        compute_errors(naive_baselines(rec6, st9, [0, 10, 20], 50)["hold current state"],
+                       np.zeros((3, 50, 6), np.float32))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a 9-dim state tiled as a 6-dim action must not score")
+
+    # stretch_bicubic must be reachable and must NOT equal stretch -- if the two
+    # resamplers agreed there would be no reason for the controller to have both.
+    src = rng.integers(0, 256, (450, 800, 3), dtype=np.uint8)
+    bic = through_camera_pipeline(src, None, (448, 448), "stretch_bicubic")
+    bil = through_camera_pipeline(src, None, (448, 448), "stretch")
+    assert bic.shape == bil.shape == (448, 448, 3)
+    assert np.abs(bic.astype(int) - bil.astype(int)).mean() > 0.5, "resamplers agree?"
+    try:
+        through_camera_pipeline(src, None, (448, 448), "nope")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown fit must raise")
+
+    # Action-space inference: only the delta-EE contract's exact widths.
+    assert resolve_action_space("auto", 6, 9) == "delta-ee"
+    assert resolve_action_space("auto", 6, 7) == "joints"
+    assert resolve_action_space("auto", 6, None) == "joints"
+    assert resolve_action_space("joints", 6, 9) == "joints", "an explicit flag must win"
+    assert resolve_action_space("delta-ee", 7, 7) == "delta-ee"
+
+    # report() does a lot of string formatting over these dicts; run it once on
+    # each shape so a KeyError or a format-spec mistake fails here rather than
+    # after a twenty-minute run against a robot.
+    for space, pred, truth in (("delta-ee", p7, t7), ("joints", p8[:, :, :6], t7)):
+        sg = segments_for(space, 6)
+        m = compute_errors(pred, truth, None, sg)
+        m["repeats"] = 2
+        m["dim_names"] = DIM_NAMES.get(space)
+        m["by_position"] = {}
+        for nm, a, b, _u in sg:
+            m["segments"][nm]["between_draw_spread"] = between_draw_spread(
+                pred[:, :, a:b], 2
+            )
+            m["by_position"][nm] = errors_by_position(
+                pred[:, :, a:b], truth[:, :, a:b], [0, 1, 2, 3], 200
+            )
+        m["baselines"] = {
+            n: compute_errors(pr, truth, None, sg)
+            for n, pr in naive_baselines(
+                rec6, st9 if space == "delta-ee" else rec6[:4], [0, 1, 2, 3], 50, space
+            ).items()
+        }
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(m, f"self-check {space}")
+        out = buf.getvalue()
+        if space == "delta-ee":
+            assert "[translation]" in out and "[rotation]" in out, out
+            assert "mean L2 per step" in out
+            assert "zero delta" in out, out
+            assert "drx" in out, "delta-ee dims must not be labelled 'joint'"
+        else:
+            assert "[translation]" not in out and "joint 0" in out, out
+
     print("self-check OK")
     return 0
 
@@ -925,7 +1224,16 @@ def main() -> int:
                    help="feed a dataset image key into a policy slot; repeatable")
     p.add_argument("--camera-resolution", default=None, metavar="WxH",
                    help="simulate a real camera of this size before the controller's resize")
-    p.add_argument("--image-fit", default="pad", choices=("pad", "stretch"))
+    p.add_argument("--action-space", default="auto",
+                   choices=("auto", "joints", "delta-ee"),
+                   help="what the checkpoint speaks; `auto` infers it from the declared "
+                        "dims. Sets the error segmentation, the 'don't move' baseline, "
+                        "and the default --image-fit.")
+    p.add_argument("--image-fit", default=None,
+                   choices=("pad", "stretch", "stretch_bicubic"),
+                   help="controller-side resize to grade through (default: the "
+                        "controller's own default for the action space -- pad for "
+                        "joints, stretch_bicubic for delta-ee)")
     p.add_argument("--image-encoding", default="jpeg", choices=("jpeg", "png", "raw"))
     p.add_argument("--jpeg-quality", type=int, default=90)
     p.add_argument("--min-overlap", type=int, default=0, metavar="N",
