@@ -17,7 +17,12 @@ given `fps`.
 
 import pytest
 
-from vla.controller.config import ConfigError, ControllerConfig, SafetyConfig
+from vla.controller.config import (
+    DEFAULT_ARM_MOVE_EXTRA,
+    ConfigError,
+    ControllerConfig,
+    SafetyConfig,
+)
 from vla.controller.gripper import GRIPPER_TYPES, make_gripper_adapter
 
 
@@ -617,3 +622,40 @@ def test_config_error_is_the_shared_config_util_type():
     from vla.config_util import ConfigError as SharedConfigError
 
     assert ConfigError is SharedConfigError
+
+
+# ---------------------------------------------------------------------------
+# arm_move_extra: the driver-facing "don't block until settled" flags.
+# ---------------------------------------------------------------------------
+
+
+def test_arm_move_extra_defaults_to_the_non_blocking_flags():
+    cfg = ControllerConfig.parse(BASE)
+    assert cfg.arm_move_extra == DEFAULT_ARM_MOVE_EXTRA
+    assert cfg.arm_move_extra == {"wait": False, "waitAtEnd": False, "interpolate": False}
+
+
+def test_arm_move_extra_default_is_a_copy_not_the_shared_module_dict():
+    """Two controllers must not share one mutable default -- mutating one
+    config's extra would otherwise change every other controller's, and the
+    dict is handed to a driver that may do anything with it."""
+    a = ControllerConfig.parse(BASE)
+    b = ControllerConfig.parse(BASE)
+    a.arm_move_extra["wait"] = "poisoned"
+    assert b.arm_move_extra["wait"] is False
+    assert DEFAULT_ARM_MOVE_EXTRA["wait"] is False
+
+
+def test_arm_move_extra_replaces_the_default_wholesale():
+    cfg = ControllerConfig.parse({**BASE, "arm_move_extra": {"direct": True}})
+    assert cfg.arm_move_extra == {"direct": True}, "must not merge with the default"
+
+
+def test_empty_arm_move_extra_is_distinct_from_absent():
+    assert ControllerConfig.parse({**BASE, "arm_move_extra": {}}).arm_move_extra == {}
+
+
+def test_arm_move_extra_rejects_a_non_object():
+    for bad in ([1, 2], "wait", 3):
+        with pytest.raises(ConfigError, match="arm_move_extra"):
+            ControllerConfig.parse({**BASE, "arm_move_extra": bad})

@@ -2055,14 +2055,53 @@ async def test_fake_arm_records_the_extra_it_was_called_with(cls):
     assert len(arm2.moves) == len(arm2.move_extras)
 
 
-async def test_arm_move_asks_the_driver_not_to_wait_for_settle():
-    """A driver that blocks until the arm settles burns the whole tick budget
-    waiting for a setpoint the next tick is about to replace. Drivers that do
-    not read `wait` ignore it."""
+async def _extras_from_a_run(config=None):
     arm = FakeArm(positions=[0.0] * 6)
-    svc = _svc(config=_config(), deps=_deps(arm=arm))
+    svc = _svc(config=config or _config(), deps=_deps(arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
-    await asyncio.sleep(0.15)
+    await _wait_for_first_move(arm)
     await svc.do_command({"command": "stop"})
     assert arm.move_extras, "the arm was never commanded"
-    assert all(e == {"wait": False} for e in arm.move_extras), arm.move_extras
+    return arm.move_extras
+
+
+async def test_arm_move_asks_every_known_driver_not_to_wait_for_settle():
+    """A driver that blocks until the arm settles burns the whole tick budget
+    waiting for a setpoint the next tick is about to replace.
+
+    All three spellings ship together because drivers disagree on the key and
+    silently ignore ones they do not know. Sending only `wait` was measured
+    against a ufactory xArm -- which parses `waitAtEnd`, not `wait` -- at
+    ticks of 0.26-1.49s against a 0.100s budget.
+    """
+    extras = await _extras_from_a_run()
+    for e in extras:
+        assert e["wait"] is False, e          # so-101
+        assert e["waitAtEnd"] is False, e     # ufactory xArm
+        assert e["interpolate"] is False, e   # xArm: skip the interpolation loop
+
+
+async def test_arm_move_extra_values_are_real_booleans_not_truthy_stand_ins():
+    """xArm compares `extra["waitAtEnd"] == false` against an `any`, so `0` or
+    `"false"` would not match and the arm would silently keep blocking."""
+    for e in await _extras_from_a_run():
+        for key in ("wait", "waitAtEnd", "interpolate"):
+            assert isinstance(e[key], bool), (key, type(e[key]))
+
+
+async def test_arm_move_extra_is_overridable_and_replaces_rather_than_merges():
+    """A driver may need a different motion mode (xArm's `direct` for
+    point-to-point instead of servo), which can require *removing* a default
+    key. Merging would make that impossible."""
+    extras = await _extras_from_a_run(
+        _config(arm_move_extra={"direct": True, "waitAtEnd": False})
+    )
+    for e in extras:
+        assert e == {"direct": True, "waitAtEnd": False}, e
+
+
+async def test_empty_arm_move_extra_sends_nothing_rather_than_the_default():
+    # `{}` is a real choice -- restore whatever the driver does by default --
+    # and must be distinguishable from "key absent".
+    for e in await _extras_from_a_run(_config(arm_move_extra={})):
+        assert e == {}, e
