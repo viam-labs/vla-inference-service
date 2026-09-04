@@ -409,6 +409,19 @@ class VLAController(Generic, EasyResource):
         value = await gripper.read()
         await gripper.write(value)
 
+    @staticmethod
+    def _consumed_image_size(specs: dict[str, Any]) -> tuple[int, int] | None:
+        """(height, width) from `specs.preprocess_image_size`, or None.
+
+        Absent for a policy service older than the field, and null for a
+        checkpoint whose policy does no resize of its own. Both mean the
+        same thing here: fall back to the declared shape.
+        """
+        raw = specs.get("preprocess_image_size")
+        if not raw:
+            return None
+        return (int(raw[0]), int(raw[1]))
+
     def _image_sizes(self, specs: dict[str, Any]) -> dict[str, tuple[int, int]]:
         cfg = self._cfg
         # int() is mandatory, not defensive. specs arrives via
@@ -416,10 +429,29 @@ class VLAController(Generic, EasyResource):
         # stores every number as a double, so [3, 224, 224] comes back as
         # [3.0, 224.0, 224.0]. PIL's resize() raises "TypeError: integer
         # argument expected, got float" on a bare float.
-        sizes = {
+        declared = {
             key: (int(specs["input_features"][key][1]), int(specs["input_features"][key][2]))
             for key in specs["image_feature_keys"]
         }
+        # The declared shape is what the checkpoint *claims*; a fine-tune
+        # inherits its base model's claim verbatim regardless of the
+        # resolution it was actually trained on. When the policy reports the
+        # size its own preprocessing consumes, that is the one training
+        # really used -- resizing to the declared shape first would resample
+        # twice and discard detail the policy is about to ask for anyway.
+        consumed = self._consumed_image_size(specs)
+        sizes = {key: consumed for key in declared} if consumed else declared
+        for key, shape in declared.items():
+            if consumed and shape != consumed:
+                LOGGER.info(
+                    "feeding %r at %dx%d (the size the policy's own preprocessing "
+                    "consumes) rather than the %dx%d it declares in input_features",
+                    key,
+                    consumed[0],
+                    consumed[1],
+                    shape[0],
+                    shape[1],
+                )
         missing = set(sizes) - set(cfg.cameras)
         if missing:
             raise RuntimeError(
@@ -647,12 +679,13 @@ class VLAController(Generic, EasyResource):
             # cleared the action, so there is no "try again next tick" that
             # would be safe -- the arm itself is reporting the fault.
             #
-            # `wait: False` because the next tick supersedes this setpoint: a driver
-            # that blocks until the arm physically settles (so-101's default) spends
-            # the entire tick budget waiting for a target we are about to replace.
-            # Free-form `extra`, so a driver that does not read the key ignores it.
+            # `arm_move_extra` must make the driver return without waiting for
+            # the arm to physically settle: the next tick supersedes this
+            # setpoint, so a blocking driver spends the whole tick budget
+            # waiting for a target we are about to replace. See
+            # `DEFAULT_ARM_MOVE_EXTRA` for why it takes three keys.
             await arm.move_to_joint_positions(
-                JointPositions(values=target), extra={"wait": False}
+                JointPositions(values=target), extra=dict(cfg.arm_move_extra)
             )
             if gripper.has_normalized_tail:
                 await gripper.write(float(safe[-1]))

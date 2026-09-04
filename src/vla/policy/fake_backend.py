@@ -31,6 +31,10 @@ class FakePolicyBackend(PolicyBackend):
         supports_rtc: bool = True,
         relative_actions: bool = False,
         image_size: tuple[int, int] = (224, 224),
+        # Defaults to None -- the "policy does its own resize" case is the
+        # interesting one, so a test that cares must opt in and say so,
+        # rather than every unrelated controller test silently exercising it.
+        preprocess_image_size: tuple[int, int] | None = None,
         state_dim: int | None = None,
         camera_keys: tuple[str, ...] = _DEFAULT_CAMERA_KEYS,
     ) -> None:
@@ -43,6 +47,7 @@ class FakePolicyBackend(PolicyBackend):
         self._supports_rtc = supports_rtc
         self._relative_actions = relative_actions
         self._image_size = image_size
+        self._preprocess_image_size = preprocess_image_size
         self._camera_keys = tuple(camera_keys)
         self._specs: PolicySpecs | None = None
         self._lock = threading.Lock()
@@ -79,6 +84,9 @@ class FakePolicyBackend(PolicyBackend):
             output_features={"action": [self._action_dim]},
             image_feature_keys=image_keys,
             declared_image_feature_keys=declared_image_keys,
+            preprocess_image_size=(
+                list(self._preprocess_image_size) if self._preprocess_image_size else None
+            ),
             supports_rtc=self._supports_rtc,
             rtc_enabled=bool(rtc and getattr(rtc, "enabled", False)),
             relative_actions=self._relative_actions,
