@@ -44,7 +44,15 @@ from .gripper import GRIPPER_TYPES, GRIPPER_TYPES_NEEDING_DEPENDENCY
 from .observation import DEFAULT_DURATION_WARN_S, STALE_FRAME_WARN_S
 from .units import SUPPORTED_UNITS
 
-__all__ = ["ConfigError", "SafetyConfig", "ControllerConfig", "MODES", "ENCODINGS", "IMAGE_FITS"]
+__all__ = [
+    "ConfigError",
+    "SafetyConfig",
+    "ControllerConfig",
+    "MODES",
+    "ENCODINGS",
+    "IMAGE_FITS",
+    "DEFAULT_ARM_MOVE_EXTRA",
+]
 
 MODES = ("auto", "sequential", "rtc", "async")
 ENCODINGS = ("jpeg", "png", "raw")
@@ -56,6 +64,61 @@ ENCODINGS = ("jpeg", "png", "raw")
 # deployment can reproduce its pre-fix output. See observation.py's `_encode`
 # and the README's `#controller` section for the measured divergence.
 IMAGE_FITS = ("pad", "stretch")
+
+# `extra` sent with every `move_to_joint_positions`. The control loop issues a
+# new setpoint every tick and the next one supersedes this one, so the driver
+# must return WITHOUT waiting for the arm to physically settle. Drivers spell
+# that differently and silently ignore keys they do not know, so all three
+# spellings ship together rather than making the operator pick:
+#
+#   wait          so-101's key. Its driver blocks until settled by default.
+#   waitAtEnd     ufactory xArm's key (viam-ufactory-xarm arm/xarm.go:701-703).
+#                 `wait` is NOT in its parsed set (speed_r, speed_d,
+#                 acceleration_r, acceleration_d, direct, waitAtEnd,
+#                 interpolate), so it was dropped and the default `true`
+#                 applied: every tick ran the client-side interpolation to
+#                 completion and then polled GetState every 10ms until the arm
+#                 stopped (comm.go:1009-1030). Measured on an xArm at fps=10:
+#                 ticks of 0.26-1.49s against a 0.100s budget, i.e. the arm
+#                 replayed a 10Hz trajectory at roughly 2Hz.
+#   interpolate   also xArm's. `waitAtEnd: false` alone still runs the
+#                 client-side interpolation loop, which costs one 1/move_hz
+#                 sleep per intermediate step and so still scales with the
+#                 delta. `false` sends the goal as a single servo setpoint.
+#                 Safe here because safety.py already clamps every per-tick
+#                 delta to `max_vel_degs_per_sec / fps`, so a setpoint can
+#                 never ask for more motion than one tick's worth.
+#
+# Override wholesale via the `arm_move_extra` config key for a driver that
+# wants something else (xArm also accepts `direct: true` for point-to-point
+# instead of servo mode). An empty dict restores stock blocking behavior.
+DEFAULT_ARM_MOVE_EXTRA: dict[str, Any] = {
+    "wait": False,
+    "waitAtEnd": False,
+    "interpolate": False,
+}
+
+
+def _parse_arm_move_extra(raw: Any) -> dict[str, Any]:
+    """Validate `arm_move_extra`, defaulting to `DEFAULT_ARM_MOVE_EXTRA`.
+
+    Absent means "use the default"; `{}` is a real, distinct choice meaning
+    "send nothing", which restores whatever blocking behavior the driver
+    defaults to. Keys must be strings because they cross a protobuf Struct.
+
+    Deliberately NOT merged with the default: a driver needing a different
+    motion mode may have to *remove* a key, and a merge would make that
+    impossible. Whatever is configured is exactly what gets sent.
+    """
+    if raw is None:
+        return dict(DEFAULT_ARM_MOVE_EXTRA)
+    if not isinstance(raw, dict):
+        raise ConfigError(f"arm_move_extra must be an object, got {type(raw).__name__}")
+    bad = sorted(k for k in raw if not isinstance(k, str))
+    if bad:
+        raise ConfigError(f"arm_move_extra keys must be strings, got {bad}")
+    return dict(raw)
+
 
 # Sanity ceilings/floors, not physical limits: they turn an obvious typo (a
 # negative fps, a fractional queue_threshold) into a config-time error.
@@ -170,6 +233,9 @@ class ControllerConfig:
     image_encoding: str = "jpeg"
     jpeg_quality: int = 90
     image_fit: str = "pad"
+    arm_move_extra: dict[str, Any] = field(
+        default_factory=lambda: dict(DEFAULT_ARM_MOVE_EXTRA)
+    )
     # Operator-configurable rather than fixed module defaults: a checkpoint
     # run at 2 Hz and one at 10 Hz imply very different "this tick is late"
     # and "this frame is stale" thresholds. Defaults match observation.py's
@@ -255,6 +321,7 @@ class ControllerConfig:
             image_encoding=as_choice(raw.get("image_encoding", "jpeg"), "image_encoding", ENCODINGS),
             jpeg_quality=as_int(raw.get("jpeg_quality", 90), "jpeg_quality", minimum=0, maximum=100),
             image_fit=as_choice(raw.get("image_fit", "pad"), "image_fit", IMAGE_FITS),
+            arm_move_extra=_parse_arm_move_extra(raw.get("arm_move_extra")),
             duration_warn_s=as_float(
                 raw.get("duration_warn_s", DEFAULT_DURATION_WARN_S), "duration_warn_s", minimum=0.0
             ),

@@ -679,12 +679,13 @@ class VLAController(Generic, EasyResource):
             # cleared the action, so there is no "try again next tick" that
             # would be safe -- the arm itself is reporting the fault.
             #
-            # `wait: False` because the next tick supersedes this setpoint: a driver
-            # that blocks until the arm physically settles (so-101's default) spends
-            # the entire tick budget waiting for a target we are about to replace.
-            # Free-form `extra`, so a driver that does not read the key ignores it.
+            # `arm_move_extra` must make the driver return without waiting for
+            # the arm to physically settle: the next tick supersedes this
+            # setpoint, so a blocking driver spends the whole tick budget
+            # waiting for a target we are about to replace. See
+            # `DEFAULT_ARM_MOVE_EXTRA` for why it takes three keys.
             await arm.move_to_joint_positions(
-                JointPositions(values=target), extra={"wait": False}
+                JointPositions(values=target), extra=dict(cfg.arm_move_extra)
             )
             if gripper.has_normalized_tail:
                 await gripper.write(float(safe[-1]))
