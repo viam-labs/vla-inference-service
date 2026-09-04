@@ -30,6 +30,17 @@ class PolicySpecs:
     # by the caller so a checkpoint's full declared shape is always visible
     # on the wire, even once a feature has been dropped from the reduced set.
     declared_image_feature_keys: list[str]
+    # (height, width) the policy's OWN preprocessing resizes every frame to
+    # before the vision encoder sees it, or None when it does no such resize.
+    # Distinct from `input_features`, which is only what the checkpoint
+    # *declares*: a fine-tune inherits its base model's declared shape
+    # verbatim (smolvla_base says 256x256 whatever the fine-tuning dataset
+    # actually held), while training fed the dataset's native frames straight
+    # into this resize. Feeding the declared shape therefore resamples twice
+    # and, from a 720p/1080p recording, throws away three quarters of the
+    # pixels the weights were fitted on -- so this is the size a caller
+    # should put on the wire.
+    preprocess_image_size: list[int] | None
     supports_rtc: bool
     rtc_enabled: bool
     relative_actions: bool
