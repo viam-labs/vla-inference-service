@@ -29,7 +29,7 @@ from tests.fakes import FakeArm, FakeCamera, FakeDoCommandGripper, StalledArm
 from vla.controller.service import VLAController
 from vla.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
-from vla.wire import encode_matrix
+from vla.wire import decode_image, encode_matrix
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,6 +51,7 @@ class FakePolicyClient:
         supports_rtc=True,
         image_feature_keys=("observation.images.top",),
         extra_image_shapes=None,
+        preprocess_image_size=None,
         error="",
         action_value=0.0,
     ):
@@ -61,6 +62,8 @@ class FakePolicyClient:
         self.supports_rtc = supports_rtc
         self.image_feature_keys = list(image_feature_keys)
         self.extra_image_shapes = extra_image_shapes or {}
+        self.preprocess_image_size = preprocess_image_size
+        self.last_infer = None
         self.error = error
         self.action_value = action_value
         self.infer_calls = 0
@@ -87,6 +90,13 @@ class FakePolicyClient:
                 "n_action_steps": float(self.n),
                 "input_features": input_features,
                 "output_features": {"action": [float(self.action_dim)]},
+                # Floats for the same reason as every other number here: a
+                # real specs response crosses protobuf Struct.
+                "preprocess_image_size": (
+                    [float(v) for v in self.preprocess_image_size]
+                    if self.preprocess_image_size
+                    else None
+                ),
                 "image_feature_keys": self.image_feature_keys,
                 "supports_rtc": self.supports_rtc,
                 "rtc_enabled": False,
@@ -95,6 +105,7 @@ class FakePolicyClient:
             }
         if name == "infer":
             self.infer_calls += 1
+            self.last_infer = command
             if self.infer_delay_s:
                 await asyncio.sleep(self.infer_delay_s)
             if self.fail_infer:
@@ -1059,6 +1070,41 @@ async def test_camera_feature_not_mapped_refuses_and_names_it():
     assert "not" in status["last_error"] and "mapped" in status["last_error"]
     assert len(arm.moves) == 0
     assert arm.stopped >= 1
+
+
+async def _first_wire_image_shape(policy, arm):
+    svc = _svc(
+        config=_config(safety={"max_start_delta_degs": 1000.0}),
+        deps=_deps(policy=policy, arm=arm, camera=FakeCamera(size=(480, 640))),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await svc.do_command({"command": "stop"})
+    return decode_image(policy.last_infer["images"]["observation.images.top"]).shape[:2]
+
+
+async def test_frames_go_on_the_wire_at_the_size_the_policy_consumes():
+    """The declared shape is what a fine-tune inherited from its base model;
+    `preprocess_image_size` is what the policy actually resizes to before its
+    vision encoder. Sending the smaller declared shape resamples twice and
+    throws away detail the policy is about to ask for -- on smolvla-box-bot,
+    256x256 on the wire against a 512x512 preprocess is a 4x pixel loss over
+    the training path."""
+    policy = FakePolicyClient(preprocess_image_size=(512, 512))
+    shape = await _first_wire_image_shape(policy, FakeArm(positions=[0.0] * 6))
+    # Not the declared 224x224 that FakePolicyClient reports in
+    # input_features, and not the camera's native 480x640 either.
+    assert shape == (512, 512)
+
+
+async def test_declared_shape_is_used_when_the_policy_reports_no_preprocess_size():
+    """A policy service older than the field, or a checkpoint whose policy
+    does no resize of its own, must keep the previous behaviour rather than
+    losing its resize entirely."""
+    policy = FakePolicyClient()
+    assert policy.preprocess_image_size is None
+    shape = await _first_wire_image_shape(policy, FakeArm(positions=[0.0] * 6))
+    assert shape == (224, 224)
 
 
 async def test_first_action_far_from_current_pose_refuses_and_stops():
