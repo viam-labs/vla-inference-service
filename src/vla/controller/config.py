@@ -16,10 +16,21 @@ Two fields carry non-obvious semantics:
     operator mistake on a safety-critical limit.
 
   - `queue_threshold: None` means "derive it", not "zero". The right value is
-    a property of the checkpoint (`n_action_steps`), which config parsing
-    cannot see, so `VLAController._build_scheduler` derives `n_action_steps -
-    1` once `specs` is known. A sentinel of `0` could not be distinguished
-    from an operator who genuinely wants `0`.
+    a property of the checkpoint (`n_action_steps`) or of
+    `actions_per_chunk`, neither of which config parsing can see, so
+    `VLAController._build_scheduler` derives `effective_chunk - 1` once
+    `specs` is known. A sentinel of `0` could not be distinguished from an
+    operator who genuinely wants `0`.
+
+  - `actions_per_chunk: None` means "execute the whole chunk". An int
+    truncates every chunk to its first N actions before it is queued,
+    mirroring lerobot's server-side `actions_per_chunk`
+    (`async_inference/policy_server.py`, `chunk[:, : self.actions_per_chunk, :]`).
+    A checkpoint whose `chunk_size` covers 5s of motion is 5s of open loop;
+    truncating re-observes every N ticks instead. N is floored by inference
+    latency -- below `latency * fps` the queue cannot refill in time -- so
+    this is only useful with `mode: "async"`, where `sequential`'s
+    per-refill stall would otherwise dominate the duty cycle.
 
 `state_units`/`action_units` validate against `units.SUPPORTED_UNITS`, so a
 "normalized" config fails here with the field name rather than surviving to
@@ -163,6 +174,7 @@ class ControllerConfig:
     fps: float = 10.0
     mode: str = "auto"
     queue_threshold: int | None = None
+    actions_per_chunk: int | None = None
     starvation_grace_ticks: int = 3
     policy_ready_timeout_s: int = 600
     state_units: str = "degrees"
@@ -240,6 +252,11 @@ class ControllerConfig:
             queue_threshold=(
                 as_int(raw["queue_threshold"], "queue_threshold", minimum=0)
                 if raw.get("queue_threshold") is not None
+                else None
+            ),
+            actions_per_chunk=(
+                as_int(raw["actions_per_chunk"], "actions_per_chunk", minimum=1)
+                if raw.get("actions_per_chunk") is not None
                 else None
             ),
             starvation_grace_ticks=as_int(

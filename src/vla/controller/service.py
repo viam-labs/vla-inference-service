@@ -301,35 +301,54 @@ class VLAController(Generic, EasyResource):
         return "sequential"
 
     def _build_scheduler(self, mode: str, builder: ObservationBuilder) -> ChunkScheduler:
+        limit = self._cfg.actions_per_chunk
         if mode == "async":
             threshold = self._resolve_queue_threshold()
             return AsyncScheduler(
-                lambda rtc: self._infer(builder, rtc), threshold, self._cfg.fps
+                lambda rtc: self._infer(builder, rtc), threshold, self._cfg.fps, limit
             )
-        return SequentialScheduler(lambda rtc: self._infer(builder, rtc))
+        return SequentialScheduler(lambda rtc: self._infer(builder, rtc), limit)
+
+    def _effective_chunk_len(self) -> int:
+        """How many actions a merged chunk actually contributes to the queue.
+
+        `actions_per_chunk` truncates the chunk (see `_validate_and_merge`),
+        so it -- not the checkpoint's `n_action_steps` -- is what every
+        queue-depth decision has to be measured against. Clamped by
+        `n_action_steps` so an operator who budgets more actions than the
+        policy emits does not get a threshold the queue can never reach.
+        """
+        n_action_steps = int(self._specs["n_action_steps"])
+        limit = self._cfg.actions_per_chunk
+        return n_action_steps if limit is None else min(limit, n_action_steps)
 
     def _resolve_queue_threshold(self) -> int:
         """`queue_threshold=None` (the config default) means "derive it" --
         config parsing has no access to `specs`, so it cannot pick a value
-        itself. `n_action_steps - 1` fires the background refill as early
+        itself. `effective_chunk - 1` fires the background refill as early
         as possible (maximizing overlap runway), which is unambiguously
         right in the latency-bound regime this scheduler exists for, and
         harmless in the fast-inference regime, where the queue never drains
-        that low before the (fast) refill lands regardless. An explicit
-        config value always overrides this -- this is a default, not a
-        clamp.
+        far enough for the threshold to bind.
+
+        Note this is a *staleness* ceiling as much as a starvation floor.
+        `ActionQueue` merges in append mode, so with threshold T the action
+        executing at any instant was inferred between T and T + chunk_len
+        ticks ago. Deriving from the truncated length is what keeps that
+        window narrow: at `actions_per_chunk=12` it is 11-23 ticks, where
+        the untruncated 50-step chunk gives 49-98.
         """
         configured = self._cfg.queue_threshold
         if configured is not None:
             return configured
-        n_action_steps = int(self._specs["n_action_steps"])
-        derived = max(0, n_action_steps - 1)
+        effective = self._effective_chunk_len()
+        derived = max(0, effective - 1)
         LOGGER.info(
-            "queue_threshold not configured; deriving %d from the checkpoint's "
-            "n_action_steps=%d (fires the background refill as early as possible, "
+            "queue_threshold not configured; deriving %d from an effective chunk "
+            "length of %d (fires the background refill as early as possible, "
             "maximizing overlap runway)",
             derived,
-            n_action_steps,
+            effective,
         )
         return derived
 
