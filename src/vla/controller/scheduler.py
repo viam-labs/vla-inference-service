@@ -64,7 +64,12 @@ class SchedulerError(VLAError, RuntimeError):
     """
 
 
-def _validate_and_merge(queue: ActionQueue, processed: np.ndarray, raw: np.ndarray) -> None:
+def _validate_and_merge(
+    queue: ActionQueue,
+    processed: np.ndarray,
+    raw: np.ndarray,
+    actions_per_chunk: int | None = None,
+) -> None:
     """Validate a freshly-inferred chunk and merge it into `queue`.
 
     Shared by both schedulers so the two cannot drift apart on what counts
@@ -72,6 +77,13 @@ def _validate_and_merge(queue: ActionQueue, processed: np.ndarray, raw: np.ndarr
     parameter: both callers run `ActionQueue` in append mode, where the
     delay is ignored, and a computed-delay parameter would imply RTC
     semantics that apply to neither.
+
+    `actions_per_chunk` truncates before the merge, not after: the discarded
+    tail must never reach the queue, or a later `qsize()` would count
+    actions that will never be executed and the refill would fire late.
+    Truncation is deliberately *not* a validation failure when the chunk is
+    shorter than N -- a policy is free to return fewer rows than the
+    operator budgeted for, and slicing past the end is already a no-op.
     """
     try:
         if processed.shape[0] == 0:
@@ -85,6 +97,10 @@ def _validate_and_merge(queue: ActionQueue, processed: np.ndarray, raw: np.ndarr
             f"infer(), got processed={type(processed).__name__!r} "
             f"raw={type(raw).__name__!r}"
         ) from exc
+
+    if actions_per_chunk is not None:
+        processed = processed[:actions_per_chunk]
+        raw = raw[:actions_per_chunk]
 
     try:
         queue.merge(raw, processed, real_delay=0)
@@ -123,9 +139,10 @@ class SequentialScheduler(ChunkScheduler):
     behavior here is the baseline the overlapped path is compared against.
     """
 
-    def __init__(self, infer: InferFn) -> None:
+    def __init__(self, infer: InferFn, actions_per_chunk: int | None = None) -> None:
         self._infer = infer
         self._queue = ActionQueue(QueueSettings(rtc_enabled=False))
+        self._actions_per_chunk = actions_per_chunk
 
     async def next_action(self) -> np.ndarray:
         action = self._queue.get()
@@ -138,7 +155,7 @@ class SequentialScheduler(ChunkScheduler):
         # as-is, unlike AsyncScheduler, which must wrap it because it
         # surfaces on a later, unrelated call.
         processed, raw = await self._infer(None)
-        _validate_and_merge(self._queue, processed, raw)
+        _validate_and_merge(self._queue, processed, raw, self._actions_per_chunk)
 
         action = self._queue.get()
         if action is None:  # pragma: no cover - guarded by the shape check above
@@ -195,10 +212,17 @@ class AsyncScheduler(ChunkScheduler):
     tick) if `queue_threshold < ceil(observed_latency * fps)`.
     """
 
-    def __init__(self, infer: InferFn, queue_threshold: int, fps: float = 10.0) -> None:
+    def __init__(
+        self,
+        infer: InferFn,
+        queue_threshold: int,
+        fps: float = 10.0,
+        actions_per_chunk: int | None = None,
+    ) -> None:
         self._infer = infer
         self._queue = ActionQueue(QueueSettings(rtc_enabled=False))
         self._queue_threshold = queue_threshold
+        self._actions_per_chunk = actions_per_chunk
         self._fps = fps
         self._inflight: asyncio.Task[None] | None = None
         self._pending_error: Exception | None = None
@@ -262,7 +286,7 @@ class AsyncScheduler(ChunkScheduler):
         started = time.perf_counter()
         try:
             processed, raw = await self._infer(None)
-            _validate_and_merge(self._queue, processed, raw)
+            _validate_and_merge(self._queue, processed, raw, self._actions_per_chunk)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

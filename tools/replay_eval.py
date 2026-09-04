@@ -281,6 +281,34 @@ def between_draw_spread(
     return float(per_window[live].mean()) if live.any() else float("nan")
 
 
+def spread_by_offset(
+    predicted: np.ndarray, repeats: int, mask: np.ndarray | None = None
+) -> np.ndarray:
+    """`between_draw_spread`, resolved per horizon offset instead of pooled.
+
+    This is what separates two very different diagnoses of a rising error
+    curve. If the draws AGREE at an offset but are wrong, the policy is
+    confidently wrong there and more capacity or training could fix it. If
+    the draws DISAGREE, the policy is sampling several plausible futures and
+    the error is genuine ambiguity about what happens next -- which no
+    amount of retraining removes, because the ground truth is one arbitrary
+    sample from that same distribution.
+
+    Returns an array of length `horizon`, nan where a mask left no draws.
+    """
+    if repeats < 2:
+        return np.full(predicted.shape[1], np.nan, dtype=np.float64)
+    n = predicted.shape[0] // repeats
+    if mask is None:
+        mask = np.ones(predicted.shape[:2], dtype=bool)
+    g = predicted.reshape(n, repeats, *predicted.shape[1:])
+    gm = mask.reshape(n, repeats, -1)[:, 0]
+    dev = np.linalg.norm(g - g.mean(axis=1, keepdims=True), axis=3).mean(axis=1)
+    counts = gm.sum(axis=0)
+    total = np.where(gm, dev, 0.0).sum(axis=0)
+    return np.where(counts > 0, total / np.maximum(counts, 1), np.nan)
+
+
 def errors_by_position(
     predicted: np.ndarray, truth: np.ndarray, starts: list[int], n_frames: int,
     buckets: int = 4, mask: np.ndarray | None = None,
@@ -567,6 +595,24 @@ def report(metrics: dict, label: str) -> None:
         _print_curve(
             seg["l2_by_offset"], metrics.get("n_by_offset"), bool(metrics.get("truncated")), ind
         )
+        sbo = seg.get("spread_by_offset")
+        if sbo is not None and np.isfinite(sbo).any():
+            # The ratio is the diagnosis. ~1 means the draws disagree with
+            # each other about as much as they disagree with the truth --
+            # the future is genuinely ambiguous there, and a retrain cannot
+            # remove it because the recorded action is itself one arbitrary
+            # sample from that distribution. Well under 1 means the policy is
+            # confidently wrong, which training CAN fix.
+            print(f"{ind}draw disagreement vs. error, by offset:")
+            for k in (0, 1, 4, 9, 24, 49):
+                if k >= len(sbo) or not np.isfinite(sbo[k]):
+                    continue
+                err = seg["l2_by_offset"][k]
+                ratio = sbo[k] / err if err else float("nan")
+                print(
+                    f"{ind}  k={k:<4d} spread {sbo[k]:7.4f}  error {err:7.4f}  "
+                    f"spread/error {ratio:.2f}"
+                )
 
         if metrics.get("baselines"):
             print(f"{ind}vs. predictors that never call the policy:")
@@ -726,7 +772,19 @@ async def run(args) -> int:
         image_keys = list(specs["image_feature_keys"])
         horizon = int(specs["n_action_steps"])
         state_dim = int(specs["state_dim"])
-        sizes = {k: tuple(int(v) for v in specs["input_features"][k][1:]) for k in image_keys}
+        # Mirror the controller (`VLAController._image_sizes`): the declared
+        # shape is whatever the checkpoint's BASE model advertised, while
+        # `preprocess_image_size` is what this policy's own preprocessing
+        # actually resizes to. Grading through the declared shape resamples
+        # twice and charges the policy for detail the controller no longer
+        # discards. Absent -> declared, for an older policy service or a
+        # policy that does no resize of its own.
+        consumed = specs.get("preprocess_image_size")
+        sizes = (
+            {k: (int(consumed[0]), int(consumed[1])) for k in image_keys}
+            if consumed
+            else {k: tuple(int(v) for v in specs["input_features"][k][1:]) for k in image_keys}
+        )
         print(f"policy: {specs['policy_type']} on {specs['device']} ({specs['dtype']})")
         print(f"  image keys {image_keys}, horizon {horizon}, state_dim {state_dim}")
         action_space = resolve_action_space(
@@ -826,6 +884,9 @@ async def run(args) -> int:
         metrics["by_position"] = {}
         for name, start, stop, _unit in segs:
             metrics["segments"][name]["between_draw_spread"] = between_draw_spread(
+                predicted[:, :, start:stop], args.repeats, mask
+            )
+            metrics["segments"][name]["spread_by_offset"] = spread_by_offset(
                 predicted[:, :, start:stop], args.repeats, mask
             )
             metrics["by_position"][name] = errors_by_position(
@@ -1092,6 +1153,19 @@ def self_check() -> int:
     m6 = np.ones((4, 50), bool); m6[:, 30:] = False
     wild = stacked.copy(); wild[0, 30:] = 1e6
     assert abs(between_draw_spread(wild, 2, m6) - np.sqrt(6)) < 1e-5
+
+    # spread_by_offset: same quantity as between_draw_spread, resolved per k.
+    assert np.isnan(spread_by_offset(stacked, 1)).all()
+    assert not spread_by_offset(np.repeat(draws_a, 2, axis=0), 2).any()
+    sbo = spread_by_offset(stacked, 2)
+    assert sbo.shape == (50,)
+    assert np.allclose(sbo, np.sqrt(6)), sbo[:3]
+    # Its mean over offsets must agree with the pooled scalar, or the two
+    # numbers in one report would contradict each other.
+    assert abs(sbo.mean() - between_draw_spread(stacked, 2)) < 1e-5
+    # An offset no draw reached is nan, not a silently-zero "they agree!".
+    sbo_m = spread_by_offset(wild, 2, m6)
+    assert np.allclose(sbo_m[:30], np.sqrt(6)) and np.isnan(sbo_m[30:]).all()
 
     # ---------------------------------------------------------------- delta-ee
     # Segmented metrics. The point is that a rotation-only error must be
