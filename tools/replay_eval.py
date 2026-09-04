@@ -772,7 +772,19 @@ async def run(args) -> int:
         image_keys = list(specs["image_feature_keys"])
         horizon = int(specs["n_action_steps"])
         state_dim = int(specs["state_dim"])
-        sizes = {k: tuple(int(v) for v in specs["input_features"][k][1:]) for k in image_keys}
+        # Mirror the controller (`VLAController._image_sizes`): the declared
+        # shape is whatever the checkpoint's BASE model advertised, while
+        # `preprocess_image_size` is what this policy's own preprocessing
+        # actually resizes to. Grading through the declared shape resamples
+        # twice and charges the policy for detail the controller no longer
+        # discards. Absent -> declared, for an older policy service or a
+        # policy that does no resize of its own.
+        consumed = specs.get("preprocess_image_size")
+        sizes = (
+            {k: (int(consumed[0]), int(consumed[1])) for k in image_keys}
+            if consumed
+            else {k: tuple(int(v) for v in specs["input_features"][k][1:]) for k in image_keys}
+        )
         print(f"policy: {specs['policy_type']} on {specs['device']} ({specs['dtype']})")
         print(f"  image keys {image_keys}, horizon {horizon}, state_dim {state_dim}")
         action_space = resolve_action_space(
