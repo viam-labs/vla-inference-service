@@ -9,7 +9,7 @@ from viam.proto.app.robot import ServiceConfig
 from google.protobuf.struct_pb2 import Struct
 
 from vla.policy.config import PolicyConfig
-from vla.policy.fake_backend import FakePolicyBackend
+from tests.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
 from vla.wire import encode_image, encode_matrix, encode_vector, decode_matrix
 
@@ -275,57 +275,6 @@ async def test_close_does_not_warn_when_load_already_settled(tmp_path, caplog):
         await svc.close()
     warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == []
-
-
-# --- 2. generation counter ---
-
-
-async def test_stale_load_generation_does_not_overwrite_newer_state(tmp_path):
-    """Directly exercises the generation guard inside `_load`.
-
-    Simulates a stale load (an old generation number) finishing its work
-    after a newer reconfigure has already moved `self._generation` forward.
-    The stale load must leave `_state`/`_error` untouched.
-    """
-    _make_checkpoint(tmp_path)
-    svc = VLAPolicy("p")
-    svc._backend_factory = FakePolicyBackend
-    svc._cfg = PolicyConfig.parse({"model_path": str(tmp_path)})
-    stale_backend = FakePolicyBackend(action_dim=9, n_action_steps=3)
-    svc._backend = stale_backend
-    svc._generation = 5
-    # Deliberately a value the stale load's own (successful) run would NOT
-    # produce on its own -- if the generation guard were a no-op, `_load`
-    # would happily overwrite this to "ready"/None, so this baseline is
-    # chosen specifically to make that overwrite observable.
-    svc._state = "failed"
-    svc._error = "some earlier, unrelated failure"
-
-    await svc._load(3, stale_backend)  # stale generation: 3 != current 5
-
-    assert svc._state == "failed"
-    assert svc._error == "some earlier, unrelated failure"
-
-
-async def test_reconfigure_increments_generation_each_call(tmp_path):
-    """The increment itself, isolated from cancellation.
-
-    Cancellation alone can mask a broken (e.g. never-incrementing) counter in
-    an end-to-end race test, because the cancelled task never reaches the
-    comparison at all. This asserts the counter's own arithmetic directly.
-    """
-    _make_checkpoint(tmp_path)
-    svc = VLAPolicy("p")
-    svc._backend_factory = FakePolicyBackend
-    before = svc._generation
-
-    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
-    assert svc._generation == before + 1
-
-    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
-    assert svc._generation == before + 2
-
-    await svc.await_ready()
 
 
 async def test_reconfigure_while_loading_discards_stale_load_result(tmp_path):

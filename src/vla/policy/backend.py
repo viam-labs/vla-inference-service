@@ -1,8 +1,7 @@
-"""Backend abstraction separating the resource layer from any inference runtime."""
+"""What a loaded policy reports about itself, and the image-key rule every backend shares."""
 
 from __future__ import annotations
 
-import abc
 import dataclasses
 from dataclasses import dataclass
 from typing import Any
@@ -60,8 +59,7 @@ def resolve_image_feature_keys(
 ) -> list[str]:
     """Subtract `unused_image_features` from a checkpoint's declared keys.
 
-    Shared by every `PolicyBackend` implementation so `LeRobotBackend` and
-    `FakePolicyBackend` can never silently drift apart on what counts as
+    Shared so `LeRobotBackend` and the test fake can never silently drift apart on what counts as
     "not declared" or "would leave zero cameras" -- both backends call this
     same function rather than each re-deriving the rule.
     """
@@ -87,47 +85,3 @@ def resolve_image_feature_keys(
             "prepare_images has no path for zero image inputs"
         )
     return image_keys
-
-
-class PolicyBackend(abc.ABC):
-    """Loads a checkpoint and turns observations into action chunks.
-
-    Implementations must be safe to call concurrently from multiple requests:
-    `predict_chunk` carries no state between calls.
-    """
-
-    @abc.abstractmethod
-    def load(
-        self,
-        checkpoint_dir: str,
-        *,
-        device: str,
-        dtype: str,
-        rtc: Any | None,
-        unused_image_features: frozenset[str] = frozenset(),
-    ) -> None:
-        """Load weights and processors. Blocking; run off the event loop."""
-
-    @property
-    @abc.abstractmethod
-    def specs(self) -> PolicySpecs | None:
-        """Loaded policy specs, or None before load completes."""
-
-    @abc.abstractmethod
-    def predict_chunk(
-        self,
-        images: dict[str, np.ndarray],
-        state: np.ndarray,
-        task: str,
-        rtc_kwargs: dict[str, Any] | None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return `(processed_actions, raw_actions)`, both `[n_action_steps, action_dim]`.
-
-        `processed_actions` are postprocessed and ready for the robot.
-        `raw_actions` are in the policy's own action space and are what an RTC
-        caller must feed back as `prev_chunk_left_over`. They are deliberately
-        distinct return values because confusing them is the likeliest RTC bug.
-        """
-
-    def reset(self) -> None:
-        """Clear any cached state. Default: no-op."""

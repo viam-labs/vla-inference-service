@@ -136,22 +136,21 @@ def decode_matrix(payload: dict[str, Any]) -> np.ndarray:
         raise WireError(f"matrix payload 'rows' must be a list, got {type(rows).__name__}")
     if not rows:
         return np.zeros((0, 0), dtype=np.float32)
+    # Struct's null_value round-trips to None, which numpy would quietly turn
+    # into NaN -- and the safety layer's NaN rejection would then blame the
+    # model for a transport fault. Everything else (nested values, ragged
+    # rows) numpy already rejects, just with its own wording.
     for i, row in enumerate(rows):
-        if not isinstance(row, list):
-            raise WireError(f"matrix payload row {i} must be a list, got {type(row).__name__}")
-    widths = {len(r) for r in rows}
-    if len(widths) != 1:
-        raise WireError(f"ragged matrix rows: widths {sorted(widths)}")
-    for i, row in enumerate(rows):
-        for j, v in enumerate(row):
+        for j, v in enumerate(row if isinstance(row, list) else ()):
             if v is None:
-                # Struct's null_value round-trips to None. Left unchecked
-                # this becomes NaN below, and the safety layer's NaN
-                # rejection then blames the model for a transport fault.
                 raise WireError(f"matrix payload has a null value at row {i}, column {j}")
-            if isinstance(v, (list, dict)):
-                raise WireError(f"matrix payload value at row {i}, column {j} is not a scalar")
-    return np.asarray(rows, dtype=np.float32)
+    try:
+        out = np.asarray(rows, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise WireError(f"matrix payload 'rows' must be a rectangular (non-ragged) list of numbers: {exc}") from exc
+    if out.ndim != 2:
+        raise WireError(f"matrix payload 'rows' must be a list of lists, got shape {out.shape}")
+    return out
 
 
 def encode_vector(v: np.ndarray) -> dict[str, Any]:
@@ -169,6 +168,10 @@ def decode_vector(payload: dict[str, Any]) -> np.ndarray:
     for i, v in enumerate(values):
         if v is None:
             raise WireError(f"vector payload has a null value at index {i}")
-        if isinstance(v, (list, dict)):
-            raise WireError(f"vector payload value at index {i} is not a scalar")
-    return np.asarray(values, dtype=np.float32)
+    try:
+        out = np.asarray(values, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise WireError(f"vector payload 'values' must be a flat list of numbers: {exc}") from exc
+    if out.ndim != 1:
+        raise WireError(f"vector payload 'values' must be a flat list, got shape {out.shape}")
+    return out

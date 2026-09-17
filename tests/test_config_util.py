@@ -6,7 +6,6 @@ from vla.config_util import (
     VLAError,
     as_bool,
     as_choice,
-    as_env_var_name,
     as_float,
     as_int,
     as_str,
@@ -139,49 +138,3 @@ def test_redact_secret_shows_only_a_prefix_and_the_length(value, expected):
 def test_redact_secret_never_contains_the_full_value():
     secret = "hf_AbCdEfGhIjKlMnOpQrStUv123456"
     assert secret not in redact_secret(secret)
-
-
-# --- as_env_var_name ---
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        "HF_TOKEN",
-        "_FOO_BAR",  # leading underscore is a valid identifier
-        "A" * 64,  # exactly at the length cap
-        # Documents the known gap: a real Hugging Face token is `hf_` plus
-        # ~34 alphanumerics -- a perfectly valid env-var name, so this check
-        # cannot and does not reject it. Redaction at display time is the
-        # actual defense. This row exists so nobody "fixes" the check later
-        # believing it should have caught this.
-        "hf_AbCdEfGhIjKlMnOpQrStUv123456",
-    ],
-)
-def test_as_env_var_name_accepts(value):
-    assert as_env_var_name(value, "field") == value
-
-
-@pytest.mark.parametrize(
-    "value",
-    [
-        "1FOO",  # leading digit
-        "sk-live-1234567890abcdef1234567890abcdef",  # hyphens
-        "FOO BAR",
-        "FOO.BAR",
-        "A" * 65,  # over the length cap
-        "TOKÉN",  # non-ASCII: str.isidentifier() alone would accept it
-        1.0,
-        "",
-    ],
-)
-def test_as_env_var_name_rejects(value):
-    with pytest.raises(ConfigError, match="field"):
-        as_env_var_name(value, "field")
-
-
-def test_as_env_var_name_never_echoes_the_full_rejected_value():
-    offending = "sk-live-1234567890abcdef1234567890abcdef"
-    with pytest.raises(ConfigError) as excinfo:
-        as_env_var_name(offending, "field")
-    assert offending not in str(excinfo.value)

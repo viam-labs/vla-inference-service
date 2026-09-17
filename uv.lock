@@ -1686,7 +1686,6 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "pillow" },
-    { name = "typing-extensions" },
     { name = "viam-sdk" },
 ]
 
@@ -1706,7 +1705,6 @@ requires-dist = [
     { name = "lerobot", extras = ["smolvla", "evo1"], marker = "extra == 'lerobot'", git = "https://github.com/huggingface/lerobot?rev=ff7cc3de1de830f5f3276918a013d04bdf9ea4be" },
     { name = "numpy", specifier = ">=2.0.0,<2.3.0" },
     { name = "pillow", specifier = ">=10.0.0" },
-    { name = "typing-extensions", specifier = ">=4.12.2" },
     { name = "viam-sdk", specifier = ">=0.80.0" },
 ]
 provides-extras = ["lerobot"]

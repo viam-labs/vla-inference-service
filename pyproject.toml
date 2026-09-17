@@ -8,7 +8,6 @@ dependencies = [
     "viam-sdk>=0.80.0",
     "numpy>=2.0.0,<2.3.0",
     "pillow>=10.0.0",
-    "typing-extensions>=4.12.2",
 ]
 
 [project.optional-dependencies]

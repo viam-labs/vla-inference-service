@@ -3,8 +3,7 @@
 `LeRobotBackend.load()` imports torch and lerobot lazily inside itself (see
 this module's own docstring), but `_build_specs` and the helpers it calls do
 not -- `_detect_relative_actions` already guards its `lerobot.processor`
-import with `except ImportError`, and `_warn_about_likely_unused_features`
-does the same. That means the `unused_image_features` validation this file
+import with `except ImportError`. That means the `unused_image_features` validation this file
 exercises -- the same validation `FakePolicyBackend` mirrors via
 `resolve_image_feature_keys` -- can be driven directly with plain fakes,
 with no `@pytest.mark.integration` and no checkpoint download.
@@ -202,81 +201,6 @@ def test_build_specs_allows_a_checkpoint_that_declares_no_image_features():
 # directly. Marked `differential` for the same reason every other
 # lerobot-requiring test here is: pyproject defines that marker as
 # "requires lerobot installed", and the fast suite deselects it.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.differential
-def test_advisory_warning_names_only_the_camera_with_no_stats_and_no_rename_target(caplog):
-    """The shape of a real fine-tune: two cameras renamed onto the base
-    model's canonical slots, a third slot inherited from the base and never
-    fed. Only that third slot may be named.
-    """
-    import logging
-
-    normalize_mod = pytest.importorskip("lerobot.processor.normalize_processor")
-    rename_mod = pytest.importorskip("lerobot.processor.rename_processor")
-
-    fed = ["observation.images.camera1", "observation.images.camera2"]
-    inherited = "observation.images.camera3"
-
-    rename = rename_mod.RenameObservationsProcessorStep(
-        rename_map={
-            "observation.images.camera_transform": fed[0],
-            "observation.images.realsense_cam": fed[1],
-        }
-    )
-    # object.__new__ so this test does not have to track NormalizerProcessorStep's
-    # constructor signature across lerobot releases; `stats` is the only
-    # attribute the advisory check reads off it.
-    normalizer = object.__new__(normalize_mod.NormalizerProcessorStep)
-    normalizer.stats = {key: {} for key in fed}
-
-    backend = LeRobotBackend()
-    cfg = _fake_cfg(image_keys=[*fed, inherited])
-    with caplog.at_level(logging.WARNING, logger="vla.policy.lerobot_backend"):
-        specs = backend._build_specs(
-            cfg, _FakePolicy(), True, _fake_preprocessor([rename, normalizer]), "cpu", frozenset()
-        )
-
-    assert specs.image_feature_keys == [*fed, inherited]
-    warnings = [r.message for r in caplog.records if "unused_image_features" in r.message]
-    assert len(warnings) == 1
-    assert inherited in warnings[0]
-    for key in fed:
-        assert key not in warnings[0], "a camera with normalizer stats must not be flagged"
-
-
-@pytest.mark.differential
-def test_advisory_warning_is_silent_once_the_camera_is_listed_as_unused(caplog):
-    import logging
-
-    normalize_mod = pytest.importorskip("lerobot.processor.normalize_processor")
-    rename_mod = pytest.importorskip("lerobot.processor.rename_processor")
-
-    fed = ["observation.images.camera1", "observation.images.camera2"]
-    inherited = "observation.images.camera3"
-    rename = rename_mod.RenameObservationsProcessorStep(
-        rename_map={"observation.images.realsense_cam": fed[1]}
-    )
-    normalizer = object.__new__(normalize_mod.NormalizerProcessorStep)
-    normalizer.stats = {key: {} for key in fed}
-
-    backend = LeRobotBackend()
-    cfg = _fake_cfg(image_keys=[*fed, inherited])
-    with caplog.at_level(logging.WARNING, logger="vla.policy.lerobot_backend"):
-        specs = backend._build_specs(
-            cfg,
-            _FakePolicy(),
-            True,
-            _fake_preprocessor([rename, normalizer]),
-            "cpu",
-            frozenset({inherited}),
-        )
-
-    assert specs.image_feature_keys == fed
-    assert [r.message for r in caplog.records if "unused_image_features" in r.message] == []
-
-
 class _FakeTorch:
     """Enough torch surface for `_select_device`, with a controllable device.
 

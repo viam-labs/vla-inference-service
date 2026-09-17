@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, ClassVar, Mapping, Sequence
+from typing import Any, Callable, ClassVar, Mapping, Self, Sequence
 
 import numpy as np
-from typing_extensions import Self
 from viam.proto.app.robot import ServiceConfig
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
@@ -18,7 +17,6 @@ from viam.utils import struct_to_dict
 
 from ..config_util import VLAError, as_int
 from ..wire import WireError, decode_image, decode_matrix, decode_vector, encode_matrix
-from .backend import PolicyBackend
 from .config import PolicyConfig
 from .lerobot_backend import LeRobotBackend
 from .resolver import resolve_checkpoint
@@ -46,12 +44,12 @@ class VLAPolicy(Generic, EasyResource):
     def __init__(self, name: str):
         super().__init__(name)
         self._cfg: PolicyConfig | None = None
-        self._backend: PolicyBackend | None = None
-        self._backend_factory: Callable[[], PolicyBackend] = LeRobotBackend
+        # `Any`, not `LeRobotBackend`: tests inject a duck-typed fake here.
+        self._backend: Any = None
+        self._backend_factory: Callable[[], Any] = LeRobotBackend
         self._state = "idle"
         self._error: str | None = None
         self._load_task: asyncio.Task | None = None
-        self._generation = 0
         self._closed = False
 
     @classmethod
@@ -79,44 +77,21 @@ class VLAPolicy(Generic, EasyResource):
         self._backend = backend
         if self._load_task and not self._load_task.done():
             self._load_task.cancel()
-        # In production, viam-server's Python SDK reconfigures a resource by
-        # removing it and constructing a brand-new instance (remove-then-add
-        # -- see module.py's reconfigure_resource), so reconfigure() is never
-        # actually called twice on the same live object; the race this
-        # counter guards against cannot happen there. It is kept as cheap
-        # defense-in-depth -- and because this class's own tests (and any
-        # other embedder) can call reconfigure() directly, without that SDK
-        # guarantee: cancelling `_load_task` only abandons this coroutine's
-        # await, and if the awaited to_thread call happens to complete at the
-        # exact moment a second reconfigure()/cancel() races it, cancellation
-        # alone can lose that race. The generation check inside `_load` is
-        # what stops a stale load from writing state after a newer one won
-        # in that case.
-        self._generation += 1
-        self._load_task = asyncio.create_task(self._load(self._generation, backend))
+        self._load_task = asyncio.create_task(self._load(backend))
 
-    async def _load(self, generation: int, backend: PolicyBackend) -> None:
+    async def _load(self, backend: Any) -> None:
         """Resolve, load, and warm up `backend` -- captured at dispatch time.
 
         `backend` is passed explicitly rather than read from `self._backend`
         so that if a later reconfigure() swaps `self._backend` out from
         under this still-running background task, this load keeps operating
-        on the instance it was actually given. That race lives in a worker
-        thread (inside asyncio.to_thread), not on the event loop, so neither
-        cancellation nor the generation counter above would catch it -- only
-        not reading `self._backend` here does.
+        on the instance it was actually given. The task itself is cancelled
+        by that reconfigure, so a stale load never writes state.
         """
         cfg = self._cfg
         assert cfg is not None
-
-        def _superseded() -> bool:
-            return generation != self._generation
-
         try:
             await asyncio.wait_for(self._resolve_and_load(cfg, backend), timeout=cfg.load_timeout_s)
-            if _superseded():
-                LOGGER.info("discarding superseded load (generation %d)", generation)
-                return
             self._state = "ready"
             LOGGER.info("policy ready: %s", backend.specs)
         except asyncio.TimeoutError:
@@ -126,18 +101,12 @@ class VLAPolicy(Generic, EasyResource):
             # "downloading 40GB" from "wedged". This does NOT stop the
             # underlying thread (see close()'s docstring for why it can't);
             # it only stops us from waiting on it forever.
-            if _superseded():
-                LOGGER.info("ignoring timeout from superseded load (generation %d)", generation)
-                return
             self._state = "failed"
             self._error = f"load timed out after {cfg.load_timeout_s}s (load_timeout_s)"
             LOGGER.error("policy load timed out after %ss", cfg.load_timeout_s)
         except VLAError as exc:
             # Expected failures: bad config, unresolvable checkpoint, malformed
             # payload. The message is meant for an operator reading `status`.
-            if _superseded():
-                LOGGER.info("ignoring failure from superseded load: %s", exc)
-                return
             self._state = "failed"
             self._error = str(exc)
             LOGGER.error("policy load failed: %s", exc)
@@ -146,16 +115,11 @@ class VLAPolicy(Generic, EasyResource):
             # this module. It must still land in `status`: this runs in a
             # background task, so letting it propagate would leave state stuck
             # on "loading" forever with the traceback swallowed by asyncio.
-            # Distinguish it in the message and log the full traceback, so a
-            # bug here is never mistaken for a user configuration error.
-            if _superseded():
-                LOGGER.info("ignoring failure from superseded load: %s", exc)
-                return
             self._state = "failed"
             self._error = f"internal error ({type(exc).__name__}): {exc}"
             LOGGER.exception("policy load failed with an unexpected error")
 
-    async def _resolve_and_load(self, cfg: PolicyConfig, backend: PolicyBackend) -> None:
+    async def _resolve_and_load(self, cfg: PolicyConfig, backend: Any) -> None:
         """The part of `_load` bounded by `cfg.load_timeout_s`."""
         checkpoint = await asyncio.to_thread(resolve_checkpoint, cfg)
         rtc = cfg.rtc if cfg.rtc.enabled else None
@@ -170,7 +134,7 @@ class VLAPolicy(Generic, EasyResource):
         for _ in range(cfg.warmup_inferences):
             await asyncio.to_thread(self._warmup_once, backend)
 
-    def _warmup_once(self, backend: PolicyBackend) -> None:
+    def _warmup_once(self, backend: Any) -> None:
         """Run one throwaway inference so the first real call is not an outlier.
 
         Takes `backend` explicitly for the same reason `_load` does -- see

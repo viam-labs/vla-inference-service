@@ -1,4 +1,4 @@
-"""LeRobot-backed implementation of PolicyBackend.
+"""LeRobot-backed policy backend.
 
 `lerobot` is imported lazily inside methods so the module loads, validates
 config, and reports status even when torch is unavailable.
@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .backend import PolicyBackend, PolicySpecs, resolve_image_feature_keys
+from .backend import PolicySpecs, resolve_image_feature_keys
 from .prefix import normalize_prefix_length
 
 LOGGER = logging.getLogger(__name__)
@@ -62,7 +62,13 @@ def _select_device(requested: str) -> str:
     return "cpu"
 
 
-class LeRobotBackend(PolicyBackend):
+class LeRobotBackend:
+    """Loads a checkpoint and turns observations into action chunks.
+
+    Safe to call concurrently from multiple requests: `predict_chunk` carries
+    no state between calls.
+    """
+
     def __init__(self) -> None:
         self._policy = None
         self._preprocessor = None
@@ -213,7 +219,6 @@ class LeRobotBackend(PolicyBackend):
         # not merely subtracted, so a typo'd key name fails loudly instead of
         # silently doing nothing.
         image_keys = resolve_image_feature_keys(declared_image_keys, unused_image_features)
-        self._warn_about_likely_unused_features(declared_image_keys, unused_image_features, preprocessor)
         # dtype is deliberately read off a live parameter rather than echoing
         # the requested string: load() never casts weights (see the warning
         # above), so the requested dtype and the checkpoint's actual dtype
@@ -236,77 +241,18 @@ class LeRobotBackend(PolicyBackend):
             dtype=dtype,
         )
 
-    @staticmethod
-    def _warn_about_likely_unused_features(
-        declared_image_keys: list[str], unused_image_features: frozenset[str], preprocessor
-    ) -> None:
-        """Advisory-only nudge toward a declared image key an operator forgot to list.
-
-        Deliberately never raises and never changes `image_keys` -- it only
-        logs. "No stats and no rename target" stays too weak a signal to
-        *act* on automatically: VISUAL features are IDENTITY-normalized
-        (lerobot/processor/normalize_processor.py's norm_map), so a
-        perfectly legitimate, actually-fed camera can have no normalizer
-        stats at all. The heuristic is good enough to point a human at a
-        candidate worth double-checking, not good enough to silently drop a
-        camera over.
-
-        Checkpoints with no rename map at all are skipped outright rather
-        than warned about -- see the comment on that early return below.
-
-        Wrapped in try/except: an unexpected processor shape (a future
-        lerobot release, a custom pipeline) must never fail the load just
-        because this advisory check couldn't make sense of it.
-        """
-        try:
-            from lerobot.processor import NormalizerProcessorStep, RenameObservationsProcessorStep
-
-            stats_keys: set[str] = set()
-            rename_targets: set[str] = set()
-            for step in preprocessor.steps:
-                if isinstance(step, NormalizerProcessorStep):
-                    stats_keys |= set(step.stats or {})
-                if isinstance(step, RenameObservationsProcessorStep):
-                    rename_targets |= set(step.rename_map.values())
-
-            # An empty rename map carries no information: the "not a rename
-            # target" clause below is then vacuously true for every declared
-            # key, so the check degenerates into "warn about every camera
-            # without normalizer stats" and fires on all three of
-            # lerobot/smolvla_base's own cameras (its stats cover unrelated
-            # keys and it was never renamed). An empty map is also precisely
-            # the signature of a checkpoint that was *not* fine-tuned with
-            # camera renaming -- which is exactly where the inheritance case
-            # this warning exists to catch cannot arise. Staying silent
-            # costs nothing and keeps the warning worth reading.
-            if not rename_targets:
-                return
-
-            suspicious = sorted(
-                key
-                for key in declared_image_keys
-                if key not in unused_image_features
-                and key not in stats_keys
-                and key not in rename_targets
-            )
-            if suspicious:
-                LOGGER.warning(
-                    "checkpoint declares image feature(s) %s with no normalizer stats and no "
-                    "rename_observations_processor target; this is the same shape as the "
-                    "smolvla_base 3-camera inheritance case (see PolicyConfig.unused_image_features) "
-                    "-- if this camera is not actually fed by this robot, add it to "
-                    "unused_image_features. This is only a heuristic (a legitimately-used VISUAL "
-                    "feature can have no stats), so it may be a false positive.",
-                    suspicious,
-                )
-        except Exception:  # noqa: BLE001
-            LOGGER.debug("unused_image_features advisory check could not run", exc_info=True)
-
     @property
     def specs(self) -> PolicySpecs | None:
         return self._specs
 
     def predict_chunk(self, images, state, task, rtc_kwargs):
+        """Return `(processed_actions, raw_actions)`, both `[n_action_steps, action_dim]`.
+
+        `processed_actions` are postprocessed and ready for the robot.
+        `raw_actions` are in the policy's own action space and are what an RTC
+        caller must feed back as `prev_chunk_left_over`. They are deliberately
+        distinct return values because confusing them is the likeliest RTC bug.
+        """
         import torch
 
         if self._policy is None:

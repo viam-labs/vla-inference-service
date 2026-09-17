@@ -27,7 +27,7 @@ from viam.proto.app.robot import ServiceConfig
 
 from tests.fakes import FakeArm, FakeCamera, FakeDoCommandGripper, StalledArm
 from vla.controller.service import VLAController
-from vla.policy.fake_backend import FakePolicyBackend
+from tests.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
 from vla.wire import decode_image, encode_matrix
 

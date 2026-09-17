@@ -44,10 +44,9 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, ClassVar, Mapping, Sequence
+from typing import Any, ClassVar, Mapping, Self, Sequence
 
 import numpy as np
-from typing_extensions import Self
 from viam.proto.app.robot import ServiceConfig
 from viam.proto.component.arm import JointPositions
 from viam.resource.base import ResourceBase
