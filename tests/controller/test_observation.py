@@ -26,7 +26,7 @@ from vla.controller.observation import (
 )
 from vla.controller.units import UnitSegment, VectorUnits
 from vla.wire import decode_image
-from tests.fakes import FakeArm, FakeCamera, FakeServo
+from tests.fakes import FakeArm, FakeCamera
 
 
 def _builder(**kw):
@@ -76,15 +76,6 @@ async def test_arm_joint_gripper_appended_from_arm():
         gripper=make_gripper_adapter({"type": "arm_joint", "joint_index": 5}, {})
     ).build()
     np.testing.assert_allclose(obs.state, [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
-
-
-async def test_servo_gripper_appended_normalized():
-    servo = FakeServo(angle=45)
-    gripper = make_gripper_adapter(
-        {"type": "servo", "name": "s", "min_deg": 0, "max_deg": 90}, {"s": servo}
-    )
-    obs = await _builder(gripper=gripper).build()
-    assert obs.state[-1] == pytest.approx(0.5)
 
 
 async def test_no_gripper_leaves_state_unmodified():
@@ -302,21 +293,6 @@ async def test_pad_handles_upscaling_a_source_smaller_than_the_target():
     assert arr.shape == (224, 224, 3)
     # Square source into a square target -- ratio is 1 in both dimensions,
     # so the whole frame is content with no padding at all.
-    assert np.all(arr == 255)
-
-
-async def test_stretch_reproduces_the_old_full_frame_distorting_behavior():
-    cam = _ColorCamera(size=(180, 320))
-    obs = await _builder(
-        cameras={"observation.images.top": cam},
-        image_sizes={"observation.images.top": (256, 256)},
-        image_fit="stretch",
-        image_encoding="raw",
-    ).build()
-    arr = decode_image(obs.images["observation.images.top"])
-    assert arr.shape == (256, 256, 3)
-    # A uniform source stretched (rather than padded) fills the ENTIRE
-    # target -- there is no black band anywhere, unlike the "pad" case.
     assert np.all(arr == 255)
 
 
@@ -600,16 +576,6 @@ def test_stretch_bicubic_fills_the_declared_shape_without_padding():
     assert stretched.shape == padded.shape == (224, 224, 3)
     assert (padded.max(axis=(1, 2)) == 0).sum() == 56
     assert (stretched.max(axis=(1, 2)) == 0).sum() == 0
-
-
-def test_stretch_bicubic_is_not_the_same_pixels_as_stretch():
-    """Bilinear and bicubic are different resamplers, and the difference is
-    the whole reason this mode exists rather than reusing "stretch"."""
-    frame = np.random.default_rng(0).integers(0, 256, (480, 640, 3), dtype=np.uint8)
-    assert not np.array_equal(
-        decode_image(_encode_only(frame, "stretch_bicubic")),
-        decode_image(_encode_only(frame, "stretch")),
-    )
 
 
 def test_a_frame_already_at_the_declared_shape_is_never_resampled():

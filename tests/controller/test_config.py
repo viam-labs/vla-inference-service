@@ -48,7 +48,7 @@ def test_parses_minimal_config():
     assert cfg.gripper == {"type": "none"}
     assert cfg.task == ""
     assert cfg.fps == 10.0
-    assert cfg.mode == "auto"
+    assert cfg.mode == "sequential"
     # None, not a fixed number -- the right value is derived from the
     # checkpoint's n_action_steps once specs are known (see config.py's
     # docstring); config parsing alone has no access to that.
@@ -92,13 +92,6 @@ def test_dependencies_include_policy_arm_and_cameras():
         "my-arm",
         "cam-top",
     }
-
-
-def test_servo_gripper_adds_dependency():
-    cfg = ControllerConfig.parse(
-        {**BASE, "gripper": {"type": "servo", "name": "grip", "min_deg": 0, "max_deg": 90}}
-    )
-    assert "grip" in cfg.dependencies()
 
 
 def test_do_command_gripper_adds_dependency():
@@ -182,7 +175,7 @@ def test_rejects_unknown_mode():
         ControllerConfig.parse({**BASE, "mode": "turbo"})
 
 
-@pytest.mark.parametrize("mode", ["auto", "sequential", "rtc", "async"])
+@pytest.mark.parametrize("mode", ["sequential", "async"])
 def test_accepts_every_known_mode(mode):
     # Hardcoded literal, not MODES itself -- a mutant that shrinks MODES
     # must not be able to shrink this test's coverage along with it.
@@ -236,7 +229,6 @@ def test_rejects_unknown_gripper_type():
 # stale branch the way an `if kind == ...` chain would.
 GRIPPER_EXTRA = {
     "arm_joint": {"joint_index": 5},
-    "servo": {"name": "grip"},
     "gripper": {"name": "grip"},
     "do_command": {"name": "grip", "open_value": 95.0, "closed_value": 0.0},
     "none": {},
@@ -297,7 +289,7 @@ def test_joint_limits_length_matches_without_degree_gripper():
     cfg = ControllerConfig.parse(
         {
             **BASE,
-            "gripper": {"type": "servo", "name": "grip"},
+            "gripper": {"type": "do_command", "name": "grip", "open_value": 95.0, "closed_value": 0.0},
             "safety": {"joint_limits_degs": [[-90, 90]] * 5},  # no trailing pair
         }
     )
@@ -479,8 +471,7 @@ def test_rejects_fractional_jpeg_quality():
 
 # ---------------------------------------------------------------------------
 # image_fit -- "pad" (aspect-preserving, smolvla's resize_with_pad
-# convention) is the default; "stretch" is kept only so an existing
-# deployment can reproduce its pre-fix output. See observation.py.
+# convention) is the default; "stretch_bicubic" is EVO1's. See observation.py.
 # ---------------------------------------------------------------------------
 
 
@@ -489,7 +480,7 @@ def test_image_fit_defaults_to_pad():
     assert cfg.image_fit == "pad"
 
 
-@pytest.mark.parametrize("fit", ["pad", "stretch"])
+@pytest.mark.parametrize("fit", ["pad", "stretch_bicubic"])
 def test_accepts_every_known_image_fit(fit):
     cfg = ControllerConfig.parse({**BASE, "image_fit": fit})
     assert cfg.image_fit == fit

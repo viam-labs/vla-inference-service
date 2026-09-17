@@ -1,7 +1,7 @@
 """Guard against a broken/missing lerobot silently vanishing from the
 differential suite's coverage.
 
-Every test in `test_action_queue_differential.py` goes through
+Every test in `test_observation_differential.py` goes through
 `pytest.importorskip("torch")` / `pytest.importorskip("lerobot...")` at
 module level. Verified empirically (rename `torch` out of site-packages,
 run `uv run pytest -m differential -v`): today that produces

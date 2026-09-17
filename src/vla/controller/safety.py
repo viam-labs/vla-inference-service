@@ -34,7 +34,7 @@ through different SDK calls with different guarantees:
      order.
 
 The degrees-based clamps (delta and limit) skip the trailing gripper channel
-for every variant except `arm_joint` (`servo`, `do_command`): a degree-shaped
+for every variant except `arm_joint` (`do_command`): a degree-shaped
 limit on a 0.0-1.0 channel would either never fire (useless) or fire
 constantly on ordinary gripper motion (worse than useless). It gets its own
 `[0, 1]` clamp instead, tracked separately as `clamp_counts["gripper"]`.
@@ -55,11 +55,14 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from vla.config_util import VLAError
+
+if TYPE_CHECKING:
+    from .config import SafetyConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -74,17 +77,10 @@ class SafetyError(VLAError, RuntimeError):
     """
 
 
-@dataclass(frozen=True)
-class SafetyLimits:
-    max_joint_delta_degs: float = 8.0
-    max_start_delta_degs: float = 15.0
-    joint_limits_degs: list[tuple[float, float]] | None = None
-    gripper_in_degrees: bool = True
-
-
 class SafetyLayer:
-    def __init__(self, limits: SafetyLimits) -> None:
+    def __init__(self, limits: SafetyConfig, *, gripper_in_degrees: bool = True) -> None:
         self.limits = limits
+        self._gripper_in_degrees = gripper_in_degrees
         self.clamp_counts: Counter[str] = Counter()
 
     def _validate(self, action: np.ndarray, current: np.ndarray) -> None:
@@ -99,7 +95,7 @@ class SafetyLayer:
             )
 
     def _gripper_index(self, n: int) -> int | None:
-        if self.limits.gripper_in_degrees or n == 0:
+        if self._gripper_in_degrees or n == 0:
             return None
         return n - 1  # trailing channel: normalized, degree limits do not apply
 
@@ -183,33 +179,6 @@ class SafetyLayer:
         return out
 
 
-@dataclass(frozen=True)
-class CartesianLimits:
-    """Per-tick ceilings on a delta-EE action, in working units (mm, radians).
-
-    The defaults come from the recorded per-tick statistics of the dataset
-    these checkpoints are trained on (`xarm-open-box-eedelta`, 34,670 frames
-    at 10 fps):
-
-    | quantity    | median  | p99     | max     | default here |
-    | ----------- | ------- | ------- | ------- | ------------ |
-    | translation | 9.31 mm | 28.4 mm | 96.8 mm | 40 mm        |
-    | rotation    | 0.0142  | 0.0807  | 0.3246  | 0.12 rad     |
-
-    Each default sits about 1.4x above the p99, so ordinary in-distribution
-    motion never clamps and the counter stays a genuine signal, and well
-    below the largest single tick in the recording, which at 10 fps would be
-    968 mm/s of tool travel. Clamping *below* the observed maximum is the
-    deliberate half of that choice: the recorded extremes are a handful of
-    frames out of 34,670, so reproducing them at full driver speed buys
-    nothing and a policy that emits one every tick is out of distribution,
-    not in a hurry.
-    """
-
-    max_tcp_delta_mm: float = 40.0
-    max_tcp_rot_delta_rads: float = 0.12
-
-
 class CartesianSafetyLayer:
     """Per-tick magnitude clamp on a delta-EE action. THE velocity limit.
 
@@ -248,7 +217,7 @@ class CartesianSafetyLayer:
     `rotation`) so `VLAController._status()` reports both layers identically.
     """
 
-    def __init__(self, limits: CartesianLimits) -> None:
+    def __init__(self, limits: SafetyConfig) -> None:
         self.limits = limits
         self.clamp_counts: Counter[str] = Counter()
 

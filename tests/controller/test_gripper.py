@@ -8,7 +8,7 @@ from vla.controller.gripper import (
     GripperRuntimeError,
     make_gripper_adapter,
 )
-from tests.fakes import FakeDoCommandGripper, FakeServo
+from tests.fakes import FakeDoCommandGripper
 
 # ---------------------------------------------------------------------------
 # none
@@ -65,93 +65,6 @@ def test_arm_joint_index_zero_is_valid():
     # wrongly reject the first joint.
     a = make_gripper_adapter({"type": "arm_joint", "joint_index": 0}, {})
     assert a.arm_joint_index == 0
-
-
-# ---------------------------------------------------------------------------
-# servo: unit convention (normalized 0..1 -> min_deg..max_deg)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "value, expected_angle",
-    [(0.0, 0), (0.5, 45), (1.0, 90)],
-)
-async def test_servo_write_maps_normalized_range(value, expected_angle):
-    servo = FakeServo()
-    a = make_gripper_adapter(
-        {"type": "servo", "name": "s", "min_deg": 0, "max_deg": 90}, {"s": servo}
-    )
-    await a.write(value)
-    assert servo.moves == [expected_angle]
-
-
-@pytest.mark.parametrize(
-    "angle, expected_value",
-    [(0, 0.0), (45, 0.5), (90, 1.0)],
-)
-async def test_servo_read_maps_to_normalized_range(angle, expected_value):
-    servo = FakeServo(angle=angle)
-    a = make_gripper_adapter(
-        {"type": "servo", "name": "s", "min_deg": 0, "max_deg": 90}, {"s": servo}
-    )
-    assert await a.read() == pytest.approx(expected_value)
-
-
-async def test_servo_adapter_writes_denormalized_int():
-    servo = FakeServo()
-    a = make_gripper_adapter(
-        {"type": "servo", "name": "s", "min_deg": 0, "max_deg": 90}, {"s": servo}
-    )
-    await a.write(0.25)
-    assert servo.moves == [22]  # int(round(0.25 * 90)) with 1-degree resolution
-
-
-async def test_servo_write_clamps_above_range():
-    servo = FakeServo()
-    a = make_gripper_adapter(
-        {"type": "servo", "name": "s", "min_deg": 0, "max_deg": 90}, {"s": servo}
-    )
-    await a.write(5.0)
-    assert servo.moves == [90]
-
-
-async def test_servo_write_clamps_below_range():
-    servo = FakeServo()
-    a = make_gripper_adapter(
-        {"type": "servo", "name": "s", "min_deg": 0, "max_deg": 90}, {"s": servo}
-    )
-    await a.write(-5.0)
-    assert servo.moves == [0]
-
-
-def test_servo_uses_degrees_is_false():
-    # Servo carries a normalized 0..1 value, not a degree value, even though
-    # it is denormalized onto min_deg..max_deg internally.
-    a = make_gripper_adapter(
-        {"type": "servo", "name": "s", "min_deg": 0, "max_deg": 90}, {}
-    )
-    assert a.uses_degrees is False
-
-
-def test_servo_requires_name():
-    with pytest.raises(GripperConfigError, match="name"):
-        make_gripper_adapter({"type": "servo", "min_deg": 0, "max_deg": 90}, {})
-
-
-def test_servo_rejects_inverted_range():
-    with pytest.raises(GripperConfigError, match="max_deg"):
-        make_gripper_adapter(
-            {"type": "servo", "name": "s", "min_deg": 90, "max_deg": 0}, {}
-        )
-
-
-def test_servo_min_max_defaults():
-    servo = FakeServo(angle=45)
-    a = make_gripper_adapter({"type": "servo", "name": "s"}, {"s": servo})
-    # Documented defaults: min_deg=0, max_deg=90.
-    import asyncio
-
-    assert asyncio.run(a.read()) == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
