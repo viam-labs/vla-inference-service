@@ -175,6 +175,7 @@ controller's `cameras`, `state_joint_indices`, and `gripper` have to line up wit
     "observation.images.camera2",
     "observation.images.camera3"
   ],
+  "preprocess_image_size": [512, 512],
   "supports_rtc": true,
   "rtc_enabled": false,
   "relative_actions": false,
@@ -182,6 +183,13 @@ controller's `cameras`, `state_joint_indices`, and `gripper` have to line up wit
   "dtype": "bfloat16"
 }
 ```
+
+`preprocess_image_size` is `(height, width)` — the size the policy's own preprocessing
+resizes every frame to before the encoder (smolvla's `resize_imgs_with_padding`, which the
+checkpoint stores as `(width, height)` and this field transposes). `null` when the policy
+does no resize of its own. The controller puts frames on the wire at this size rather than
+the declared `input_features` shape; see
+[wire resolution](#wire-resolution-what-the-policy-consumes-not-what-it-declares).
 
 #### `infer`
 
@@ -304,14 +312,16 @@ backoff for up to `policy_ready_timeout_s`.
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
 | `mode` | `auto` \| `sequential` \| `async` \| `rtc` | `"auto"` | `auto` resolves to `sequential`. Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). `rtc` is not implemented; configuring it fails at `start`. |
-| `queue_threshold` | integer | derived (`n_action_steps - 1`) | `mode: "async"` only: refill fires once the queue has this many actions left. Leave unset — the derived default is the highest useful value. See [Performance](#performance). |
+| `queue_threshold` | integer | derived (effective chunk length − 1) | `mode: "async"` only: refill fires once the queue has this many actions left. Derived from `actions_per_chunk` when set, else from the checkpoint's `n_action_steps`. Leave unset — see [Performance](#performance). |
+| `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
 | `state_units` | `degrees` \| `radians` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). |
 | `action_units` | `degrees` \| `radians` | `"degrees"` | Unit the policy's action is expressed in. |
 | `image_encoding` | `jpeg` \| `png` \| `raw` | `"jpeg"` | A debugging knob (JPEG artifacts vs. the training distribution), not a tuning one. |
 | `jpeg_quality` | integer, 0–100 | `90` | |
-| `image_fit` | `pad` \| `stretch` | `"pad"` | How a camera frame is resized onto the checkpoint's declared `(h, w)` whenever the frame's shape differs from it — see below. |
+| `image_fit` | `pad` \| `stretch` | `"pad"` | How a camera frame is resized onto the wire `(h, w)` — `specs.preprocess_image_size` when the policy reports one, else the checkpoint's declared shape — whenever the frame's shape differs from it. See below. |
+| `arm_move_extra` | object | `{"wait": false, "waitAtEnd": false, "interpolate": false}` | The `extra` struct sent with every `move_to_joint_positions`. Replaces the default wholesale; `{}` sends nothing. See [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle). |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
 | `safety.max_joint_delta_degs` | number | `8.0` | Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
@@ -330,6 +340,13 @@ the **left and top** — matching lerobot's own `resize_with_pad`
 not the centered variant lerobot also ships for openpi. Aspect ratio and padding side both
 end up where the checkpoint saw them in training.
 
+The resampler matches too. `resize_with_pad` uses torch's `F.interpolate(mode="bilinear",
+align_corners=False)` with **no antialiasing**; `"pad"` reproduces that formula in numpy
+rather than calling PIL, whose bilinear low-pass filters before sampling and differs from
+torch by a mean of ~14/255 on a 1080p → 512 downscale. Verified against lerobot's actual
+`resize_with_pad`: no pixel differs by more than 1/255 and >99.5% are bit-identical. A frame
+already at the target size is passed through untouched.
+
 `"stretch"` is the plain `Image.resize` this module used before, kept only so an existing
 deployment can reproduce its old output byte-for-byte. It squashes a 16:9 frame into a
 square, distorting every object's proportions in a way no checkpoint trained on. Measured
@@ -337,22 +354,27 @@ against training geometry: **~8.3°** divergence over a 50-step chunk versus **~
 for any aspect-preserving fit, about 2.5x worse. (Synthetic texture, so read those as an
 ordering rather than a precise bound.)
 
-#### The declared resolution may not describe your cameras
+#### Wire resolution: what the policy consumes, not what it declares
 
-The controller takes its wire resolution from `specs.input_features[key]`, which is only
-as trustworthy as the checkpoint's own declaration. A fine-tune of `lerobot/smolvla_base`
-inherits the base's `[3, 256, 256]` — the same inheritance behind
-[`unused_image_features`](#unused_image_features) — so a checkpoint recorded from 1080p
-cameras can still claim 256x256. Frames then get downsampled harder than training
-downsampled them, on top of whatever `image_fit` does about aspect ratio.
+`specs.input_features[key]` is only as trustworthy as the checkpoint's own declaration. A
+fine-tune of `lerobot/smolvla_base` inherits the base's `[3, 256, 256]` — the same
+inheritance behind [`unused_image_features`](#unused_image_features) — so a checkpoint
+recorded from 1080p cameras can still claim 256x256, while its own preprocessing resizes
+every frame to `resize_imgs_with_padding: (512, 512)` before the vision encoder. Training
+fed native dataset frames into that resize once. Sending 256x256 would resample twice and
+throw away three quarters of the pixels the weights were fitted on.
 
-`"pad"` is the fix for the geometry half of that, and it is the half that matters more.
-The remaining resolution loss has no config knob: there is deliberately no override for
-the declared shape, because the declaration is the right place to fix this.
+So the controller prefers `specs.preprocess_image_size` — the `(h, w)` the policy's own
+preprocessing resizes to, reported by `#policy` from the checkpoint config — and falls back
+to the declared shape only when the policy reports none. The substitution is logged once
+per image key at start (`feeding 'observation.images.camera1' at 512x512 ... rather than
+the 256x256 it declares`). `tools/replay_eval.py` grades through the same size, so its
+numbers describe what the robot actually sends.
 
-**Train with `--policy.input_features=null` and no `--rename_map`** and the problem does
-not arise: lerobot derives the features from the dataset, so `config.json` records your
-cameras' real names and native resolutions. Verified on `viamrobotics/box-opener`, that
+There is deliberately no config override for either shape. **Train with
+`--policy.input_features=null` and no `--rename_map`** and the declaration is right in
+the first place: lerobot derives the features from the dataset, so `config.json` records
+your cameras' real names and native resolutions. Verified on `viamrobotics/box-opener`, that
 yields `observation.images.realsense_cam [3, 720, 1280]` and
 `observation.images.camera_transform [3, 1920, 1080]` — two cameras at full resolution
 instead of three at 256x256. The controller then sends full-resolution frames with no
@@ -430,6 +452,10 @@ What to read it for:
   keeping up; see [Performance](#performance).
 - `starved_ticks` — ticks the loop held position with an empty queue. Only possible under
   `mode: "async"`, and a persistently rising value means `queue_threshold` is too low.
+- `queue_size` — under `mode: "async"` it hovers between `queue_threshold` and
+  `queue_threshold + chunk length`, and every action in it is that many ticks stale. 40–90
+  with a 50-step chunk at 10 fps means the arm is executing observations 4–9 s old; see
+  [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk).
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
 
@@ -519,21 +545,34 @@ channel. `arm_joint` carries degrees, per `action_units`.
 
 ### Arm writes do not wait for settle
 
-Every tick's arm command is sent with `extra={"wait": false}`. A VLA replaces
-its setpoint on the next tick, so a driver that blocks until the arm
-physically settles would spend the whole tick budget — 100 ms at `fps: 10` —
-waiting for a target about to be superseded. `devrel:so101:arm` defaults to
-waiting, and honours this flag to skip it.
+Every tick's arm command is sent with `extra=arm_move_extra`, which defaults to
 
-`extra` is a free-form struct, so a driver that does not read `wait` ignores
-it and behaves exactly as before. There is no config switch: if you need the
-blocking behaviour back, that is a code change.
+```json
+{ "wait": false, "waitAtEnd": false, "interpolate": false }
+```
 
-Note this is the *arm* channel only, and it is passed unconditionally. The
-gripper's equivalent is opt-in: set `write_args: {"wait": false}` on a
-`do_command` block, as the so-101 example above does. Both flags reach
-`devrel:so101-arm` through the same helper on its side, so a version that
-honors one honors the other.
+A VLA replaces its setpoint on the next tick, so a driver that blocks until the
+arm physically settles would spend the whole tick budget — 100 ms at `fps: 10` —
+waiting for a target about to be superseded. Drivers spell "don't wait"
+differently and silently ignore keys they do not know, so every spelling ships
+together:
+
+| key | driver | why |
+|---|---|---|
+| `wait` | `devrel:so101:arm` | Defaults to waiting; honours this flag to skip it. |
+| `waitAtEnd` | `viam:ufactory:xarm` | Its parsed set is `speed_r`, `speed_d`, `acceleration_r`, `acceleration_d`, `direct`, `waitAtEnd`, `interpolate` — `wait` was dropped and the default `true` polled `GetState` until the arm stopped. Measured at `fps: 10`: every tick overran, 0.26–1.49 s against a 0.100 s budget, so a 10 Hz trajectory replayed at ~2 Hz. |
+| `interpolate` | `viam:ufactory:xarm` | `waitAtEnd: false` alone still runs the client-side interpolation loop, one `1/move_hz` sleep per intermediate step, so the cost still scales with the delta. `false` sends the goal as a single servo setpoint. Safe because the [safety layer](#safety) already clamps every per-tick delta to `max_vel_degs_per_sec / fps`. |
+
+`arm_move_extra` **replaces** the default rather than merging into it, so a
+driver that needs a key removed (xArm's `direct: true` for point-to-point
+instead of servo mode, say) can have it. `{}` sends nothing and restores
+whatever blocking behaviour the driver defaults to. Values must be real
+booleans — xArm compares `extra["waitAtEnd"] == false`, so `0` or `"false"`
+would silently keep the arm blocking.
+
+Note this is the *arm* channel only. The gripper's equivalent is opt-in: set
+`write_args: {"wait": false}` on a `do_command` block, as the so-101 example
+above does.
 
 ### Full worked example
 
@@ -712,13 +751,63 @@ throughput delivering 150 actions at latency ≈ chunk duration × 1.06 (`n_acti
 
 The runway a threshold buys is `queue_threshold` ticks; the runway inference *needs* is
 `ceil(observed_latency × fps)` ticks. Because the queue can only ever hold at most
-`n_action_steps - 1` actions before a refill must have already been requested, the
-highest `queue_threshold` can ever usefully be is `n_action_steps - 1` — which is exactly
-why that is the derived default (see the config table above) rather than a fixed number:
-a fixed default is right for at most one checkpoint's chunk length and measurably wrong
-for every other one. Override it explicitly only if you have a specific reason to trade
-some of that throughput back for fresher observations at each chunk boundary (a lower
-threshold fires the refill later, off a more recent — but riskier — observation).
+`chunk length - 1` actions before a refill must have already been requested, the highest
+`queue_threshold` can ever usefully be is `chunk length - 1` — which is why the derived
+default is `effective chunk length - 1` (the config table above) rather than a fixed
+number: a fixed default is right for at most one checkpoint's chunk length and measurably
+wrong for every other one. "Effective" means `actions_per_chunk` when that is set, else
+`n_action_steps`.
+
+**The threshold is a staleness ceiling as much as a starvation floor.** `ActionQueue`
+merges in append mode, so with threshold `T` the action executing at any instant was
+inferred between `T` and `T + chunk length` ticks ago. Deriving `T = 49` from an
+untruncated 50-step chunk maximizes runway and, in doing so, maximizes staleness: measured
+by driving `AsyncScheduler` at 1.05 s latency and 10 fps, the executing action was 4.75–10.5 s
+old, against 1.07–6.9 s for `sequential`. Async was also inferring no more often than
+sequential — one refill per chunk consumed either way — so that default bought only the
+removal of a ~1 s stall and paid 2.2× the staleness for it. Lowering `queue_threshold`
+alone (to 14, say) recovers most of the staleness without a rebuild; `actions_per_chunk`
+is the proper fix.
+
+### `actions_per_chunk` — execute the head of each chunk
+
+A checkpoint that emits `chunk_size: 50` at `fps: 10` is five seconds of open loop, and
+nothing in this module shortened it: `predict_chunk` calls lerobot's `predict_action_chunk`,
+and only `select_action` — which this module never calls — slices by `n_action_steps`.
+Replay against the deployed policy shows why that matters (230 samples, mean L2 per
+horizon offset):
+
+| offset | mean L2 |
+|---|---|
+| k=0 | 3.49 |
+| k=1 | 5.31 |
+| k=9 | 12.97 |
+| k=24 | 15.07 |
+| k=49 | 17.52 |
+
+73% of the degradation happens in the first 9 of 50 steps. `actions_per_chunk: 12`
+truncates every chunk to its first 12 actions *before* it is merged (so `queue_size` never
+counts rows that will not execute), cuts the executed mean from 14.21 to 9.73, and derives
+`queue_threshold = 11` automatically. Measured on the same scheduler drive:
+
+| config | staleness | queue depth | inference cadence |
+|---|---|---|---|
+| `sequential` | 1.07–6.91 s | 0–50 | every 5.0 s + stall |
+| derived `T = 49` | 4.75–10.54 s | 40–90 | every 5.0 s |
+| `queue_threshold: 14` | 1.43–6.59 s | 5–55 | every 5.0 s |
+| `actions_per_chunk: 12` | 1.12–3.05 s | 2–16 | every 1.4 s |
+
+Rules for setting it:
+
+- **Requires `mode: "async"`.** Under `sequential`, truncating to 12 re-infers every 12
+  ticks with a ~10-tick blocking stall — a 47% duty cycle of frozen arm.
+- **Floor is `ceil(avg_latency_s × fps)`.** Below it the queue cannot refill in time; the
+  scheduler's starvation-risk `WARNING` fires, since the derived threshold is one less than
+  `actions_per_chunk`. At 1.05 s and 10 fps that floor is 11, so 12 is the shortest safe
+  setting.
+- Unset means "execute the whole chunk": no deployment's chunk is shortened silently.
+- A value above the checkpoint's `n_action_steps` is not an error; the threshold derivation
+  clamps to `n_action_steps` so it can never be stranded above what the queue can hold.
 
 **Two diagnostics exist so a bad threshold is never silent:**
 
