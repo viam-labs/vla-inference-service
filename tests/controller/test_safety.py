@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 
 from vla.config_util import VLAError
-from vla.controller.safety import SafetyError, SafetyLayer, SafetyLimits
+from vla.controller.safety import (
+    CartesianLimits,
+    CartesianSafetyLayer,
+    SafetyError,
+    SafetyLayer,
+    SafetyLimits,
+)
 
 
 def _layer(**kw):
@@ -438,3 +444,156 @@ def test_no_clamp_does_not_log_warning(caplog):
 def test_safety_error_is_a_vla_error():
     assert issubclass(SafetyError, VLAError)
     assert issubclass(SafetyError, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# CartesianSafetyLayer -- action_space="delta-ee".
+#
+# The delta is already relative, so there is no `current` to clamp against and
+# no start check: the first tick's magnitude is the same quantity every later
+# tick's clamp measures. What there *is* instead is the direction-preserving
+# property, which has no analogue in joint space and is the thing most likely
+# to be "simplified" into a per-component np.clip later.
+# ---------------------------------------------------------------------------
+
+
+def _cartesian(**kw):
+    defaults = dict(max_tcp_delta_mm=40.0, max_tcp_rot_delta_rads=0.12)
+    defaults.update(kw)
+    return CartesianSafetyLayer(CartesianLimits(**defaults))
+
+
+# A translation at the recorded median (9.31 mm) and rotation at the recorded
+# median (0.0142 rad): in-distribution motion must pass through untouched.
+IN_DISTRIBUTION = np.array([9.31, 0.0, 0.0, 0.0142, 0.0, 0.0])
+
+
+def test_in_distribution_delta_passes_through_unchanged():
+    layer = _cartesian()
+    np.testing.assert_allclose(layer.apply(IN_DISTRIBUTION), IN_DISTRIBUTION)
+    assert layer.clamp_counts == {}
+
+
+def test_a_delta_at_the_recorded_p99_still_does_not_clamp():
+    """The defaults exist to leave the counter meaningful.
+
+    28.40 mm and 0.0807 rad are the p99 of the training data. If either
+    clamped, `clamp_counts` would tick over on ordinary motion and stop being
+    a signal that anything is wrong.
+    """
+    layer = _cartesian()
+    layer.apply(np.array([28.40, 0.0, 0.0, 0.0807, 0.0, 0.0]))
+    assert layer.clamp_counts == {}
+
+
+def test_over_large_translation_is_scaled_to_the_ceiling():
+    layer = _cartesian()
+    out = layer.apply(np.array([300.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert float(np.linalg.norm(out[:3])) == pytest.approx(40.0)
+    assert layer.clamp_counts["translation"] == 1
+
+
+def test_over_large_rotation_is_scaled_to_the_ceiling():
+    layer = _cartesian()
+    out = layer.apply(np.array([0.0, 0.0, 0.0, 1.5, 0.0, 0.0]))
+    assert float(np.linalg.norm(out[3:])) == pytest.approx(0.12)
+    assert layer.clamp_counts["rotation"] == 1
+
+
+def test_the_recorded_maximum_tick_does_clamp():
+    """96.83 mm / 0.3246 rad is the largest single tick in 34,670 frames.
+
+    Deliberately above the defaults: reproducing a handful of outlier frames
+    at 968 mm/s buys nothing, and a policy emitting one every tick is out of
+    distribution rather than in a hurry. Pinned so that choice is visible if
+    anyone raises the defaults past it.
+    """
+    layer = _cartesian()
+    layer.apply(np.array([96.83, 0.0, 0.0, 0.3246, 0.0, 0.0]))
+    assert layer.clamp_counts == {"translation": 1, "rotation": 1}
+
+
+def test_translation_clamp_preserves_direction():
+    """Scaling, not per-component clipping.
+
+    `np.clip(delta, -40, 40)` would turn (100, 10, 0) into (40, 10, 0) -- a
+    different heading than the policy asked for, and one that varies with how
+    far over the ceiling the step was. The tool's path is physical here, so
+    the only defensible clamp is "same way, less far".
+    """
+    layer = _cartesian()
+    delta = np.array([100.0, 10.0, 0.0, 0.0, 0.0, 0.0])
+    out = layer.apply(delta)
+
+    original = delta[:3] / np.linalg.norm(delta[:3])
+    clamped = out[:3] / np.linalg.norm(out[:3])
+    np.testing.assert_allclose(clamped, original, atol=1e-12)
+    assert float(np.linalg.norm(out[:3])) == pytest.approx(40.0)
+    # And explicitly NOT what a component-wise clip would have produced.
+    assert not np.allclose(out[:3], np.clip(delta[:3], -40.0, 40.0))
+
+
+def test_rotation_clamp_preserves_the_axis():
+    layer = _cartesian()
+    delta = np.array([0.0, 0.0, 0.0, 1.0, 0.5, -0.25])
+    out = layer.apply(delta)
+
+    original = delta[3:] / np.linalg.norm(delta[3:])
+    clamped = out[3:] / np.linalg.norm(out[3:])
+    np.testing.assert_allclose(clamped, original, atol=1e-12)
+    assert float(np.linalg.norm(out[3:])) == pytest.approx(0.12)
+
+
+def test_translation_and_rotation_clamp_independently():
+    """A huge translation must not shrink a perfectly reasonable rotation."""
+    layer = _cartesian()
+    out = layer.apply(np.array([500.0, 0.0, 0.0, 0.0142, 0.0, 0.0]))
+    assert float(np.linalg.norm(out[:3])) == pytest.approx(40.0)
+    np.testing.assert_allclose(out[3:], [0.0142, 0.0, 0.0])
+    assert layer.clamp_counts == {"translation": 1}
+
+
+def test_a_delta_exactly_at_the_ceiling_is_not_counted_as_clamped():
+    """Matches SafetyLayer's boundary convention: only an altered value counts."""
+    layer = _cartesian()
+    out = layer.apply(np.array([40.0, 0.0, 0.0, 0.12, 0.0, 0.0]))
+    np.testing.assert_allclose(out, [40.0, 0.0, 0.0, 0.12, 0.0, 0.0])
+    assert layer.clamp_counts == {}
+
+
+def test_a_zero_delta_is_a_no_op_and_never_divides_by_zero():
+    layer = _cartesian()
+    np.testing.assert_array_equal(layer.apply(np.zeros(6)), np.zeros(6))
+    assert layer.clamp_counts == {}
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_rejects_non_finite_deltas(bad):
+    with pytest.raises(SafetyError, match="finite"):
+        _cartesian().apply(np.array([1.0, 0.0, 0.0, bad, 0.0, 0.0]))
+
+
+@pytest.mark.parametrize("width", [3, 5, 7, 9])
+def test_rejects_a_wrong_width_action(width):
+    with pytest.raises(SafetyError, match="6 dimensions"):
+        _cartesian().apply(np.zeros(width))
+
+
+def test_clamping_logs_a_warning_naming_the_measured_magnitude(caplog):
+    layer = _cartesian()
+    with caplog.at_level(logging.WARNING):
+        layer.apply(np.array([300.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    assert any("300" in rec.getMessage() for rec in caplog.records)
+
+
+def test_no_cartesian_clamp_does_not_log_a_warning(caplog):
+    with caplog.at_level(logging.WARNING):
+        _cartesian().apply(IN_DISTRIBUTION)
+    assert not any("clamp" in rec.message.lower() for rec in caplog.records)
+
+
+def test_apply_does_not_mutate_its_argument():
+    layer = _cartesian()
+    delta = np.array([300.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    layer.apply(delta)
+    np.testing.assert_array_equal(delta, [300.0, 0.0, 0.0, 0.0, 0.0, 0.0])
