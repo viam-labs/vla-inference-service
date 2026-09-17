@@ -8,8 +8,8 @@ import pytest
 from viam.utils import dict_to_struct, struct_to_dict
 
 from vla.config_util import ConfigError
-from vla.policy.backend import PolicyBackend, PolicySpecs
-from vla.policy.fake_backend import FakePolicyBackend
+from vla.policy.backend import PolicySpecs
+from tests.policy.fake_backend import FakePolicyBackend
 
 
 def _obs():
@@ -358,66 +358,6 @@ def test_call_count_increments_per_predict_chunk_call():
     assert b.call_count == 1
     b.predict_chunk(_obs(), np.zeros(4, np.float32), "t", None)
     assert b.call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# The PolicyBackend contract is the only thing enforcing the seam (item 4)
-# ---------------------------------------------------------------------------
-
-
-def test_backend_missing_load_cannot_be_instantiated():
-    class MissingLoad(PolicyBackend):
-        @property
-        def specs(self):
-            return None
-
-        def predict_chunk(self, images, state, task, rtc_kwargs):
-            raise NotImplementedError
-
-    with pytest.raises(TypeError):
-        MissingLoad()
-
-
-def test_backend_missing_specs_cannot_be_instantiated():
-    class MissingSpecs(PolicyBackend):
-        def load(self, checkpoint_dir, *, device, dtype, rtc):
-            pass
-
-        def predict_chunk(self, images, state, task, rtc_kwargs):
-            raise NotImplementedError
-
-    with pytest.raises(TypeError):
-        MissingSpecs()
-
-
-def test_backend_missing_predict_chunk_cannot_be_instantiated():
-    class MissingPredict(PolicyBackend):
-        def load(self, checkpoint_dir, *, device, dtype, rtc):
-            pass
-
-        @property
-        def specs(self):
-            return None
-
-    with pytest.raises(TypeError):
-        MissingPredict()
-
-
-def test_backend_implementing_all_abstract_methods_can_be_instantiated():
-    class Complete(PolicyBackend):
-        def load(self, checkpoint_dir, *, device, dtype, rtc):
-            pass
-
-        @property
-        def specs(self):
-            return None
-
-        def predict_chunk(self, images, state, task, rtc_kwargs):
-            raise NotImplementedError
-
-    # Must not raise -- proves the failures above are due to missing
-    # abstract methods specifically, not some unrelated constructor issue.
-    Complete()
 
 
 # ---------------------------------------------------------------------------

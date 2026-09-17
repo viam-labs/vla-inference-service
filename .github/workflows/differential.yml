@@ -22,4 +22,5 @@ jobs:
       # matrix legs test the exact same pinned SHA and the 'main' leg's
       # entire purpose (catch an upstream merge-semantics change before
       # it reaches the robot) silently does nothing.
+      - run: uv run --no-sync pytest -m 'not integration and not differential' -q
       - run: uv run --no-sync pytest -m differential -v

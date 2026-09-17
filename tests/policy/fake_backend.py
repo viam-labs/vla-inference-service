@@ -1,4 +1,7 @@
-"""Deterministic in-memory backend, so everything above it tests without torch."""
+"""Deterministic in-memory backend, so everything above it tests without torch.
+
+Duck-types `LeRobotBackend` (`load`, `specs`, `predict_chunk`, `reset`).
+"""
 
 from __future__ import annotations
 
@@ -7,12 +10,12 @@ from typing import Any
 
 import numpy as np
 
-from .backend import PolicyBackend, PolicySpecs, resolve_image_feature_keys
+from vla.policy.backend import PolicySpecs, resolve_image_feature_keys
 
 _DEFAULT_CAMERA_KEYS: tuple[str, ...] = ("observation.images.top",)
 
 
-class FakePolicyBackend(PolicyBackend):
+class FakePolicyBackend:
     """Deterministic stand-in for a real LeRobot backend.
 
     `last_rtc` and `call_count` are test affordances for asserting what a
@@ -126,3 +129,6 @@ class FakePolicyBackend(PolicyBackend):
         raw = np.tile(base, (1, dim)) * 0.01
         processed = raw + 1.0
         return processed, raw
+
+    def reset(self) -> None:
+        pass

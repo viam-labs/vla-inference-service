@@ -49,6 +49,8 @@ The two settings most likely to bite you are `state_units`/`action_units` (see
   install (no `lerobot` extra — config parsing, the controller's pure-numpy code, the
   wire codec) has no torch dependency at all and measured **81 MB** on the same machine.
 
+<a id="policy"></a>
+
 ## `#policy` — `viam-labs:vla:policy`
 
 Has no dependencies; `validate_config` always returns `([], [])`.
@@ -288,6 +290,8 @@ path):
   "warmup_inferences": 3
 }
 ```
+
+<a id="controller"></a>
 
 ## `#controller` — `viam-labs:vla:controller`
 

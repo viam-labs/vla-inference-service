@@ -12,13 +12,6 @@ from __future__ import annotations
 import math
 from typing import Any, Sequence
 
-# POSIX environment variable names are ASCII identifiers, capped here at 64
-# chars. This is a shape check, not a secret detector: a real token (e.g.
-# Hugging Face's `hf_` + ~34 alphanumerics) is itself a valid identifier and
-# passes cleanly. Redaction at every display site is the actual defense.
-_MAX_ENV_VAR_NAME_LEN = 64
-
-
 class VLAError(Exception):
     """Common base for every error this module's own code raises.
 
@@ -119,21 +112,3 @@ def redact_secret(value: str) -> str:
     reconstructable from a log line.
     """
     return f"{value[:4]}...<{len(value)} chars>"
-
-
-def as_env_var_name(value: Any, field_name: str) -> str:
-    """Require a value shaped like a POSIX environment variable name.
-
-    Fields such as `hf_token_env` name an env var precisely so the secret
-    never appears in config or logs. This catches an obviously malformed
-    paste (hyphens, dots, spaces, excessive length); it is not a secret
-    detector, so a rejected value is still redacted rather than echoed.
-    """
-    text = as_str(value, field_name)
-    if not text.isidentifier() or not text.isascii() or len(text) > _MAX_ENV_VAR_NAME_LEN:
-        raise ConfigError(
-            f"{field_name} must look like an environment variable name "
-            f"(ASCII letters, digits, underscore; not starting with a digit; "
-            f"{_MAX_ENV_VAR_NAME_LEN} chars max), got {redact_secret(text)}"
-        )
-    return text

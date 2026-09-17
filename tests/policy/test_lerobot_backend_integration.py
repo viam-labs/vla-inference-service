@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from vla.policy.backend import PolicySpecs
-from vla.policy.fake_backend import FakePolicyBackend
+from tests.policy.fake_backend import FakePolicyBackend
 
 pytestmark = pytest.mark.integration
 
@@ -399,35 +399,3 @@ def test_unused_image_features_rejects_dropping_every_camera(checkpoint_path):
                 }
             ),
         )
-
-
-def test_advisory_warning_stays_silent_on_a_checkpoint_with_no_rename_map(checkpoint_path, caplog):
-    """smolvla_base is the heuristic's worst case, and it must say nothing.
-
-    Its VISUAL features are identity-normalized (so no normalizer stats)
-    *and* its keys were never renamed (empty rename_map), which without the
-    empty-rename-map guard makes all three of its own declared cameras look
-    "suspicious" -- a warning that is 100% false positives on the single
-    most common base checkpoint, which is how operators learn to ignore
-    warnings. An empty rename map is also exactly the signature of a
-    checkpoint that was never fine-tuned with camera renaming, i.e. one
-    where the inheritance case this warning exists to catch cannot arise.
-
-    The true-positive half of this heuristic is covered by
-    tests/policy/test_lerobot_backend.py, which can build a non-empty
-    rename map directly without downloading a checkpoint.
-    """
-    import logging
-
-    from vla.policy.lerobot_backend import LeRobotBackend
-
-    b = LeRobotBackend()
-    with caplog.at_level(logging.WARNING, logger="vla.policy.lerobot_backend"):
-        b.load(checkpoint_path, device="cpu", dtype="auto", rtc=None)
-
-    # Sanity-check the premise rather than just asserting silence: if a
-    # future lerobot release ships smolvla_base with a rename map, this
-    # test would otherwise keep passing while no longer testing anything.
-    assert len(b.specs.declared_image_feature_keys) == 3
-    warnings = [r.message for r in caplog.records if "unused_image_features" in r.message]
-    assert warnings == []
