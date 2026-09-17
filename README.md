@@ -385,6 +385,11 @@ The rejection is symmetric: the `safety.max_tcp_*` keys are refused under `"join
 **Unreachable poses do not kill the run.** `move_to_position` goes through the driver's
 inverse kinematics, which can decline a kinematically unreachable target or a
 singularity while the hardware is fine — and declines before commanding any motion.
+What "the driver's IK" means is the driver's choice: `viam:ufactory:xarm` implements
+`MoveToPosition` by calling its configured **motion service** (`motion.Move`), so on that
+arm the call fails outright unless the arm's `motion` attribute names one, every tick is a
+full motion plan, and `arm_move_extra` is ignored. Expect the tick budget to be dominated
+by planning there, and check `measured_fps` against `fps` before trusting the replay.
 Because the action is relative, the next tick simply recomposes from the measured pose,
 so a refusal is logged and the tick skipped. Consecutive refusals are bounded by
 `starvation_grace_ticks`, so a genuinely stuck arm still halts.
@@ -852,9 +857,10 @@ tick's magnitude is the same quantity every later tick's clamp measures.
 **Joint limits are the arm driver's job on this path.** `safety.joint_limits_degs` has no
 Cartesian analogue and is rejected under this action space rather than accepted and
 ignored; out-of-range and unreachable targets are refused by the driver's own inverse
-kinematics when `move_to_position` is called. Note that `move_to_position` is the arm
-*component* method, not the motion service, so there is no obstacle avoidance on this
-path either.
+kinematics when `move_to_position` is called. Whether that call plans around obstacles
+depends on the driver: `viam:ufactory:xarm` delegates it to the arm's configured motion
+service (see [`action_space`](#action_space)); a driver that implements it directly does
+no obstacle avoidance at all.
 
 ## Performance
 
@@ -1004,8 +1010,8 @@ Rules for setting it:
 - **Joint limits are not enforced by this service under `action_space: "delta-ee"`.**
   `safety.joint_limits_degs` has no Cartesian analogue on the `move_to_position` path;
   the arm driver's own inverse kinematics refuses out-of-range and unreachable targets.
-  `move_to_position` is the arm component method rather than the motion service, so
-  there is no obstacle avoidance on that path either.
+  Obstacle avoidance on that path depends entirely on how the driver implements
+  `move_to_position` (see [`action_space`](#action_space)).
 - **Relative-action checkpoints are refused under RTC**, not silently mishandled — RTC's
   prefix would need re-anchoring against the cached raw state that this module does not
   yet implement, and applying guidance in the wrong coordinate frame would produce

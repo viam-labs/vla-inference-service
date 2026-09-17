@@ -881,8 +881,12 @@ class VLAController(Generic, EasyResource):
             theta=vector["theta"],
         )
 
+        # Same `arm_move_extra` as the joints path. Whether a driver honours it
+        # here is the driver's business (viam:ufactory:xarm routes this call
+        # through its configured motion service and ignores `extra`), but the
+        # operator's setting must reach every arm command or it is a lie.
         try:
-            await arm.move_to_position(commanded)
+            await arm.move_to_position(commanded, extra=dict(self._cfg.arm_move_extra))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

@@ -53,6 +53,7 @@ class FakeArm:
         self.fail_next_move = False
         self.pose = pose if pose is not None else default_pose()
         self.pose_moves = []
+        self.pose_move_extras = []
         self.fail_next_pose_move = False
 
     async def get_end_position(self, **kwargs):
@@ -63,6 +64,7 @@ class FakeArm:
             self.fail_next_pose_move = False
             raise RuntimeError("arm could not plan to the requested pose")
         self.pose_moves.append(pose)
+        self.pose_move_extras.append(extra)
         self.pose = pose
 
     async def get_joint_positions(self, **kwargs):

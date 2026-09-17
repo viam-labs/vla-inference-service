@@ -2208,6 +2208,27 @@ async def _wait_for_first_pose_move(arm, timeout=2.0):
     await _wait_until(lambda: arm.pose_moves, "the arm's first pose move", timeout=timeout)
 
 
+async def test_delta_ee_passes_arm_move_extra_to_move_to_position():
+    """The pose path must carry the same non-blocking flags as the joints path.
+
+    Without this, an operator's `arm_move_extra` is parsed and silently never
+    sent under `delta-ee`, and a driver that blocks until settle burns the tick
+    budget exactly as #8 measured on the joints path.
+    """
+    arm = FakeArm(pose=default_pose())
+    svc = _svc(
+        _delta_ee_config(arm_move_extra={"direct": True, "waitAtEnd": False}),
+        _deps(policy=_delta_ee_policy(action_value=0.0), arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_pose_move(arm)
+    await svc.do_command({"command": "stop"})
+
+    assert arm.pose_move_extras, "the arm was never commanded"
+    for e in arm.pose_move_extras:
+        assert e == {"direct": True, "waitAtEnd": False}, e
+
+
 async def test_delta_ee_commands_move_to_position_not_joint_positions():
     arm = FakeArm()
     svc = _svc(
