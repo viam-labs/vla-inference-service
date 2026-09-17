@@ -1885,6 +1885,56 @@ async def test_async_mode_explicit_zero_threshold_is_honored_not_derived():
     assert svc._scheduler._queue_threshold == 0
 
 
+async def test_derived_threshold_follows_actions_per_chunk_not_n_action_steps():
+    """The derived threshold is a staleness ceiling: append-mode merging
+    means the executing action was inferred between `threshold` and
+    `threshold + chunk_len` ticks ago. Deriving from the untruncated
+    n_action_steps would leave the queue holding chunks it will never
+    execute, defeating the truncation entirely."""
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=50)  # would derive 49 without truncation
+    svc = _svc(
+        config=_config(mode="async", fps=50.0, actions_per_chunk=4),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await svc.do_command({"command": "stop"})
+    assert svc._scheduler._queue_threshold == 3
+
+
+async def test_actions_per_chunk_above_n_action_steps_cannot_strand_the_threshold():
+    """An operator budgeting more actions than the policy emits must not get
+    a threshold the queue can never reach -- the refill would then fire on
+    every single tick."""
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=7)
+    svc = _svc(
+        config=_config(mode="async", fps=50.0, actions_per_chunk=99),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await svc.do_command({"command": "stop"})
+    assert svc._scheduler._queue_threshold == 6
+
+
+async def test_sequential_mode_also_honors_actions_per_chunk():
+    # The knob is about how far ahead actions are committed, which is not an
+    # async-only concern -- sequential must not silently ignore it.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=20)
+    svc = _svc(
+        config=_config(mode="sequential", actions_per_chunk=5),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["queue_size"] < 5
+
+
 # ---------------------------------------------------------------------------
 # status.starved_ticks: cumulative, distinct from the escalation counter.
 # ---------------------------------------------------------------------------

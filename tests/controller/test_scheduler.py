@@ -731,3 +731,81 @@ async def test_warning_reflects_a_real_completed_background_inference(caplog):
         await s.next_action()  # fast path: queue (n=1) now empty, fires call #2 in background
         await asyncio.sleep(0.2)  # let call #2 actually complete for real
     assert len(caplog.records) == 1
+
+
+# ---------------------------------------------------------------------------
+# actions_per_chunk: execute only the head of each chunk.
+# ---------------------------------------------------------------------------
+
+
+async def test_sequential_truncates_the_chunk_to_actions_per_chunk():
+    infer = RecordingInfer(n=10)
+    s = SequentialScheduler(infer, actions_per_chunk=3)
+    await s.next_action()
+    # 3 queued, 1 consumed. The 7 discarded rows must be gone, not merely
+    # unread: a queue that still holds them would refill late and execute
+    # actions inferred from a much older observation.
+    assert s.qsize() == 2
+
+
+async def test_truncation_makes_the_policy_be_called_more_often():
+    """The entire point: shorter chunks mean re-observing sooner. Draining
+    the same number of actions must cost proportionally more inferences."""
+    infer = RecordingInfer(n=12)
+    s = SequentialScheduler(infer, actions_per_chunk=4)
+    for _ in range(12):
+        await s.next_action()
+    assert infer.calls == 3  # not 1, which is what the untruncated chunk gives
+
+
+async def test_async_truncates_the_chunk_to_actions_per_chunk():
+    infer = RecordingInfer(n=10)
+    s = AsyncScheduler(infer, queue_threshold=0, actions_per_chunk=3)
+    await s.next_action()
+    assert s.qsize() == 2
+    await s.close()
+
+
+async def test_no_actions_per_chunk_executes_the_whole_chunk():
+    # The default must not silently shorten an existing deployment's chunk.
+    infer = RecordingInfer(n=10)
+    s = SequentialScheduler(infer)
+    await s.next_action()
+    assert s.qsize() == 9
+
+
+async def test_actions_per_chunk_larger_than_the_chunk_is_not_an_error():
+    """A policy may return fewer rows than the operator budgeted for (a
+    checkpoint swap, say). Slicing past the end is a no-op, and treating it
+    as malformed would refuse a chunk that is perfectly executable."""
+    infer = RecordingInfer(n=4)
+    s = SequentialScheduler(infer, actions_per_chunk=50)
+    await s.next_action()
+    assert s.qsize() == 3
+
+
+async def test_truncation_keeps_the_head_of_the_chunk_not_the_tail():
+    """k=0 is the accurate end of the chunk; the tail is what truncation
+    exists to throw away. Reversing the slice would still pass a qsize
+    assertion while executing exactly the wrong actions."""
+
+    class RampInfer:
+        async def __call__(self, rtc):
+            base = np.arange(10, dtype=np.float32).reshape(10, 1)
+            return base + 100.0, base
+
+    s = SequentialScheduler(RampInfer(), actions_per_chunk=3)
+    first = await s.next_action()
+    second = await s.next_action()
+    np.testing.assert_allclose(first, [100.0])
+    np.testing.assert_allclose(second, [101.0])
+
+
+async def test_truncation_applies_to_the_raw_chunk_too():
+    """`raw` feeds `get_left_over` (the RTC prefix). Truncating only the
+    processed array would leave the two queues at different lengths."""
+    infer = RecordingInfer(n=10)
+    s = SequentialScheduler(infer, actions_per_chunk=3)
+    await s.next_action()
+    # Both arrays hold 3 rows; `get()` advances last_index without trimming.
+    assert s._queue.original_queue.shape[0] == s._queue.queue.shape[0] == 3
