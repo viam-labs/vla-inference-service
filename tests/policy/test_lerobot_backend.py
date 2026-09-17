@@ -92,6 +92,49 @@ def test_build_specs_with_no_unused_image_features_keeps_everything():
     assert specs.declared_image_feature_keys == ["observation.images.top"]
 
 
+def _specs(cfg):
+    return LeRobotBackend()._build_specs(
+        cfg, _FakePolicy(), True, _fake_preprocessor(), "cpu", frozenset()
+    )
+
+
+def test_build_specs_reports_the_size_the_policy_actually_resizes_to():
+    cfg = _fake_cfg(image_keys=["observation.images.top"])
+    cfg.resize_imgs_with_padding = [512, 512]
+    specs = _specs(cfg)
+    # The declared shape stays 224 -- these answer different questions, and
+    # collapsing them would lose the checkpoint's own claim.
+    assert specs.preprocess_image_size == [512, 512]
+    assert specs.input_features["observation.images.top"] == [3, 224, 224]
+
+
+def test_preprocess_image_size_is_height_width_not_the_configs_width_height():
+    # lerobot calls resize_with_pad(img, value[1], value[0]) into a
+    # (img, height, width) signature, so the config pair is (width, height).
+    # Passing it through verbatim transposes every non-square checkpoint --
+    # invisible on the 512x512 one in reach today, which is exactly why this
+    # is pinned with a non-square value.
+    cfg = _fake_cfg(image_keys=["observation.images.top"])
+    cfg.resize_imgs_with_padding = [640, 480]
+    assert _specs(cfg).preprocess_image_size == [480, 640]
+
+
+def test_preprocess_image_size_is_none_for_a_policy_that_does_no_resize():
+    # No attribute at all: this module is generic over any LeRobot-registered
+    # policy, and the caller must fall back to the declared shape rather than
+    # get a fabricated one.
+    cfg = _fake_cfg(image_keys=["observation.images.top"])
+    assert not hasattr(cfg, "resize_imgs_with_padding")
+    assert _specs(cfg).preprocess_image_size is None
+
+
+def test_preprocess_image_size_is_none_for_a_malformed_or_empty_value():
+    for bad in (None, [], [512], [512, 512, 512], [0, 512]):
+        cfg = _fake_cfg(image_keys=["observation.images.top"])
+        cfg.resize_imgs_with_padding = bad
+        assert _specs(cfg).preprocess_image_size is None, bad
+
+
 def test_build_specs_rejects_a_key_the_checkpoint_never_declared():
     backend = LeRobotBackend()
     cfg = _fake_cfg(image_keys=["observation.images.top"])

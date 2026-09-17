@@ -220,6 +220,62 @@ async def test_pad_of_a_portrait_source_pads_on_the_left_not_the_right():
     assert np.all(arr[:, pad_w:] == 255), "the source's content must reach the right edge, unpadded"
 
 
+def test_resize_matches_lerobots_resampler_not_pils():
+    """The fine-tune fed native dataset frames straight into lerobot's
+    `resize_with_pad`, which resamples with torch bilinear and NO
+    antialiasing. `PIL.Image.BILINEAR` scales its filter support with the
+    downscale factor, so it low-pass filters first -- a different image, and
+    on a 1920x1080 -> 512x512 downscale a mean of ~13.8/255 different.
+    Substituting a resampler here is a systematic input perturbation the
+    weights were never fit to.
+
+    Reimplemented rather than imported: the controller must not depend on
+    torch (only the policy service does), so the equivalence has to be
+    pinned by an independent implementation of the same formula.
+    """
+    yy, xx = np.mgrid[0:270, 0:480]
+    # High-frequency content is the whole point -- a smooth gradient is
+    # resampled almost identically by every filter and would pass here even
+    # with PIL restored.
+    src = np.repeat(
+        (127 + 100 * np.sin(xx / 2.0) * np.cos(yy / 2.7)).astype(np.uint8)[:, :, None], 3, axis=2
+    )
+    out_h, out_w = 128, 227
+    got = ObservationBuilder._bilinear_no_antialias(src, out_h, out_w)
+
+    # align_corners=False: output centers map to (i + 0.5) * scale - 0.5.
+    sy = np.clip((np.arange(out_h) + 0.5) * (src.shape[0] / out_h) - 0.5, 0.0, None)
+    sx = np.clip((np.arange(out_w) + 0.5) * (src.shape[1] / out_w) - 0.5, 0.0, None)
+    y0, x0 = np.floor(sy).astype(int), np.floor(sx).astype(int)
+    y1 = np.minimum(y0 + 1, src.shape[0] - 1)
+    x1 = np.minimum(x0 + 1, src.shape[1] - 1)
+    fy, fx = (sy - y0)[:, None, None], (sx - x0)[None, :, None]
+    a = src.astype(np.float64)
+    want = (
+        a[y0][:, x0] * (1 - fx) * (1 - fy)
+        + a[y0][:, x1] * fx * (1 - fy)
+        + a[y1][:, x0] * (1 - fx) * fy
+        + a[y1][:, x1] * fx * fy
+    )
+    assert np.abs(got.astype(float) - want).max() <= 0.5, "must agree to uint8 rounding"
+
+    from PIL import Image
+
+    pil = np.asarray(Image.fromarray(src).resize((out_w, out_h), Image.BILINEAR), dtype=np.uint8)
+    # And must NOT be PIL's answer, or this test would pass with the old code.
+    assert np.abs(pil.astype(float) - want).mean() > 2.0, "PIL must be measurably different"
+
+
+def test_resize_upscaling_is_unaffected_by_the_antialias_question():
+    # Antialiasing only engages on downscale. An upscale must still be plain
+    # bilinear, and a flat source must survive it exactly -- this guards the
+    # coordinate math independently of the filter question.
+    src = np.full((8, 8, 3), 200, dtype=np.uint8)
+    out = ObservationBuilder._bilinear_no_antialias(src, 32, 32)
+    assert out.shape == (32, 32, 3)
+    assert np.all(out == 200)
+
+
 async def test_pad_leaves_a_frame_already_at_target_size_untouched():
     cam = _ColorCamera(size=(224, 224))
     obs = await _builder(

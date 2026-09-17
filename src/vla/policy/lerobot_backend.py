@@ -165,6 +165,32 @@ class LeRobotBackend(PolicyBackend):
             for s in preprocessor.steps
         )
 
+    @staticmethod
+    def _preprocess_image_size(cfg) -> list[int] | None:
+        """(height, width) this policy resizes frames to before the encoder.
+
+        smolvla's `prepare_images` resizes whatever it is handed to
+        `config.resize_imgs_with_padding` -- training fed the dataset's
+        native frames straight into it, so that pair, not the declared
+        `input_features` shape, is the resolution the weights were fitted
+        on. See `PolicySpecs.preprocess_image_size`.
+
+        None for a policy with no such attribute: the caller then has only
+        the declared shape to go on, which is the previous behaviour.
+        """
+        raw = getattr(cfg, "resize_imgs_with_padding", None)
+        if raw is None or len(raw) != 2:
+            return None
+        # lerobot calls `resize_with_pad(img, raw[1], raw[0])` against a
+        # `(img, height, width)` signature, so the configured pair is
+        # (width, height). Returning it verbatim would transpose every
+        # non-square checkpoint -- silently, since the only one in reach
+        # today is 512x512.
+        width, height = int(raw[0]), int(raw[1])
+        if width <= 0 or height <= 0:
+            return None
+        return [height, width]
+
     def _build_specs(
         self, cfg, policy, supports_rtc, preprocessor, device, unused_image_features
     ) -> PolicySpecs:
@@ -202,6 +228,7 @@ class LeRobotBackend(PolicyBackend):
             output_features=output_features,
             image_feature_keys=image_keys,
             declared_image_feature_keys=declared_image_keys,
+            preprocess_image_size=self._preprocess_image_size(cfg),
             supports_rtc=supports_rtc,
             rtc_enabled=self._rtc_enabled,
             relative_actions=self._detect_relative_actions(preprocessor),

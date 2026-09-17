@@ -234,7 +234,49 @@ class ObservationBuilder:
             raise ObservationError(f"could not encode image for {key!r}: {exc}") from exc
 
     @staticmethod
-    def _resize_with_pad(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    def _bilinear_no_antialias(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+        """Bilinear resample matching torch's `F.interpolate(mode="bilinear",
+        align_corners=False)` -- crucially with NO antialiasing.
+
+        This exists because `PIL.Image.BILINEAR` is not the same operation.
+        PIL scales its filter support with the downscale factor, so it
+        low-pass filters before sampling; torch's bilinear does not, and
+        `antialias` defaults to False. On the 1920x1080 -> 512x512 downscale
+        this deployment actually performs, the two differ by a mean of
+        13.8/255 -- far from a rounding detail.
+
+        The policy's own preprocessing (lerobot `resize_with_pad`, which
+        `prepare_images` calls) uses the torch path, and the fine-tune fed
+        native dataset frames straight into it. Reproducing that exactly is
+        the whole point: any resampler we substitute here is a systematic
+        input perturbation the weights were never fit to, and shows up as
+        systematic error rather than noise.
+
+        `align_corners=False` maps output pixel centers to input coordinates
+        as `(i + 0.5) * scale - 0.5`, clamped at 0 so the first output row
+        does not sample a negative coordinate.
+        """
+        in_h, in_w = arr.shape[:2]
+
+        def coords(n_out: int, n_in: int) -> np.ndarray:
+            return np.clip((np.arange(n_out) + 0.5) * (n_in / n_out) - 0.5, 0.0, None)
+
+        y, x = coords(out_h, in_h), coords(out_w, in_w)
+        y0 = np.floor(y).astype(np.intp)
+        x0 = np.floor(x).astype(np.intp)
+        y1 = np.minimum(y0 + 1, in_h - 1)
+        x1 = np.minimum(x0 + 1, in_w - 1)
+        wy = (y - y0)[:, None, None]
+        wx = (x - x0)[None, :, None]
+
+        src = arr.astype(np.float32)
+        top = src[y0][:, x0] * (1.0 - wx) + src[y0][:, x1] * wx
+        bot = src[y1][:, x0] * (1.0 - wx) + src[y1][:, x1] * wx
+        out = top * (1.0 - wy) + bot * wy
+        return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+    @classmethod
+    def _resize_with_pad(cls, arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
         """Resize preserving aspect ratio, padding black on the LEFT and TOP.
 
         Mirrors lerobot's `resize_with_pad`
@@ -247,14 +289,18 @@ class ObservationBuilder:
         would be as wrong as stretching, since the policy never saw that
         geometry during training either. Handles upscaling (source smaller
         than target) the same way: `ratio` just comes out < 1.
+
+        lerobot short-circuits when the source is already the target size;
+        so does this, which keeps an already-correct frame bit-exact instead
+        of pushing it through a resample that would only add rounding.
         """
         cur_h, cur_w = arr.shape[:2]
+        if (cur_h, cur_w) == (target_h, target_w):
+            return arr
         ratio = max(cur_w / target_w, cur_h / target_h)
         resized_h = max(1, int(cur_h / ratio))
         resized_w = max(1, int(cur_w / ratio))
-        resized = np.asarray(
-            Image.fromarray(arr).resize((resized_w, resized_h), Image.BILINEAR), dtype=np.uint8
-        )
+        resized = cls._bilinear_no_antialias(arr, resized_h, resized_w)
 
         pad_h = max(0, target_h - resized_h)
         pad_w = max(0, target_w - resized_w)
