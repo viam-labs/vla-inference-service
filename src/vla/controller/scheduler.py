@@ -1,11 +1,7 @@
 """Chunk scheduling: turn action chunks into one action per control tick.
 
 Two strategies ship: `SequentialScheduler` (blocking refill) and
-`AsyncScheduler` (overlapped refill). `RTCScheduler` is still a follow-up
-plan -- deferred until CUDA latency is measured, since RTC needs `delay <
-chunk_length` to function at all (on the measured Apple Silicon target
-`delay > chunk_length`, so RTC would discard every chunk on every merge).
-The `ActionQueue` underneath already supports both modes.
+`AsyncScheduler` (overlapped refill). Both append onto one `ActionQueue`.
 
 `ChunkScheduler.next_action` is typed to allow returning `None`.
 `SequentialScheduler` never actually does -- it raises `SchedulerError`
@@ -42,11 +38,11 @@ import numpy as np
 
 from vla.config_util import VLAError
 
-from .action_queue import ActionQueue, ActionQueueError, QueueSettings
+from .action_queue import ActionQueue, ActionQueueError
 
 LOGGER = logging.getLogger(__name__)
 
-InferFn = Callable[[dict[str, Any] | None], Awaitable[tuple[np.ndarray, np.ndarray]]]
+InferFn = Callable[[], Awaitable[np.ndarray]]
 
 # AsyncScheduler's starvation-risk warning: how many recent completed
 # inferences to average over, and the minimum before the average counts as
@@ -65,18 +61,12 @@ class SchedulerError(VLAError, RuntimeError):
 
 
 def _validate_and_merge(
-    queue: ActionQueue,
-    processed: np.ndarray,
-    raw: np.ndarray,
-    actions_per_chunk: int | None = None,
+    queue: ActionQueue, processed: Any, actions_per_chunk: int | None = None
 ) -> None:
     """Validate a freshly-inferred chunk and merge it into `queue`.
 
     Shared by both schedulers so the two cannot drift apart on what counts
-    as a malformed policy response. `real_delay=0` is baked in rather than a
-    parameter: both callers run `ActionQueue` in append mode, where the
-    delay is ignored, and a computed-delay parameter would imply RTC
-    semantics that apply to neither.
+    as a malformed policy response.
 
     `actions_per_chunk` truncates before the merge, not after: the discarded
     tail must never reach the queue, or a later `qsize()` would count
@@ -85,25 +75,17 @@ def _validate_and_merge(
     shorter than N -- a policy is free to return fewer rows than the
     operator budgeted for, and slicing past the end is already a no-op.
     """
-    try:
-        if processed.shape[0] == 0:
-            raise SchedulerError("policy returned an empty action chunk")
-    except AttributeError as exc:
-        # `.shape` on a non-ndarray (e.g. a policy service returning plain
-        # lists after a decode bug) must not leak as a bare AttributeError
-        # -- callers only know to catch SchedulerError.
+    if not isinstance(processed, np.ndarray) or processed.ndim != 2:
         raise SchedulerError(
-            "policy returned a malformed action chunk: expected numpy arrays from "
-            f"infer(), got processed={type(processed).__name__!r} "
-            f"raw={type(raw).__name__!r}"
-        ) from exc
-
+            "policy returned a malformed action chunk: expected a 2D numpy array from "
+            f"infer(), got {type(processed).__name__!r}"
+        )
+    if processed.shape[0] == 0:
+        raise SchedulerError("policy returned an empty action chunk")
     if actions_per_chunk is not None:
         processed = processed[:actions_per_chunk]
-        raw = raw[:actions_per_chunk]
-
     try:
-        queue.merge(raw, processed, real_delay=0)
+        queue.merge(processed)
     except ActionQueueError as exc:
         # ActionQueue raises its own type; a caller of the scheduler should
         # never have to also know about it.
@@ -141,7 +123,7 @@ class SequentialScheduler(ChunkScheduler):
 
     def __init__(self, infer: InferFn, actions_per_chunk: int | None = None) -> None:
         self._infer = infer
-        self._queue = ActionQueue(QueueSettings(rtc_enabled=False))
+        self._queue = ActionQueue()
         self._actions_per_chunk = actions_per_chunk
 
     async def next_action(self) -> np.ndarray:
@@ -154,8 +136,8 @@ class SequentialScheduler(ChunkScheduler):
         # SchedulerError: an arbitrary exception from `infer` propagates
         # as-is, unlike AsyncScheduler, which must wrap it because it
         # surfaces on a later, unrelated call.
-        processed, raw = await self._infer(None)
-        _validate_and_merge(self._queue, processed, raw, self._actions_per_chunk)
+        processed = await self._infer()
+        _validate_and_merge(self._queue, processed, self._actions_per_chunk)
 
         action = self._queue.get()
         if action is None:  # pragma: no cover - guarded by the shape check above
@@ -220,7 +202,7 @@ class AsyncScheduler(ChunkScheduler):
         actions_per_chunk: int | None = None,
     ) -> None:
         self._infer = infer
-        self._queue = ActionQueue(QueueSettings(rtc_enabled=False))
+        self._queue = ActionQueue()
         self._queue_threshold = queue_threshold
         self._actions_per_chunk = actions_per_chunk
         self._fps = fps
@@ -285,8 +267,8 @@ class AsyncScheduler(ChunkScheduler):
     async def _infer_and_merge(self) -> None:
         started = time.perf_counter()
         try:
-            processed, raw = await self._infer(None)
-            _validate_and_merge(self._queue, processed, raw, self._actions_per_chunk)
+            processed = await self._infer()
+            _validate_and_merge(self._queue, processed, self._actions_per_chunk)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

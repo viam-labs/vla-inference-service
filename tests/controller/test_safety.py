@@ -4,13 +4,8 @@ import numpy as np
 import pytest
 
 from vla.config_util import VLAError
-from vla.controller.safety import (
-    CartesianLimits,
-    CartesianSafetyLayer,
-    SafetyError,
-    SafetyLayer,
-    SafetyLimits,
-)
+from vla.controller.config import SafetyConfig
+from vla.controller.safety import CartesianSafetyLayer, SafetyError, SafetyLayer
 
 
 def _layer(**kw):
@@ -21,7 +16,8 @@ def _layer(**kw):
         gripper_in_degrees=True,
     )
     defaults.update(kw)
-    return SafetyLayer(SafetyLimits(**defaults))
+    gripper_in_degrees = defaults.pop("gripper_in_degrees")
+    return SafetyLayer(SafetyConfig(**defaults), gripper_in_degrees=gripper_in_degrees)
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +91,11 @@ def test_within_limits_passes_through():
 
 
 def test_default_limits_values():
-    limits = SafetyLimits()
+    limits = SafetyConfig()
     assert limits.max_joint_delta_degs == 8.0
     assert limits.max_start_delta_degs == 15.0
     assert limits.joint_limits_degs is None
-    assert limits.gripper_in_degrees is True
+    assert SafetyLayer(limits)._gripper_in_degrees is True
 
 
 def test_clamp_counts_start_at_zero():
@@ -460,7 +456,7 @@ def test_safety_error_is_a_vla_error():
 def _cartesian(**kw):
     defaults = dict(max_tcp_delta_mm=40.0, max_tcp_rot_delta_rads=0.12)
     defaults.update(kw)
-    return CartesianSafetyLayer(CartesianLimits(**defaults))
+    return CartesianSafetyLayer(SafetyConfig(**defaults))
 
 
 # A translation at the recorded median (9.31 mm) and rotation at the recorded

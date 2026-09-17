@@ -60,6 +60,30 @@ DEFAULT_DURATION_WARN_S = 0.1
 STALE_FRAME_WARN_S = 0.5
 
 
+def pose_state_from_proto(pose: Any) -> np.ndarray:
+    """The 9-dim delta-EE state of a live `viam.proto.common.Pose`, in working units.
+
+    `pose_state` is the vendored converter code, called with the payload shape
+    it was written against (`{"pose": {...}}`, the export JSON) so the copy
+    stays usable without an adapter of its own -- the protobuf `Pose` carries
+    exactly those seven fields, `theta` in degrees. Raises `AttributeError` for
+    something that is not a Pose and `ValueError` for a degenerate orientation.
+    """
+    return pose_state(
+        {
+            "pose": {
+                "x": pose.x,
+                "y": pose.y,
+                "z": pose.z,
+                "o_x": pose.o_x,
+                "o_y": pose.o_y,
+                "o_z": pose.o_z,
+                "theta": pose.theta,
+            }
+        }
+    )
+
+
 class ObservationError(VLAError, RuntimeError):
     """Raised when an observation cannot be assembled.
 
@@ -230,19 +254,8 @@ class ObservationBuilder:
             )
         target_h, target_w = int(size[0]), int(size[1])
         if arr.shape[:2] != (target_h, target_w):
-            if self._fit == "stretch":
-                # The original behavior, kept as the explicit non-default
-                # choice: a plain resize onto the declared shape, distorting
-                # a 16:9 camera frame into whatever aspect the checkpoint
-                # declares (often square). Measured divergence from the
-                # geometry training actually saw: ~8.27 deg vs. ~3.2-4.1 deg
-                # for the aspect-preserving "pad" default -- see the README.
-                arr = np.asarray(
-                    Image.fromarray(arr).resize((target_w, target_h), Image.BILINEAR),
-                    dtype=np.uint8,
-                )
-            elif self._fit == "stretch_bicubic":
-                # Same geometry as "stretch", EVO1's resampler. EVO1 resizes
+            if self._fit == "stretch_bicubic":
+                # Squash the whole frame onto the target with EVO1's resampler. EVO1 resizes
                 # every frame to a square inside the policy with
                 # `tvf.resize(..., BICUBIC, antialias=True)`
                 # (lerobot/policies/evo1/internvl3_embedder.py's
@@ -250,8 +263,8 @@ class ObservationBuilder:
                 # mirror InternVL3's reference `Image.resize` -- so the exact
                 # PIL equivalent is a plain bicubic resize, which is what this
                 # is. Measured against that torchvision call on random frames:
-                # bicubic differs by a mean of 0.13-0.29/255, BILINEAR
-                # ("stretch") by 3.3-13.1/255, an order of magnitude worse.
+                # bicubic differs by a mean of 0.13-0.29/255, plain BILINEAR by
+                # 3.3-13.1/255, an order of magnitude worse.
                 # See tests/controller/test_observation_differential.py.
                 arr = np.asarray(
                     Image.fromarray(arr).resize((target_w, target_h), Image.BICUBIC),
@@ -383,32 +396,13 @@ class ObservationBuilder:
     def _build_pose_state(self, pose: Any) -> np.ndarray:
         """The 9-dim delta-EE state from one `EndPosition` reading.
 
-        `pose_state` is the vendored converter code, called with the payload
-        shape it was written against (`{"pose": {...}}`, the export JSON) so
-        the copy stays usable without an adapter of its own -- the protobuf
-        `Pose` carries exactly those seven fields, `theta` in degrees, and the
-        SDK's `get_end_position` returns the same message the recording
-        captured.
-
         Only the position is unit-converted. The six rotation components are
         direction cosines and dimensionless whatever the checkpoint's units;
         `state_units` validation pins that segment to "unitless" so the
         multiply here is by 1.0 and stays a no-op rather than a silent scale.
         """
         try:
-            state = pose_state(
-                {
-                    "pose": {
-                        "x": pose.x,
-                        "y": pose.y,
-                        "z": pose.z,
-                        "o_x": pose.o_x,
-                        "o_y": pose.o_y,
-                        "o_z": pose.o_z,
-                        "theta": pose.theta,
-                    }
-                }
-            )
+            state = pose_state_from_proto(pose)
         except AttributeError as exc:
             raise ObservationError(
                 f"arm end position is not a Pose (missing {exc}); "

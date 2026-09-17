@@ -1,7 +1,7 @@
 name: differential
 on: [push, pull_request]
 jobs:
-  action-queue-vs-upstream:
+  differential:
     runs-on: ubuntu-latest
     strategy:
       matrix:

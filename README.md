@@ -313,10 +313,10 @@ backoff for up to `policy_ready_timeout_s`.
 | `arm` | string | required | Name of the Viam `arm` component to drive. |
 | `cameras` | object (feature key → camera name) | required | Must cover every key the policy reports in `specs.image_feature_keys`. |
 | `state_joint_indices` | array of integers | required under `action_space: "joints"` | Maps Viam joint order (base → end-effector) onto the state-vector position the checkpoint expects. Indices, not names — Viam joint names are not guaranteed to match LeRobot feature names. Rejected under `delta-ee`, which builds its state from `EndPosition`. |
-| `gripper` | object | `{"type": "none"}` | Discriminated union — four variants, see below. |
+| `gripper` | object | `{"type": "none"}` | Discriminated union — three variants, see below. |
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
-| `mode` | `auto` \| `sequential` \| `async` \| `rtc` | `"auto"` | `auto` resolves to `sequential`. Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). `rtc` is not implemented; configuring it fails at `start`. |
+| `mode` | `sequential` \| `async` | `"sequential"` | Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). |
 | `queue_threshold` | integer | derived (effective chunk length − 1) | `mode: "async"` only: refill fires once the queue has this many actions left. Derived from `actions_per_chunk` when set, else from the checkpoint's `n_action_steps`. Leave unset — see [Performance](#performance). |
 | `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
@@ -325,7 +325,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `action_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit the policy's action is expressed in. Per-segment under `delta-ee`. |
 | `image_encoding` | `jpeg` \| `png` \| `raw` | `"jpeg"` | A debugging knob (JPEG artifacts vs. the training distribution), not a tuning one. |
 | `jpeg_quality` | integer, 0–100 | `90` | |
-| `image_fit` | `pad` \| `stretch` \| `stretch_bicubic` | `"pad"`, or `"stretch_bicubic"` under `delta-ee` | How a camera frame is resized onto the wire `(h, w)` — `specs.preprocess_image_size` when the policy reports one, else the checkpoint's declared shape — whenever the frame's shape differs from it. See below. |
+| `image_fit` | `pad` \| `stretch_bicubic` | `"pad"`, or `"stretch_bicubic"` under `delta-ee` | How a camera frame is resized onto the wire `(h, w)` — `specs.preprocess_image_size` when the policy reports one, else the checkpoint's declared shape — whenever the frame's shape differs from it. See below. |
 | `arm_move_extra` | object | `{"wait": false, "waitAtEnd": false, "interpolate": false}` | The `extra` struct sent with every `move_to_joint_positions`. Replaces the default wholesale; `{}` sends nothing. See [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle). |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
@@ -414,13 +414,6 @@ torch by a mean of ~14/255 on a 1080p → 512 downscale. Verified against lerobo
 `resize_with_pad`: no pixel differs by more than 1/255 and >99.5% are bit-identical. A frame
 already at the target size is passed through untouched.
 
-`"stretch"` is the plain `Image.resize` this module used before, kept only so an existing
-deployment can reproduce its old output byte-for-byte. It squashes a 16:9 frame into a
-square, distorting every object's proportions in a way no checkpoint trained on. Measured
-against training geometry: **~8.3°** divergence over a 50-step chunk versus **~3.2–4.1°**
-for any aspect-preserving fit, about 2.5x worse. (Synthetic texture, so read those as an
-ordering rather than a precise bound.)
-
 `"stretch_bicubic"` is the default under `action_space: "delta-ee"`, and it exists because
 **EVO1 does not pad.** `_batched_resize_01`
 (`lerobot/policies/evo1/internvl3_embedder.py`) resizes straight to
@@ -429,17 +422,14 @@ antialiasing, explicitly mirroring InternVL3's reference `Image.resize`. So EVO1
 training frames were the *unpadded* dataset frame squashed to a square; padding here
 would hand it black bars that then get squashed along with the picture.
 
-`"stretch"` is not a substitute, because it is BILINEAR. Measured against
-`_batched_resize_01` on random frames, mean absolute difference per pixel:
-
-| controller fit | difference from EVO1's own resize |
-|---|---|
-| `stretch_bicubic` | 0.13–0.29 / 255 |
-| `stretch` | 3.3–13.1 / 255 |
-
-An order of magnitude apart, which is why there is a third fit rather than a reuse. Both
-halves of that comparison are pinned in
+The resampler matters here too: against `_batched_resize_01` on random frames, PIL bicubic
+differs by 0.13–0.29/255 per pixel where plain bilinear differs by 3.3–13.1/255, an order
+of magnitude worse. That parity is pinned in
 `tests/controller/test_observation_differential.py`.
+
+Do not use `"stretch_bicubic"` for a smolvla checkpoint: it squashes a 16:9 frame into a
+square, distorting every object's proportions in a way that policy never trained on
+(measured at ~2.5x the divergence of an aspect-preserving fit).
 
 Note this only bites when the camera's resolution differs from the wire shape (see
 below). When they match, the controller does not resample at all and parity is exact.
@@ -562,13 +552,6 @@ Value follows `action_units` like every other joint.
 { "type": "arm_joint", "joint_index": 5 }
 ```
 
-**`servo`** — bidirectional via `get_position()`/`move(angle)`, both `int` degrees (1°
-resolution). Value is normalized `0.0`–`1.0` and mapped onto `[min_deg, max_deg]`.
-
-```json
-{ "type": "servo", "name": "grip-servo", "min_deg": 0, "max_deg": 90 }
-```
-
 **`do_command`** — proportional control for drivers that expose it through
 `DoCommand` rather than the typed API. Requires that the driver implement
 `{"get": true}` → `{<read_key>: number}` and `{"set": number}`.
@@ -620,7 +603,7 @@ endpoints do not describe this driver's scale at all.
 { "type": "none" }
 ```
 
-`servo` and `do_command` hand the controller a normalized `0.0`–`1.0` value
+`do_command` hands the controller a normalized `0.0`–`1.0` value
 (`0` = fully open), matching how LeRobot datasets typically encode a gripper
 channel. `arm_joint` carries degrees, per `action_units`.
 
@@ -807,8 +790,7 @@ Applied to every action, in this fixed order, before it reaches the arm:
    sign of wrong units or wrong joint order** — it is deliberately loud rather than
    silently "handled."
 
-The trailing gripper channel (`servo`, `do_command` — everything except
-`arm_joint`) is exempt
+The trailing gripper channel (`do_command`) is exempt
 from the degree-shaped delta and limit clamps — it gets its own `[0, 1]` clamp instead,
 counted separately as `clamp_counts["gripper"]`.
 
@@ -991,15 +973,13 @@ Rules for setting it:
 
 ## Limitations
 
-- **`mode: "rtc"` is not implemented.** `ActionQueue` supports RTC mode and is
-  differentially tested against upstream, but `RTCScheduler`, two-delay bookkeeping, and
-  `prev_chunk_left_over` wiring are a follow-up plan — deferred until CUDA latency is
-  measured, since RTC needs `delay < chunk_length` to function at all (on the measured
-  Apple Silicon numbers, `delay > chunk_length`, so it could not be validated there even
-  if implemented). Configuring `mode: "rtc"` raises at `start`. `mode: "async"` (see
-  Performance) is the currently-shipped answer to slow inference; it is a plain overlap,
-  not RTC, and does not smooth the seam at each chunk boundary the way RTC eventually
-  would.
+- **The controller does not run RTC.** The `#policy` service accepts an `rtc` block on
+  `infer` and returns `raw_actions` for a caller that runs real-time chunking itself, but
+  the controller has no `RTCScheduler` and its `ActionQueue` is append-only. Deferred
+  until CUDA latency is measured: RTC needs `delay < chunk_length` to function at all,
+  and on the measured Apple Silicon numbers `delay > chunk_length`. `mode: "async"` (see
+  Performance) is the shipped answer to slow inference; it is a plain overlap and does
+  not smooth the seam at each chunk boundary the way RTC eventually would.
 - **`state_units`/`action_units: "normalized"` is unsupported.** It needs a source of
   per-joint min/max (dataset stats vs. explicit config) that is an open design question.
   Only `degrees` and `radians` are accepted under `action_space: "joints"`.
@@ -1083,12 +1063,12 @@ closed-loop error, only rule out the config faults.
 
 - `mise run test` runs `pytest -m 'not integration and not differential'` — this is the
   suite that must stay green (and torch-free) in a base `uv sync`, with no `lerobot`
-  extra installed at all. It is the payoff for the `PolicyBackend` seam: everything
-  except two files (`lerobot_backend.py` and the integration tests) never imports torch.
+  extra installed at all: everything except `lerobot_backend.py` and the integration
+  tests never imports torch.
 - `mise run test-all` runs the full suite, including `@pytest.mark.integration` (a real
   `lerobot/smolvla_base` checkpoint against a fake robot — no hardware) and
-  `@pytest.mark.differential` (this module's numpy `ActionQueue` port checked against
-  upstream lerobot's torch implementation, on both the pinned SHA and `main`). Both need
+  `@pytest.mark.differential` (the controller's image resampling checked against
+  lerobot's own preprocessing, on both the pinned SHA and `main`). Both need
   `uv sync --extra lerobot` first.
 - `mise run build` / `mise run package` build the wheel and the deployable
   `module.tar.gz` (`meta.json` + `run.sh` + `setup.sh` + the wheel — no `docs/`, so

@@ -106,8 +106,7 @@ def test_padding_is_never_on_the_bottom_or_right(src_h, src_w, tgt_h, tgt_w):
 # actually runs on every frame inside an EVO1 policy. Its docstring states it
 # exists to mirror InternVL3's reference PIL preprocessing -- `Image.resize`
 # with the default (bicubic) resampler -- so the claim under test is that the
-# controller's PIL bicubic reproduces it, and that the pre-existing "stretch"
-# (BILINEAR) does not.
+# controller's PIL bicubic reproduces it.
 #
 # This runs on the *controller* side rather than testing lerobot: the
 # controller resizes a live camera frame onto the checkpoint's declared shape
@@ -180,28 +179,4 @@ def test_stretch_bicubic_reproduces_evo1s_resize(src_h, src_w, size):
     assert mean_error < _MEAN_TOLERANCE, (
         f"stretch_bicubic diverged from EVO1's resize by {mean_error:.4f}/255; "
         "the controller and the policy are no longer using the same resampler"
-    )
-
-
-@pytest.mark.parametrize(("src_h", "src_w", "size"), RESAMPLE_CASES)
-def test_the_bilinear_stretch_would_not_have_passed(src_h, src_w, size):
-    """The half that makes the test above mean something.
-
-    Without this, `_MEAN_TOLERANCE` could be loose enough to accept any
-    resampler at all and nobody would know. This pins that the pre-existing
-    "stretch" -- the obvious thing to reuse -- fails the same threshold by an
-    order of magnitude, which is why a third fit exists.
-    """
-    pytest.importorskip("lerobot.policies.evo1.internvl3_embedder")
-    frame = np.random.default_rng(src_h * src_w).integers(
-        0, 256, (src_h, src_w, 3), dtype=np.uint8
-    )
-
-    bilinear = _fit(frame, "stretch", size)
-    theirs = _evo1_resize(frame, size)
-
-    mean_error = float(np.abs(bilinear.astype(np.int32) - theirs.astype(np.int32)).mean())
-    assert mean_error > _MEAN_TOLERANCE * 5, (
-        f"BILINEAR is now within {mean_error:.4f}/255 of EVO1's resize; if that is "
-        "genuinely true, `stretch_bicubic` no longer earns its place"
     )

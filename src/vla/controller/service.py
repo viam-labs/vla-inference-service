@@ -3,7 +3,7 @@
 Two action spaces share this loop. They differ in four places -- the
 observation's state half, the safety layer, the arm call, and the unit
 conversion -- and in nothing else: the scheduler, action queue, pacing,
-starvation bounds, status reporting, and async/RTC modes are common.
+starvation bounds, status reporting, and the two `mode`s are common.
 
 ``action_space="joints"`` (the default) commands the arm via ``await
 arm.move_to_joint_positions(JointPositions(values=...))`` -- a single
@@ -79,9 +79,9 @@ from viam.utils import struct_to_dict
 from ..wire import decode_matrix, encode_vector
 from .config import DELTA_EE, DELTA_EE_ACTION_DIM, DELTA_EE_STATE_DIM, ControllerConfig
 from .gripper import GripperAdapter, make_gripper_adapter
-from .observation import ObservationBuilder
-from .pose import orientation_vector, pose_state, state_compose, state_rotation
-from .safety import CartesianLimits, CartesianSafetyLayer, SafetyLayer, SafetyLimits
+from .observation import ObservationBuilder, pose_state_from_proto
+from .pose import orientation_vector, state_compose, state_rotation
+from .safety import CartesianSafetyLayer, SafetyLayer
 from .scheduler import AsyncScheduler, ChunkScheduler, SequentialScheduler
 from .units import to_degrees, to_working
 
@@ -107,6 +107,7 @@ class VLAController(Generic, EasyResource):
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._scheduler: ChunkScheduler | None = None
+        self._mode: str | None = None
         self._stop_task: asyncio.Task | None = None
 
     @classmethod
@@ -137,6 +138,7 @@ class VLAController(Generic, EasyResource):
         self._cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
         self._deps = {self._key(k): v for k, v in dependencies.items()}
         self._specs = None
+        self._mode = None
         self._scheduler = None
         self._safety = None
         self._latencies.clear()
@@ -216,7 +218,7 @@ class VLAController(Generic, EasyResource):
         avg = float(np.mean(self._latencies)) if self._latencies else 0.0
         return {
             "state": self._state,
-            "mode": (self._specs or {}).get("_resolved_mode", self._cfg.mode if self._cfg else ""),
+            "mode": self._mode or (self._cfg.mode if self._cfg else ""),
             "queue_size": self._scheduler.qsize() if self._scheduler else 0,
             "avg_latency_s": avg,
             "measured_fps": self._measured_fps,
@@ -245,6 +247,7 @@ class VLAController(Generic, EasyResource):
         # avg_latency_s/clamp_counts as if they belonged to a run that
         # hasn't produced a single tick yet.
         self._specs = None
+        self._mode = None
         self._scheduler = None
         self._safety = None
         self._latencies.clear()
@@ -326,37 +329,12 @@ class VLAController(Generic, EasyResource):
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, 5.0)
 
-    def _resolve_mode(self, specs: dict[str, Any]) -> str:
-        cfg = self._cfg
-        if cfg.mode == "sequential":
-            return "sequential"
-        if cfg.mode == "async":
-            return "async"
-        if cfg.mode == "rtc":
-            if not specs.get("supports_rtc"):
-                raise RuntimeError("mode=rtc but the policy does not support RTC")
-            if specs.get("relative_actions"):
-                raise RuntimeError(
-                    "mode=rtc but the checkpoint uses relative actions, which requires "
-                    "prefix re-anchoring that is not implemented; use mode=sequential"
-                )
-            raise RuntimeError(
-                "mode=rtc is not implemented yet (RTCScheduler is a follow-up plan); "
-                "use mode=sequential, mode=async, or mode=auto"
-            )
-        # auto: "async" is explicit opt-in only (see config.py's docstring) --
-        # an existing deployment's behavior must not change underneath it
-        # just because this module gained a new mode.
-        return "sequential"
-
     def _build_scheduler(self, mode: str, builder: ObservationBuilder) -> ChunkScheduler:
         limit = self._cfg.actions_per_chunk
         if mode == "async":
             threshold = self._resolve_queue_threshold()
-            return AsyncScheduler(
-                lambda rtc: self._infer(builder, rtc), threshold, self._cfg.fps, limit
-            )
-        return SequentialScheduler(lambda rtc: self._infer(builder, rtc), limit)
+            return AsyncScheduler(lambda: self._infer(builder), threshold, self._cfg.fps, limit)
+        return SequentialScheduler(lambda: self._infer(builder), limit)
 
     def _effective_chunk_len(self) -> int:
         """How many actions a merged chunk actually contributes to the queue.
@@ -404,20 +382,8 @@ class VLAController(Generic, EasyResource):
     def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer | CartesianSafetyLayer:
         s = self._cfg.safety
         if self._cfg.action_space == DELTA_EE:
-            return CartesianSafetyLayer(
-                CartesianLimits(
-                    max_tcp_delta_mm=s.max_tcp_delta_mm,
-                    max_tcp_rot_delta_rads=s.max_tcp_rot_delta_rads,
-                )
-            )
-        return SafetyLayer(
-            SafetyLimits(
-                max_joint_delta_degs=s.max_joint_delta_degs,
-                max_start_delta_degs=s.max_start_delta_degs,
-                joint_limits_degs=s.joint_limits_degs,
-                gripper_in_degrees=not gripper.has_normalized_tail,
-            )
-        )
+            return CartesianSafetyLayer(s)
+        return SafetyLayer(s, gripper_in_degrees=not gripper.has_normalized_tail)
 
     def _check_action_dim(self, specs: dict[str, Any], gripper: GripperAdapter) -> None:
         cfg = self._cfg
@@ -507,7 +473,7 @@ class VLAController(Generic, EasyResource):
         refuse-before-motion discipline every other `_run()` check keeps.
 
         Reads the gripper's own current value and writes it straight back: a
-        no-op for `ServoGripper`, and usually one for `DoCommandGripper` --
+        usually a no-op for `DoCommandGripper` --
         but not always, since its `read()` clamps to [0, 1], so a driver
         resting outside its configured endpoints reads as an endpoint rather
         than its true position (an so-101 resting at 98% with open_value=95
@@ -574,10 +540,8 @@ class VLAController(Generic, EasyResource):
         cfg = self._cfg
         try:
             specs = await self._await_policy()
-            mode = self._resolve_mode(specs)
-            specs = dict(specs)
-            specs["_resolved_mode"] = mode
-            self._specs = specs
+            mode = self._mode = cfg.mode
+            self._specs = dict(specs)
 
             gripper = make_gripper_adapter(cfg.gripper, self._deps)
             self._check_action_dim(specs, gripper)
@@ -629,9 +593,12 @@ class VLAController(Generic, EasyResource):
             LOGGER.error("controller stopped: %s", exc)
             await self._safe_stop_arm()
 
-    async def _infer(
-        self, builder: ObservationBuilder, rtc: dict[str, Any] | None
-    ) -> tuple[np.ndarray, np.ndarray]:
+    async def _infer(self, builder: ObservationBuilder) -> np.ndarray:
+        """One observation in, one postprocessed action chunk out.
+
+        The policy also returns `raw_actions` (its own action space, for RTC
+        callers); this controller does not run RTC and ignores them.
+        """
         obs = await builder.build()
         payload: dict[str, Any] = {
             "command": "infer",
@@ -639,12 +606,10 @@ class VLAController(Generic, EasyResource):
             "state": encode_vector(obs.state),
             "task": self._active_task_text,
         }
-        if rtc:
-            payload["rtc"] = rtc
         started = time.perf_counter()
         out = await self._resource(self._cfg.policy_service).do_command(payload)
         self._latencies.append(time.perf_counter() - started)
-        return decode_matrix(out["actions"]), decode_matrix(out["raw_actions"])
+        return decode_matrix(out["actions"])
 
     def _record_tick(self, last_tick: float) -> float:
         now = time.perf_counter()
@@ -868,7 +833,7 @@ class VLAController(Generic, EasyResource):
         safe = self._safety.apply(delta)
 
         pose = await arm.get_end_position()
-        current = self._pose_state_of(pose)
+        current = pose_state_from_proto(pose)
         target = state_compose(current, safe)
         vector = orientation_vector(state_rotation(target))
         commanded = Pose(
@@ -907,30 +872,6 @@ class VLAController(Generic, EasyResource):
             return False
         return True
 
-    @staticmethod
-    def _pose_state_of(pose: Any) -> np.ndarray:
-        """The 9-dim state of a live `Pose`, in working units (mm, unitless).
-
-        Deliberately *not* unit-converted, unlike the copy `ObservationBuilder`
-        sends the policy: this one is only ever an operand of `state_compose`,
-        whose other operand is the already-converted delta, and both are in
-        working units by then. Converting here and back would be a round trip
-        with nothing on the far side of it.
-        """
-        return pose_state(
-            {
-                "pose": {
-                    "x": pose.x,
-                    "y": pose.y,
-                    "z": pose.z,
-                    "o_x": pose.o_x,
-                    "o_y": pose.o_y,
-                    "o_z": pose.o_z,
-                    "theta": pose.theta,
-                }
-            }
-        )
-
     async def _check_end_position(self, arm: Any) -> None:
         """Refuse before any motion if the arm cannot supply an `EndPosition`.
 
@@ -949,7 +890,7 @@ class VLAController(Generic, EasyResource):
                 f"get_end_position() failed: {exc}"
             ) from exc
         try:
-            self._pose_state_of(pose)
+            pose_state_from_proto(pose)
         except (AttributeError, ValueError) as exc:
             raise RuntimeError(
                 f"action_space={DELTA_EE!r} could not read a pose from the arm's "

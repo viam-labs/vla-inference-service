@@ -49,9 +49,7 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 
 `mode: "async"` overlaps execution with inference instead of stalling the arm
 between chunks -- for the case where inference latency approaches or exceeds
-chunk duration, where RTC cannot help (it needs `delay < chunk_length`). It is
-explicit opt-in: `"auto"` still resolves to `"sequential"`, so an existing
-deployment's behavior never changes underneath it. See `AsyncScheduler`.
+chunk duration. `"sequential"` is the default. See `AsyncScheduler`.
 """
 
 from __future__ import annotations
@@ -85,7 +83,7 @@ __all__ = [
     "DELTA_EE",
 ]
 
-MODES = ("auto", "sequential", "rtc", "async")
+MODES = ("sequential", "async")
 ENCODINGS = ("jpeg", "png", "raw")
 
 # The two action spaces. `joints` is the original and the default: absolute
@@ -102,13 +100,10 @@ ACTION_SPACES = (JOINTS, DELTA_EE)
 # "pad" mirrors smolvla's own training-time convention (resize_with_pad,
 # lerobot/policies/common/vla_utils.py:219): scale to fit inside the declared
 # (h, w) preserving aspect ratio, then pad black on the LEFT and TOP.
-# "stretch" is the plain `Image.resize` this module used before that
-# convention was matched -- kept as the non-default choice so an existing
-# deployment can reproduce its pre-fix output. See observation.py's `_encode`
-# and the README's `#controller` section for the measured divergence.
-# "stretch_bicubic" is the same geometry as "stretch" with EVO1's resampler,
-# and is the default under `action_space="delta-ee"`; see `_default_image_fit`.
-IMAGE_FITS = ("pad", "stretch", "stretch_bicubic")
+# "stretch_bicubic" squashes the whole frame onto the target with EVO1's
+# resampler, and is the default under `action_space="delta-ee"`; see
+# `_default_image_fit`.
+IMAGE_FITS = ("pad", "stretch_bicubic")
 
 # `extra` sent with every `move_to_joint_positions`. The control loop issues a
 # new setpoint every tick and the next one supersedes this one, so the driver
@@ -199,7 +194,13 @@ class SafetyConfig:
     max_vel_degs_per_sec: float | None = None
     joint_limits_degs: list[tuple[float, float]] | None = None
     stop_on_error: bool = True
-    # delta-ee only; see CartesianLimits for where the defaults come from.
+    # delta-ee only. Defaults come from the recorded per-tick statistics of
+    # the dataset these checkpoints are trained on (`xarm-open-box-eedelta`,
+    # 34,670 frames at 10 fps): translation median 9.31 mm, p99 28.4, max
+    # 96.8; rotation median 0.0142 rad, p99 0.0807, max 0.3246. Each default
+    # sits ~1.4x above the p99, so in-distribution motion never clamps and
+    # `clamp_counts` stays a real signal, and well below the largest single
+    # tick, which at 10 fps would be 968 mm/s of tool travel.
     max_tcp_delta_mm: float = 40.0
     max_tcp_rot_delta_rads: float = 0.12
     max_tcp_vel_mms_per_sec: float | None = None
@@ -486,7 +487,7 @@ class ControllerConfig:
     gripper: dict[str, Any] = field(default_factory=lambda: {"type": "none"})
     task: str = ""
     fps: float = 10.0
-    mode: str = "auto"
+    mode: str = "sequential"
     queue_threshold: int | None = None
     actions_per_chunk: int | None = None
     starvation_grace_ticks: int = 3
@@ -577,7 +578,7 @@ class ControllerConfig:
             gripper=gripper,
             task=as_str(raw.get("task", ""), "task"),
             fps=fps,
-            mode=as_choice(raw.get("mode", "auto"), "mode", MODES),
+            mode=as_choice(raw.get("mode", "sequential"), "mode", MODES),
             queue_threshold=(
                 as_int(raw["queue_threshold"], "queue_threshold", minimum=0)
                 if raw.get("queue_threshold") is not None

@@ -1150,33 +1150,8 @@ async def test_first_action_within_start_delta_is_accepted():
 
 
 # ---------------------------------------------------------------------------
-# RTC mode refusals.
+# Mode handling.
 # ---------------------------------------------------------------------------
-
-
-async def test_rtc_mode_refuses_relative_action_checkpoint():
-    policy = FakePolicyClient(relative=True)
-    svc = _svc(config=_config(mode="rtc"), deps=_deps(policy=policy))
-    await svc.do_command({"command": "start", "task": "t"})
-    status = await _wait_for_state(svc, "error")
-    assert "relative" in status["last_error"].lower()
-
-
-async def test_rtc_mode_refuses_policy_without_rtc_support():
-    policy = FakePolicyClient(supports_rtc=False)
-    svc = _svc(config=_config(mode="rtc"), deps=_deps(policy=policy))
-    await svc.do_command({"command": "start", "task": "t"})
-    status = await _wait_for_state(svc, "error")
-    assert "rtc" in status["last_error"].lower()
-
-
-async def test_rtc_mode_refuses_even_when_supported_and_not_relative():
-    # mode=rtc is unimplemented outright; RTCScheduler is a follow-up plan.
-    policy = FakePolicyClient(supports_rtc=True, relative=False)
-    svc = _svc(config=_config(mode="rtc"), deps=_deps(policy=policy))
-    await svc.do_command({"command": "start", "task": "t"})
-    status = await _wait_for_state(svc, "error")
-    assert "not implemented" in status["last_error"].lower()
 
 
 async def test_sequential_mode_never_touches_rtc_fields():
@@ -1193,17 +1168,6 @@ async def test_sequential_mode_never_touches_rtc_fields():
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
     assert status["state"] != "error"
-
-
-async def test_auto_mode_resolves_to_sequential():
-    policy = FakePolicyClient()
-    svc = _svc(config=_config(mode="auto"), deps=_deps(policy=policy))
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    status = await svc.do_command({"command": "status"})
-    await svc.do_command({"command": "stop"})
-    assert status["mode"] == "sequential"
 
 
 # ---------------------------------------------------------------------------
@@ -1425,16 +1389,16 @@ async def test_status_avg_latency_reflects_recorded_latencies():
 
 
 async def test_mode_reports_configured_value_before_specs_resolve():
-    # mode="rtc" specifically (not "sequential"): with a cold policy that
-    # never leaves "loading", specs never resolve, so this stays reporting
+    # mode="async" specifically (not "sequential"): with a cold policy that
+    # never leaves "loading", the loop never starts, so this stays reporting
     # the *configured* value the whole time. Using "sequential" here would
     # not catch a mutant that hardcoded status()'s mode field to
     # "sequential" -- it would coincidentally match either way.
     policy = FakePolicyClient(state="loading")
-    svc = _svc(config=_config(mode="rtc"), deps=_deps(policy=policy))
+    svc = _svc(config=_config(mode="async"), deps=_deps(policy=policy))
     await svc.do_command({"command": "start", "task": "t"})
     status = await svc.do_command({"command": "status"})
-    assert status["mode"] == "rtc"
+    assert status["mode"] == "async"
     await svc.do_command({"command": "stop"})
 
 
@@ -2053,7 +2017,7 @@ async def test_starved_ticks_does_not_carry_over_across_a_restart():
 async def test_sequential_mode_never_reports_starved_ticks():
     arm = FakeArm(positions=[0.0] * 6)
     policy = FakePolicyClient(n=3)
-    svc = _svc(deps=_deps(policy=policy, arm=arm))  # default mode="auto" -> sequential
+    svc = _svc(deps=_deps(policy=policy, arm=arm))  # default mode="sequential"
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_state(svc, "running")
     await asyncio.sleep(0.1)

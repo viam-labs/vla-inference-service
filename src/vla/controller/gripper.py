@@ -5,16 +5,13 @@ to carry it at different fidelity, so the config picks one explicitly:
 
   arm_joint   gripper is joint N of the arm; value is a joint angle
               following ``action_units``, like every other joint.
-  servo       get_position()/move(angle); both int degrees, so the adapter
-              maps normalized 0..1 onto min_deg..max_deg at 1-degree
-              resolution.
   do_command  proportional control through DoCommand, for drivers that
               expose it there instead of the typed API
               (``devrel:so101:gripper``, ``viam:ufactory:gripper``).
   none        no gripper channel.
 
 Unit convention: ``arm_joint`` is in degrees (or whatever ``action_units``
-is); ``servo`` and ``do_command`` are normalized 0.0-1.0, 0 = fully open,
+is); ``do_command`` is normalized 0.0-1.0, 0 = fully open,
 matching how LeRobot datasets typically encode a gripper channel.
 
 The typed ``Gripper`` API's ``get_current_inputs``/``go_to_inputs`` pair is
@@ -32,17 +29,15 @@ from typing import Any, Mapping
 
 from vla.config_util import ConfigError, VLAError, as_choice, as_float, as_int, as_str
 
-GRIPPER_TYPES = ("arm_joint", "servo", "do_command", "none")
+GRIPPER_TYPES = ("arm_joint", "do_command", "none")
 
 # Variants that resolve their own Viam resource, and so must be named in
 # `ControllerConfig.dependencies()`. Lives here rather than in `config.py`
 # because it is a fact about the adapters: `dependencies()` has to answer it
 # before any adapter exists, so it cannot read `dependency_name` off an
 # instance, but it can import the set from the module that owns the variants.
-GRIPPER_TYPES_NEEDING_DEPENDENCY = frozenset({"servo", "do_command"})
+GRIPPER_TYPES_NEEDING_DEPENDENCY = frozenset({"do_command"})
 
-_DEFAULT_MIN_DEG = 0.0
-_DEFAULT_MAX_DEG = 90.0
 _DEFAULT_READ_KEY = "position"
 
 # The coercion helpers already raise ConfigError, which is what a bad gripper
@@ -87,8 +82,8 @@ class GripperAdapter(abc.ABC):
     def has_normalized_tail(self) -> bool:
         """Whether this adapter contributes a trailing 0.0-1.0 channel.
 
-        True for every variant whose value is normalized (`servo`,
-        `do_command`); False for `arm_joint`, whose channel rides the arm's
+        True for every variant whose value is normalized (`do_command`);
+        False for `arm_joint`, whose channel rides the arm's
         joint vector in ``action_units``, and for `none`, which contributes
         nothing.
 
@@ -132,33 +127,6 @@ class ArmJointGripper(GripperAdapter):
         self.arm_joint_index = joint_index
 
 
-class ServoGripper(GripperAdapter):
-    def __init__(self, name: str, servo: Any, min_deg: float, max_deg: float) -> None:
-        if max_deg <= min_deg:
-            raise GripperConfigError(
-                f"gripper.max_deg must exceed gripper.min_deg, got "
-                f"min_deg={min_deg!r} max_deg={max_deg!r}"
-            )
-        self.dependency_name = name
-        self._servo = servo
-        self._min = min_deg
-        self._max = max_deg
-
-    async def read(self) -> float:
-        # Deliberately unvalidated and unclamped, unlike `DoCommandGripper.read`:
-        # a servo past its configured `max_deg` returns >1.0 and a driver
-        # returning NaN propagates, both straight into the observation vector.
-        # This predates the guarded adapter below and is left alone rather than
-        # changed here -- but do not read the density of guards one class down
-        # as a module-wide discipline. It is not one.
-        deg = float(await self._servo.get_position())
-        return (deg - self._min) / (self._max - self._min)
-
-    async def write(self, value: float) -> None:
-        clamped = _clamp_unit(value)
-        await self._servo.move(int(round(self._min + clamped * (self._max - self._min))))
-
-
 class DoCommandGripper(GripperAdapter):
     """Proportional control through ``DoCommand``, for drivers that expose it
     there rather than through the typed API.
@@ -184,9 +152,7 @@ class DoCommandGripper(GripperAdapter):
     # endpoints do not describe this driver's scale at all (the classic case:
     # so-101's 95/0 percent copied onto a driver reporting raw units), and
     # silently saturating it freezes the policy's gripper channel at a rail
-    # forever. A class attribute rather than a module constant because this is
-    # the only adapter that validates its reads at all -- `ServoGripper`
-    # deliberately does not, so a module-level name would overstate its reach.
+    # forever.
     _READ_SLACK = 0.25
 
     def __init__(
@@ -313,14 +279,6 @@ def make_gripper_adapter(
     if not name:
         raise GripperConfigError(f"gripper.type={kind!r} requires name")
     name = as_str(name, "gripper.name")
-
-    if kind == "servo":
-        return ServoGripper(
-            name,
-            dependencies.get(name),
-            as_float(raw.get("min_deg", _DEFAULT_MIN_DEG), "gripper.min_deg"),
-            as_float(raw.get("max_deg", _DEFAULT_MAX_DEG), "gripper.max_deg"),
-        )
 
     # kind == "do_command"
     missing = [field for field in ("open_value", "closed_value") if field not in raw]

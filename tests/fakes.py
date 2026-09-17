@@ -205,19 +205,6 @@ class FakeCamera:
         return [image], metadata
 
 
-class FakeServo:
-    def __init__(self, angle=0):
-        self.angle = angle
-        self.moves = []
-
-    async def get_position(self, **kwargs) -> int:
-        return self.angle
-
-    async def move(self, angle: int, **kwargs):
-        self.moves.append(angle)
-        self.angle = angle
-
-
 class FakeDoCommandGripper:
     """A gripper whose only proportional control is through ``DoCommand``.
 
