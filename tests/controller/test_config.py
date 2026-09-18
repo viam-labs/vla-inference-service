@@ -184,6 +184,31 @@ def test_accepts_every_known_mode(mode):
 
 
 # ---------------------------------------------------------------------------
+# merge
+# ---------------------------------------------------------------------------
+
+
+def test_merge_defaults_to_append():
+    cfg = ControllerConfig.parse(BASE)
+    assert cfg.merge == "append"
+
+
+def test_merge_aligned_accepted_with_async_mode():
+    cfg = ControllerConfig.parse({**BASE, "mode": "async", "merge": "aligned"})
+    assert cfg.merge == "aligned"
+
+
+def test_rejects_unknown_merge():
+    with pytest.raises(ConfigError, match="merge"):
+        ControllerConfig.parse({**BASE, "merge": "replace"})
+
+
+def test_rejects_aligned_merge_with_sequential_mode():
+    with pytest.raises(ConfigError, match="merge"):
+        ControllerConfig.parse({**BASE, "mode": "sequential", "merge": "aligned"})
+
+
+# ---------------------------------------------------------------------------
 # state_joint_indices
 # ---------------------------------------------------------------------------
 

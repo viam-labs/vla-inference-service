@@ -5,12 +5,13 @@ import time
 import numpy as np
 import pytest
 
-from vla.controller.action_queue import ActionQueueError
+from vla.controller.action_queue import ActionQueue, ActionQueueError
 from vla.controller.scheduler import (
     AsyncScheduler,
     ChunkScheduler,
     SchedulerError,
     SequentialScheduler,
+    _validate_and_merge,
 )
 
 
@@ -746,3 +747,155 @@ async def test_truncation_keeps_the_head_of_the_chunk_not_the_tail():
     second = await s.next_action()
     np.testing.assert_allclose(first, [100.0])
     np.testing.assert_allclose(second, [101.0])
+
+
+# ---------------------------------------------------------------------------
+# merge="aligned": drop head rows whose moment has already passed.
+# ---------------------------------------------------------------------------
+
+
+class RampInfer:
+    """Rows are identifiable by value: row i is worth i."""
+
+    def __init__(self, n=10, dim=1):
+        self.n = n
+        self.dim = dim
+
+    async def __call__(self):
+        return np.tile(np.arange(self.n, dtype=np.float32).reshape(self.n, 1), (1, self.dim))
+
+
+def test_queue_threshold_attribute_is_readable():
+    s = AsyncScheduler(RecordingInfer(), queue_threshold=5)
+    assert s.queue_threshold == 5
+
+
+def test_skip_composes_with_actions_per_chunk():
+    # skip 4 of a 10-row chunk, then truncate what remains to 3 -> rows 4,5,6.
+    queue = ActionQueue()
+    processed = np.arange(10, dtype=np.float32).reshape(10, 1)
+    skipped = _validate_and_merge(queue, processed, actions_per_chunk=3, skip=4)
+    assert skipped == 4
+    np.testing.assert_allclose(queue.queue, [[4.0], [5.0], [6.0]])
+
+
+async def test_aligned_merge_drops_stale_head_rows():
+    # fps=10 -> 0.3s of latency is 3 ticks. 2 rows are still queued when the
+    # background chunk lands, so the first fresh row served must be row
+    # index 3 + 2 - 1 = 4.
+    clock_state = {"now": 0.0}
+    s = AsyncScheduler(
+        RampInfer(n=10),
+        queue_threshold=7,
+        fps=10.0,
+        merge="aligned",
+        clock=lambda: clock_state["now"],
+    )
+
+    first = await s.next_action()  # blocking fill: rows 0..9, pops row 0
+    np.testing.assert_allclose(first, [0.0])
+
+    for _ in range(7):  # pops rows 1..7; the 3rd of these (qsize<=7) fires
+        await s.next_action()  # a background inference at clock_state["now"]=0.0
+    assert s.qsize() == 2  # rows 8, 9 left
+
+    clock_state["now"] = 0.3  # 3 ticks of latency pass before the chunk lands
+    await asyncio.sleep(0)  # let the background inference land
+
+    assert s.dropped_stale_rows == 4
+    np.testing.assert_allclose(await s.next_action(), [8.0])  # old tail first
+    np.testing.assert_allclose(await s.next_action(), [9.0])
+    np.testing.assert_allclose(await s.next_action(), [4.0])  # row index 4
+    await s.close()
+
+
+async def test_append_merge_ignores_latency_and_drops_nothing():
+    clock_state = {"now": 0.0}
+    s = AsyncScheduler(
+        RampInfer(n=10),
+        queue_threshold=7,
+        fps=10.0,
+        clock=lambda: clock_state["now"],  # merge defaults to "append"
+    )
+
+    await s.next_action()
+    for _ in range(7):
+        await s.next_action()
+    assert s.qsize() == 2
+
+    clock_state["now"] = 0.3
+    await asyncio.sleep(0)
+
+    assert s.dropped_stale_rows == 0
+    np.testing.assert_allclose(await s.next_action(), [8.0])
+    np.testing.assert_allclose(await s.next_action(), [9.0])
+    np.testing.assert_allclose(await s.next_action(), [0.0])  # nothing skipped
+    await s.close()
+
+
+async def test_entirely_stale_chunk_merges_nothing_and_recovers():
+    clock_state = {"now": 0.0}
+    infer = RampInfer(n=5)
+    s = AsyncScheduler(
+        infer, queue_threshold=4, fps=10.0, merge="aligned", clock=lambda: clock_state["now"]
+    )
+
+    await s.next_action()  # blocking fill: rows 0..4, pops row 0
+    for _ in range(4):  # pops rows 1..4; the 1st (qsize<=4) fires a background
+        await s.next_action()  # inference; the queue drains to empty
+    assert s.qsize() == 0
+
+    clock_state["now"] = 10.0  # advance well past the whole 5-row chunk
+    await asyncio.sleep(0)  # let it land -- entirely stale
+
+    assert s.dropped_stale_rows == 5
+    assert s.qsize() == 0
+
+    # A following call has nothing queued and nothing in flight: it blocks
+    # and infers again, and still returns an action -- no exception.
+    action = await s.next_action()
+    assert action is not None
+    await s.close()
+
+
+async def test_aligned_merge_executes_every_row_on_its_intended_tick():
+    """The property aligned merging exists for: every row executes on its
+    intended tick, sustained over many chunk boundaries. Latency is real
+    overlap with the loop's own ticks, not an instant clock jump.
+    """
+    fps, n, latency_ticks = 30.0, 50, 18  # latency well under half the chunk
+    state = {"tick": 0, "first": True}
+    clock = lambda: state["tick"] / fps
+
+    class LatencyInfer:
+        async def __call__(self):
+            fired_tick = state["tick"]
+            target = fired_tick + latency_ticks
+            if state["first"]:
+                # The first next_action is the blocking path (nothing queued
+                # to overlap with yet), so the fake infer must advance the
+                # clock itself rather than waiting on the loop's own ticks.
+                state["first"] = False
+                state["tick"] = target
+            else:
+                while state["tick"] < target:
+                    await asyncio.sleep(0)
+            return np.array([[fired_tick + 1 + i] for i in range(n)], dtype=np.float64)
+
+    s = AsyncScheduler(LatencyInfer(), queue_threshold=49, fps=fps, merge="aligned", clock=clock)
+
+    async def settle():
+        # Five hops: enough for a just-fired inference to reach its first
+        # `await` and start waiting, and separately for one whose target
+        # tick just arrived to wake up and finish its merge.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    for i in range(600):
+        state["tick"] += 1
+        await settle()
+        action = await s.next_action()
+        await settle()
+        assert action is not None, f"call {i} starved"
+        assert int(action[0]) == state["tick"]
+    await s.close()

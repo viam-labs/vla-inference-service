@@ -1,7 +1,10 @@
 """Chunk scheduling: turn action chunks into one action per control tick.
 
 Two strategies ship: `SequentialScheduler` (blocking refill) and
-`AsyncScheduler` (overlapped refill). Both append onto one `ActionQueue`.
+`AsyncScheduler` (overlapped refill). Both merge onto one `ActionQueue`.
+`SequentialScheduler` always appends; `AsyncScheduler` does too under its
+default `merge="append"`, but its `merge="aligned"` drops stale head rows
+before merging instead -- see `AsyncScheduler`'s docstring.
 
 `ChunkScheduler.next_action` is typed to allow returning `None`.
 `SequentialScheduler` never actually does -- it raises `SchedulerError`
@@ -61,8 +64,8 @@ class SchedulerError(VLAError, RuntimeError):
 
 
 def _validate_and_merge(
-    queue: ActionQueue, processed: Any, actions_per_chunk: int | None = None
-) -> None:
+    queue: ActionQueue, processed: Any, actions_per_chunk: int | None = None, skip: int = 0
+) -> int:
     """Validate a freshly-inferred chunk and merge it into `queue`.
 
     Shared by both schedulers so the two cannot drift apart on what counts
@@ -74,6 +77,14 @@ def _validate_and_merge(
     Truncation is deliberately *not* a validation failure when the chunk is
     shorter than N -- a policy is free to return fewer rows than the
     operator budgeted for, and slicing past the end is already a no-op.
+
+    `skip` drops rows from the *head* instead -- `AsyncScheduler`'s aligned
+    merge mode uses it to discard rows whose moment has already passed by
+    the time they would execute. A chunk that is entirely stale (`skip`
+    covers every row) is not a malformed response, just a late one: it
+    returns without merging or raising, and the caller counts the returned
+    skip total instead. Truncation to `actions_per_chunk` applies to
+    whatever remains after the skip, not before.
     """
     if not isinstance(processed, np.ndarray) or processed.ndim != 2:
         raise SchedulerError(
@@ -82,6 +93,12 @@ def _validate_and_merge(
         )
     if processed.shape[0] == 0:
         raise SchedulerError("policy returned an empty action chunk")
+
+    skipped = min(skip, processed.shape[0])
+    processed = processed[skip:]
+    if processed.shape[0] == 0:
+        return skipped
+
     if actions_per_chunk is not None:
         processed = processed[:actions_per_chunk]
     try:
@@ -90,6 +107,7 @@ def _validate_and_merge(
         # ActionQueue raises its own type; a caller of the scheduler should
         # never have to also know about it.
         raise SchedulerError(f"policy returned a malformed action chunk: {exc}") from exc
+    return skipped
 
 
 class ChunkScheduler(abc.ABC):
@@ -158,9 +176,10 @@ class AsyncScheduler(ChunkScheduler):
     freezes. RTC cannot rescue this case (it needs `delay < chunk_length`;
     here `delay > chunk_length`, so it would discard the entire chunk on
     every merge). Plain overlap can: keep serving the current chunk's queued
-    actions while the next chunk infers in the background, merged in
-    **append** mode so the new chunk extends the queue instead of replacing
-    it.
+    actions while the next chunk infers in the background, merged by default
+    in **append** mode so the new chunk extends the queue instead of
+    replacing it -- see the `merge="aligned"` paragraph below for the
+    alternative.
 
     The honest cost is a discontinuity at each chunk boundary -- the last
     action of chunk *k* and the first of *k+1* come from observations
@@ -192,6 +211,14 @@ class AsyncScheduler(ChunkScheduler):
     fire. That is silent unless something says so, so once `fps` and a
     stable latency reading are known, `next_action` warns once (never every
     tick) if `queue_threshold < ceil(observed_latency * fps)`.
+
+    `merge="aligned"` fixes append mode's boundary yank (see `config.py`'s
+    docstring) by dropping the head rows of every landing chunk whose moment
+    has already passed: with `L` ticks of latency and `q` rows still queued
+    when the chunk lands, the first remaining row must be row `L + q - 1`.
+    It only works when latency is under half the chunk length -- past that,
+    each chunk yields fewer fresh rows than the next inference takes to
+    arrive, and the queue starves faster than it can be refilled.
     """
 
     def __init__(
@@ -200,16 +227,21 @@ class AsyncScheduler(ChunkScheduler):
         queue_threshold: int,
         fps: float = 10.0,
         actions_per_chunk: int | None = None,
+        merge: str = "append",
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._infer = infer
         self._queue = ActionQueue()
-        self._queue_threshold = queue_threshold
+        self.queue_threshold = queue_threshold
         self._actions_per_chunk = actions_per_chunk
         self._fps = fps
+        self._merge = merge
+        self._clock = clock
         self._inflight: asyncio.Task[None] | None = None
         self._pending_error: Exception | None = None
         self._latencies: deque[float] = deque(maxlen=_LATENCY_WINDOW)
         self._warned_starvation_risk = False
+        self.dropped_stale_rows = 0
 
     async def next_action(self) -> np.ndarray | None:
         self._raise_pending_error()
@@ -233,10 +265,13 @@ class AsyncScheduler(ChunkScheduler):
         await self._inflight
         self._raise_pending_error()
 
-        action = self._queue.get()
-        if action is None:  # pragma: no cover - guarded by _validate_and_merge
-            raise SchedulerError("queue empty immediately after merge")
-        return action
+        # Ordinarily guarded by _validate_and_merge's empty-chunk check, but
+        # an aligned merge can validly skip an entire landing chunk as
+        # stale, leaving the queue exactly as empty as before -- not an
+        # invariant violation. None here reads exactly like the starved
+        # branch above: the next call has nothing queued and nothing in
+        # flight, so it blocks and infers again.
+        return self._queue.get()
 
     async def close(self) -> None:
         await self._cancel_inflight()
@@ -255,20 +290,43 @@ class AsyncScheduler(ChunkScheduler):
         # atomic step under asyncio's cooperative scheduling (a task only
         # switches at an `await`), which is what keeps "exactly one inference
         # in flight" true under back-to-back `next_action` calls.
-        if self._inflight is None and self._queue.qsize() <= self._queue_threshold:
+        if self._inflight is None and self._queue.qsize() <= self.queue_threshold:
             self._start_background_inference()
 
     def _start_background_inference(self) -> None:
-        # Keeping the task on `self` is load-bearing, not defensive: asyncio
-        # holds only a weak reference, so a bare handle can be
-        # garbage-collected before it ever runs.
-        self._inflight = asyncio.create_task(self._infer_and_merge())
+        # `fired_at` is when inference was REQUESTED, not when it lands, and
+        # not quite when the observation was taken either -- the `infer`
+        # callback (the controller wires it to read the camera first) grabs
+        # the frame after this point, so the true observation is slightly
+        # later than `fired_at`, and aligned merge's elapsed-time estimate is
+        # slightly too long, erring the skip one row conservative rather
+        # than short. Keeping the task on `self` is load-bearing, not
+        # defensive: asyncio holds only a weak reference, so a bare handle
+        # can be garbage-collected before it ever runs.
+        fired_at = self._clock()
+        self._inflight = asyncio.create_task(self._infer_and_merge(fired_at))
 
-    async def _infer_and_merge(self) -> None:
-        started = time.perf_counter()
+    def _aligned_skip(self, fired_at: float) -> int:
+        # Row i of a landing chunk serves tick T+1+i (T = the tick fired_at
+        # names); the merge lands before the loop pops for the tick the
+        # clock has just reached, so the q still-queued rows already cover
+        # ticks T+L .. T+L+q-1, and the first uncovered tick is T+L+q --
+        # row index L+q-1.
+        if self._merge != "aligned":
+            return 0
+        # round(), not int(): elapsed time is real-valued and the row that
+        # should execute next is the nearest tick, not whichever one a
+        # floor happens to land on -- int() truncation biases the skip low
+        # by one row whenever elapsed time lands just under a tick boundary.
+        elapsed = round((self._clock() - fired_at) * self._fps)
+        return max(0, elapsed + self._queue.qsize() - 1)
+
+    async def _infer_and_merge(self, fired_at: float) -> None:
         try:
             processed = await self._infer()
-            _validate_and_merge(self._queue, processed, self._actions_per_chunk)
+            skip = self._aligned_skip(fired_at)
+            skipped = _validate_and_merge(self._queue, processed, self._actions_per_chunk, skip)
+            self.dropped_stale_rows += skipped
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -283,7 +341,9 @@ class AsyncScheduler(ChunkScheduler):
         else:
             # Only a *completed* inference is a meaningful latency sample; a
             # failed one may have failed immediately, or stalled unrelatedly.
-            self._latencies.append(time.perf_counter() - started)
+            # Same clock as `fired_at` so a fake clock in tests measures a
+            # consistent latency.
+            self._latencies.append(self._clock() - fired_at)
             self._maybe_warn_starvation_risk()
         finally:
             self._inflight = None
@@ -297,7 +357,7 @@ class AsyncScheduler(ChunkScheduler):
 
         avg_latency = sum(self._latencies) / len(self._latencies)
         required = math.ceil(avg_latency * self._fps)
-        if self._queue_threshold >= required:
+        if self.queue_threshold >= required:
             return
 
         self._warned_starvation_risk = True
@@ -309,12 +369,12 @@ class AsyncScheduler(ChunkScheduler):
             "chunk. Raise queue_threshold (up to n_action_steps - 1), lower "
             "fps, or reduce the policy's number of denoising/diffusion steps "
             "(num_steps) to cut latency.",
-            self._queue_threshold,
+            self.queue_threshold,
             avg_latency,
             len(self._latencies),
             self._fps,
             required,
-            required - self._queue_threshold,
+            required - self.queue_threshold,
         )
 
     async def _cancel_inflight(self) -> None:

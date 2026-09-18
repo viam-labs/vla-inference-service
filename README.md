@@ -318,6 +318,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `fps` | number | `10.0` | Control loop rate. |
 | `mode` | `sequential` \| `async` | `"sequential"` | Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). |
 | `queue_threshold` | integer | derived (effective chunk length − 1) | `mode: "async"` only: refill fires once the queue has this many actions left. Derived from `actions_per_chunk` when set, else from the checkpoint's `n_action_steps`. Leave unset — see [Performance](#performance). |
+| `merge` | `append` \| `aligned` | `"append"` | `mode: "async"` only: how a landing chunk is merged into the queue. `aligned` drops stale head rows instead of appending behind them — see [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then). |
 | `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
@@ -518,6 +519,8 @@ The one command to watch while a loop runs.
   "measured_fps": 9.94,
   "clamp_counts": { "delta": 0, "limit": 0, "gripper": 0 },
   "starved_ticks": 0,
+  "queue_threshold": null,
+  "dropped_stale_rows": 0,
   "last_error": ""
 }
 ```
@@ -536,6 +539,12 @@ What to read it for:
   `queue_threshold + chunk length`, and every action in it is that many ticks stale. 40–90
   with a 50-step chunk at 10 fps means the arm is executing observations 4–9 s old; see
   [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk).
+- `queue_threshold` — the scheduler's actual refill threshold under `mode: "async"`; `null`
+  under `sequential`, where the concept does not apply.
+- `dropped_stale_rows` — cumulative rows discarded by `merge: "aligned"` as too stale to
+  execute; always `0` under `append`. A persistently rising value means observed latency is
+  near or over half the chunk length — see
+  [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then).
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
 
@@ -878,6 +887,33 @@ lower `fps` (a chunk buys more wall-clock time per inference), a smaller/faster
 checkpoint, or fewer denoising steps. **For anything resembling a live demo, the x86+CUDA
 target remains the practical answer** — the numbers above are Mac-specific, and `async`
 narrows the gap without pretending to close it as well as faster hardware would.
+
+### `merge: "aligned"` — execute rows for now, not rows for then
+
+`mode: "async"`'s default, `merge: "append"`, queues every landing chunk behind whatever is
+still queued. A chunk predicted from an observation taken at time t0 has row i meaning "the
+pose the arm should be at at t0 + (i+1)/fps" — but by the time row 0 of the new chunk
+actually executes, however many ticks were still queued when it landed have already passed,
+so it describes a pose from the past. The arm follows the outgoing chunk's drifting tail,
+then the incoming chunk's head pulls it back to where the policy thought it should have been
+a moment earlier: a visible yank at every chunk boundary. Measured on the xArm: a delta-clamp
+burst every 1.72 s, exactly one per 50-row chunk at 29 fps.
+
+`merge: "aligned"` fixes this by dropping the head rows of every landing chunk whose moment
+has already passed, instead of appending them. With `L` ticks of observed inference latency
+and `q` rows still queued when the chunk lands, it skips the first `L + q - 1` rows, so the
+first row it actually merges is the first one whose intended tick is still in the future. The
+queue only ever holds rows for now or later, never for then — at the cost of throwing part of
+every chunk away, tracked in `status.dropped_stale_rows`.
+
+That only works while latency stays under about half the chunk length — past that, each
+chunk yields fewer fresh rows than the next inference takes to arrive, and the queue starves
+faster than it can be refilled. Measured on `smolvla-box-bot-subtasks` (chunk 50 at 30 fps =
+1.67 s): at `num_steps: 10`, latency was 1.07 s = 34 ticks — over half the chunk, so `aligned`
+would starve roughly half the time. At `num_steps: 4`, latency drops to 0.58 s = 18 ticks,
+comfortably under half, and `aligned` runs with zero staleness and no starvation. This is why
+`merge` defaults to `"append"`: `"aligned"` is a clear win only once latency is known to sit
+well inside that half-chunk budget.
 
 ### Tuning `queue_threshold` — the single most actionable knob in `mode: "async"`
 

@@ -1350,6 +1350,9 @@ async def test_status_reports_every_documented_field():
         "avg_latency_s",
         "measured_fps",
         "clamp_counts",
+        "starved_ticks",
+        "queue_threshold",
+        "dropped_stale_rows",
         "last_error",
     ):
         assert key in status, f"missing status field: {key}"
@@ -1832,7 +1835,7 @@ async def test_async_mode_derives_queue_threshold_from_n_action_steps_when_unset
     await _wait_for_state(svc, "running")
     await asyncio.sleep(0.1)
     await svc.do_command({"command": "stop"})
-    assert svc._scheduler._queue_threshold == 6
+    assert svc._scheduler.queue_threshold == 6
 
 
 async def test_async_mode_explicit_queue_threshold_overrides_the_derived_default():
@@ -1846,7 +1849,7 @@ async def test_async_mode_explicit_queue_threshold_overrides_the_derived_default
     await _wait_for_state(svc, "running")
     await asyncio.sleep(0.1)
     await svc.do_command({"command": "stop"})
-    assert svc._scheduler._queue_threshold == 2
+    assert svc._scheduler.queue_threshold == 2
 
 
 async def test_async_mode_explicit_zero_threshold_is_honored_not_derived():
@@ -1860,7 +1863,7 @@ async def test_async_mode_explicit_zero_threshold_is_honored_not_derived():
     await _wait_for_state(svc, "running")
     await asyncio.sleep(0.1)
     await svc.do_command({"command": "stop"})
-    assert svc._scheduler._queue_threshold == 0
+    assert svc._scheduler.queue_threshold == 0
 
 
 async def test_derived_threshold_follows_actions_per_chunk_not_n_action_steps():
@@ -1878,7 +1881,7 @@ async def test_derived_threshold_follows_actions_per_chunk_not_n_action_steps():
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_first_move(arm)
     await svc.do_command({"command": "stop"})
-    assert svc._scheduler._queue_threshold == 3
+    assert svc._scheduler.queue_threshold == 3
 
 
 async def test_actions_per_chunk_above_n_action_steps_cannot_strand_the_threshold():
@@ -1894,7 +1897,7 @@ async def test_actions_per_chunk_above_n_action_steps_cannot_strand_the_threshol
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_first_move(arm)
     await svc.do_command({"command": "stop"})
-    assert svc._scheduler._queue_threshold == 6
+    assert svc._scheduler.queue_threshold == 6
 
 
 async def test_sequential_mode_also_honors_actions_per_chunk():
@@ -2024,6 +2027,62 @@ async def test_sequential_mode_never_reports_starved_ticks():
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
     assert status["starved_ticks"] == 0
+
+
+# ---------------------------------------------------------------------------
+# status.queue_threshold / status.dropped_stale_rows (Task 1: aligned merge).
+# ---------------------------------------------------------------------------
+
+
+async def test_status_reports_queue_threshold_and_dropped_stale_rows_for_async():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=7)
+    svc = _svc(
+        config=_config(mode="async", fps=50.0, queue_threshold=3),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    await asyncio.sleep(0.1)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["queue_threshold"] == 3
+    assert status["dropped_stale_rows"] == 0  # default merge="append" drops nothing
+
+
+async def test_status_queue_threshold_and_dropped_stale_rows_are_null_and_zero_for_sequential():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=3)
+    svc = _svc(deps=_deps(policy=policy, arm=arm))  # default mode="sequential"
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    await asyncio.sleep(0.1)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["queue_threshold"] is None
+    assert status["dropped_stale_rows"] == 0
+
+
+async def test_merge_config_is_plumbed_to_the_scheduler():
+    # Proves `_build_scheduler` forwards `merge=self._cfg.merge` specifically
+    # -- mutating that call to pass e.g. `self._cfg.mode` instead (also a
+    # string the AsyncScheduler constructor accepts without erroring) must
+    # fail this: `mode="async"` is not a valid `merge` choice, so it would
+    # silently fall back to whatever AsyncScheduler treats as not "aligned"
+    # (append), and dropped_stale_rows would stay 0.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=20, action_value=0.01)
+    policy.infer_delay_s = 0.05  # 5 ticks of latency at fps=100 below
+    svc = _svc(
+        config=_config(mode="async", merge="aligned", fps=100.0, queue_threshold=19),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    await asyncio.sleep(0.1)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["dropped_stale_rows"] > 0
 
 
 # ---------------------------------------------------------------------------

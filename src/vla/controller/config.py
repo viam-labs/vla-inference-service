@@ -50,6 +50,17 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `mode: "async"` overlaps execution with inference instead of stalling the arm
 between chunks -- for the case where inference latency approaches or exceeds
 chunk duration. `"sequential"` is the default. See `AsyncScheduler`.
+
+`merge: "aligned"` fixes the boundary yank that `mode: "async"`'s default
+`"append"` merge causes: a chunk predicted from an observation at time t0 has
+row i meaning "the pose at t0 + (i+1)/fps", but appending queues every row
+behind whatever is already queued, so by the time row 0 executes it describes
+a pose from the past and the arm gets pulled back to it. `"aligned"` drops the
+head rows whose moment has already passed before merging, so the queue only
+ever holds rows for the future. It requires `mode: "async"`: on the blocking
+scheduler, aligning would discard rows the loop just stalled to obtain,
+making the duty cycle worse, and `SequentialScheduler` does not track when
+its inference was fired anyway -- so `"append"` stays the default.
 """
 
 from __future__ import annotations
@@ -75,6 +86,7 @@ __all__ = [
     "SafetyConfig",
     "ControllerConfig",
     "MODES",
+    "MERGES",
     "ENCODINGS",
     "IMAGE_FITS",
     "DEFAULT_ARM_MOVE_EXTRA",
@@ -84,6 +96,7 @@ __all__ = [
 ]
 
 MODES = ("sequential", "async")
+MERGES = ("append", "aligned")
 ENCODINGS = ("jpeg", "png", "raw")
 
 # The two action spaces. `joints` is the original and the default: absolute
@@ -488,6 +501,7 @@ class ControllerConfig:
     task: str = ""
     fps: float = 10.0
     mode: str = "sequential"
+    merge: str = "append"
     queue_threshold: int | None = None
     actions_per_chunk: int | None = None
     starvation_grace_ticks: int = 3
@@ -570,6 +584,15 @@ class ControllerConfig:
                     f"expected {expected} (one per action dimension in degrees)"
                 )
 
+        mode = as_choice(raw.get("mode", "sequential"), "mode", MODES)
+        merge = as_choice(raw.get("merge", "append"), "merge", MERGES)
+        if merge == "aligned" and mode != "async":
+            raise ConfigError(
+                f"merge={merge!r} needs mode: \"async\" -- on the blocking scheduler, "
+                "aligning would discard rows the loop just stalled to obtain, making the "
+                "duty cycle worse, and it does not track when its inference was fired anyway"
+            )
+
         return ControllerConfig(
             policy_service=policy_service,
             arm=arm,
@@ -578,7 +601,8 @@ class ControllerConfig:
             gripper=gripper,
             task=as_str(raw.get("task", ""), "task"),
             fps=fps,
-            mode=as_choice(raw.get("mode", "sequential"), "mode", MODES),
+            mode=mode,
+            merge=merge,
             queue_threshold=(
                 as_int(raw["queue_threshold"], "queue_threshold", minimum=0)
                 if raw.get("queue_threshold") is not None

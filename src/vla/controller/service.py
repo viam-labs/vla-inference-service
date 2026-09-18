@@ -216,6 +216,7 @@ class VLAController(Generic, EasyResource):
 
     def _status(self) -> dict[str, Any]:
         avg = float(np.mean(self._latencies)) if self._latencies else 0.0
+        is_async = isinstance(self._scheduler, AsyncScheduler)
         return {
             "state": self._state,
             "mode": self._mode or (self._cfg.mode if self._cfg else ""),
@@ -231,6 +232,11 @@ class VLAController(Generic, EasyResource):
             # whole session, the same shape as clamp_counts, so an operator
             # can see the loop is quietly stalling without reading logs.
             "starved_ticks": self._starved_ticks,
+            # Only meaningful for AsyncScheduler; None/0 under sequential
+            # mode (or before a scheduler exists) rather than a stale or
+            # made-up number.
+            "queue_threshold": self._scheduler.queue_threshold if is_async else None,
+            "dropped_stale_rows": self._scheduler.dropped_stale_rows if is_async else 0,
             "last_error": self._last_error or "",
         }
 
@@ -333,7 +339,13 @@ class VLAController(Generic, EasyResource):
         limit = self._cfg.actions_per_chunk
         if mode == "async":
             threshold = self._resolve_queue_threshold()
-            return AsyncScheduler(lambda: self._infer(builder), threshold, self._cfg.fps, limit)
+            return AsyncScheduler(
+                lambda: self._infer(builder),
+                threshold,
+                self._cfg.fps,
+                limit,
+                merge=self._cfg.merge,
+            )
         return SequentialScheduler(lambda: self._infer(builder), limit)
 
     def _effective_chunk_len(self) -> int:
@@ -358,12 +370,16 @@ class VLAController(Generic, EasyResource):
         harmless in the fast-inference regime, where the queue never drains
         far enough for the threshold to bind.
 
-        Note this is a *staleness* ceiling as much as a starvation floor.
-        `ActionQueue` merges in append mode, so with threshold T the action
-        executing at any instant was inferred between T and T + chunk_len
-        ticks ago. Deriving from the truncated length is what keeps that
-        window narrow: at `actions_per_chunk=12` it is 11-23 ticks, where
-        the untruncated 50-step chunk gives 49-98.
+        Under `merge="append"` (the default) this is a *staleness* ceiling as
+        much as a starvation floor: `ActionQueue` merges every landing chunk
+        onto the tail, so with threshold T the action executing at any
+        instant was inferred between T and T + chunk_len ticks ago. Deriving
+        from the truncated length is what keeps that window narrow: at
+        `actions_per_chunk=12` it is 11-23 ticks, where the untruncated
+        50-step chunk gives 49-98. Under `merge="aligned"` that staleness
+        window collapses to zero by construction (stale head rows are
+        dropped, not queued), so there the threshold is a starvation floor
+        only.
         """
         configured = self._cfg.queue_threshold
         if configured is not None:
