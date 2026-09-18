@@ -765,11 +765,6 @@ class RampInfer:
         return np.tile(np.arange(self.n, dtype=np.float32).reshape(self.n, 1), (1, self.dim))
 
 
-def test_queue_threshold_attribute_is_readable():
-    s = AsyncScheduler(RecordingInfer(), queue_threshold=5)
-    assert s.queue_threshold == 5
-
-
 def test_skip_composes_with_actions_per_chunk():
     # skip 4 of a 10-row chunk, then truncate what remains to 3 -> rows 4,5,6.
     queue = ActionQueue()

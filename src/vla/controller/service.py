@@ -238,15 +238,11 @@ class VLAController(Generic, EasyResource):
             # whole session, the same shape as clamp_counts, so an operator
             # can see the loop is quietly stalling without reading logs.
             "starved_ticks": self._starved_ticks,
-            # Only meaningful for AsyncScheduler; None/0 under sequential
-            # mode (or before a scheduler exists) rather than a stale or
-            # made-up number.
+            # AsyncScheduler only; None/0 under sequential or before a scheduler exists.
             "queue_threshold": self._scheduler.queue_threshold if is_async else None,
             "dropped_stale_rows": self._scheduler.dropped_stale_rows if is_async else 0,
             "arm_write": self._cfg.arm_write if self._cfg else "",
-            # Live count while the stream is open; the count it ended on
-            # afterward -- self._stream is set to None on close, but the
-            # total it sent must still be readable from status.
+            # Live while the stream is open; the final total after it closes.
             "stream_points_sent": (
                 self._stream.points_sent if self._stream is not None else self._stream_points_sent
             ),
@@ -311,13 +307,9 @@ class VLAController(Generic, EasyResource):
             # is an inherited no-op, so this is a no-op for it.
             await self._scheduler.close()
         if self._stream is not None:
-            # Half-closes the batches iterator so the driver waits for
-            # motion to stop before the streamed RPC itself ends, same as
-            # the scheduler cleanup above: cancelling the loop task alone
-            # does not tear this down.
+            # Half-close so the driver waits for motion to stop; cancelling the
+            # loop task alone does not tear the stream down.
             await self._stream.close()
-            # Captured before self._stream goes to None: status must still
-            # report the total this run sent after the stream is gone.
             self._stream_points_sent = self._stream.points_sent
             self._stream = None
         await self._safe_stop_arm()
@@ -603,13 +595,8 @@ class VLAController(Generic, EasyResource):
             await self._preflight_gripper(gripper)
 
             if cfg.arm_write == "stream":
-                # `measured` is bound here: this branch is only reachable
-                # under action_space="joints" (config rejects arm_write=
-                # "stream" with "delta-ee"), so the `else` above always ran.
-                # `start()` opens the RPC but sends nothing and waits for
-                # nothing -- a driver without the streamed RPC is discovered
-                # by `_command_joints`'s `check()` on the first tick instead,
-                # before any motion, not here.
+                # `measured` is bound: config rejects "stream" with delta-ee. start()
+                # sends nothing; a driver without the RPC fails on tick one's check().
                 self._stream = ArmStream(
                     arm, fps=cfg.fps, stream_hz=cfg.stream_hz, extra=dict(cfg.arm_move_extra)
                 )
@@ -846,14 +833,9 @@ class VLAController(Generic, EasyResource):
         # cleared the action, so there is no "try again next tick" that
         # would be safe -- the arm itself is reporting the fault.
         #
-        # Under `arm_write: "setpoint"` (the default), `arm_move_extra` must
-        # make the driver return without waiting for the arm to physically
-        # settle: the next tick supersedes this setpoint, so a blocking
-        # driver spends the whole tick budget waiting for a target we are
-        # about to replace -- see `DEFAULT_ARM_MOVE_EXTRA` for why it takes
-        # three keys. Under `arm_write: "stream"`, `extra` rode along once
-        # when the stream opened, and this tick's target is densified into
-        # `stream_hz` interpolated servo setpoints instead.
+        # setpoint: `arm_move_extra` makes the driver return without waiting to
+        # settle, since the next tick supersedes this target (DEFAULT_ARM_MOVE_EXTRA).
+        # stream: `extra` went with the stream open; the target is densified.
         if self._stream is not None:
             self._stream.check()
             await self._stream.send(target)

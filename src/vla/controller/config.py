@@ -51,28 +51,16 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 between chunks -- for the case where inference latency approaches or exceeds
 chunk duration. `"sequential"` is the default. See `AsyncScheduler`.
 
-`merge: "aligned"` fixes the boundary yank that `mode: "async"`'s default
-`"append"` merge causes: a chunk predicted from an observation at time t0 has
-row i meaning "the pose at t0 + (i+1)/fps", but appending queues every row
-behind whatever is already queued, so by the time row 0 executes it describes
-a pose from the past and the arm gets pulled back to it. `"aligned"` drops the
-head rows whose moment has already passed before merging, so the queue only
-ever holds rows for the future. It requires `mode: "async"`: on the blocking
-scheduler, aligning would discard rows the loop just stalled to obtain,
-making the duty cycle worse, and `SequentialScheduler` does not track when
-its inference was fired anyway -- so `"append"` stays the default.
+`merge: "aligned"` drops the head rows of a landing chunk whose moment has
+already passed, so append mode's chunk-boundary yank disappears; it needs
+`mode: "async"` (the blocking scheduler just stalled for those rows and does not
+record when it fired). README: "merge: aligned".
 
-`arm_write: "stream"` feeds the xArm's servo mode at `stream_hz` instead of at
-`fps`: a single `move_to_joint_positions` per control tick is a single servo
-setpoint, and the arm snaps to it and holds for a whole tick (~33 ms at 30 Hz)
-before the next one lands, which UFactory's own guidance calls out as a
-visible buzz -- servo mode wants setpoints at ~100 Hz. `"setpoint"` (the
-default) is what every action space used before this option existed, and
-stays the default because a driver without
-`move_through_joint_positions_streamed` cannot take the streamed path at all.
-`stream_hz` is rounded to the nearest whole number of points per control tick
-(`round(stream_hz / fps)`), so the actual rate is that count times `fps`, not
-`stream_hz` itself -- 100 at `fps: 30` runs at 90 Hz.
+`arm_write: "stream"` densifies each tick's target into `round(stream_hz / fps)`
+servo setpoints over `move_through_joint_positions_streamed`; one setpoint per
+tick buzzes on the xArm. `"setpoint"` stays the default for drivers without the
+RPC. The real rate is `round(stream_hz / fps) * fps` (100 at 30 fps runs at 90 Hz).
+README: "Smooth servo streaming".
 """
 
 from __future__ import annotations
@@ -112,12 +100,8 @@ MODES = ("sequential", "async")
 MERGES = ("append", "aligned")
 ENCODINGS = ("jpeg", "png", "raw")
 
-# How each tick's joint target reaches the arm. "setpoint" (the default) is
-# one `move_to_joint_positions` per control tick -- what every action space
-# used before streaming existed, and the fallback for a driver without the
-# streamed RPC. "stream" densifies each tick into `stream_hz` interpolated
-# points sent over `move_through_joint_positions_streamed`; see [Smooth
-# servo streaming] in the README.
+# "setpoint": one move_to_joint_positions per tick. "stream": interpolated
+# points over move_through_joint_positions_streamed (README, Smooth servo streaming).
 ARM_WRITES = ("setpoint", "stream")
 
 # The two action spaces. `joints` is the original and the default: absolute

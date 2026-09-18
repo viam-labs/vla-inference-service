@@ -669,44 +669,32 @@ the stream opens, rather than on every tick.
 
 ### Smooth servo streaming (`arm_write: "stream"`)
 
-`arm_write: "setpoint"` (the default) sends one `move_to_joint_positions` per
-control tick — one servo setpoint every 33 ms at `fps: 30`. The xArm snaps to
-each one and holds it until the next lands, which is a visible buzz; UFactory's
-own guidance for servo mode wants setpoints at 100 Hz or more. The unary
-`move_to_joint_positions` RPC on `viam:ufactory:xarm` already interpolates a
-single target up to 100 Hz internally, but its streamed counterpart,
-`move_through_joint_positions_streamed`, sends each `TrajectoryPoint` verbatim
-at its stamped time with no interpolation of its own — so under
-`arm_write: "stream"` the controller does the densifying itself.
+`arm_write: "setpoint"` (the default) sends one `move_to_joint_positions` per control
+tick: one servo setpoint every 33 ms at `fps: 30`. The xArm snaps to each and holds it
+until the next lands, a visible buzz; UFactory's guidance for servo mode is 100 Hz or
+more. The driver's unary RPC interpolates a single target up to 100 Hz itself, but its
+streamed RPC, `move_through_joint_positions_streamed`, sends each `TrajectoryPoint`
+verbatim at its stamped time, so under `arm_write: "stream"` the controller densifies.
 
-What gets sent: `round(stream_hz / fps)` linearly interpolated points per
-control tick, each stamped on a clock anchored to the first tick's motion
-batch, with a one-tick lead ahead of when each point is due. The lead matters
-because a point that arrives at the driver past its stamped time is sent
-immediately — a stream where every point is already late collapses back into
-bursts at `fps`, not `stream_hz`. The rest point at `time=0` and the measured
-joints — required at the start of every trajectory — ships in that *same*
-first batch, alongside tick one's motion points, rather than on its own:
-which point a driver anchors its wall clock to at stream start is itself
-driver-version-dependent, so keeping both together keeps either anchor within
-one transport hop of the clock this controller stamps against.
+What gets sent: `round(stream_hz / fps)` linearly interpolated points per tick (100 at
+`fps: 30` rounds to 3 per tick, 90 Hz), stamped one tick ahead of when each is due. The
+lead matters because a point that arrives past its stamp is sent immediately, and a
+stream where every point is late collapses back into bursts at `fps`. The mandatory
+rest point at `time=0` ships in the *same* batch as tick one's motion points: which
+point a driver anchors its clock on is version-dependent, and keeping both together
+keeps either anchor within one transport hop of the controller's clock.
 
-Lifecycle: one stream per run. It opens in `start`, after every other
-pre-motion check, but nothing is sent until the first tick — a driver without
-the streamed RPC is refused on that first tick, before the arm has moved, the
-same discipline every other `_run()` check follows. `arm_move_extra` rides
-along once, as the stream's `extra`, rather than on every tick. `stop` (and
-any run-ending error) half-closes the stream, which is how the driver is told
-the trajectory is over — it waits for the arm to physically stop before the
-RPC itself ends.
+Lifecycle: one stream per run, opened in `start` after every other pre-motion check.
+Nothing is sent until the first tick, so a driver without the RPC is refused there,
+before the arm has moved. `arm_move_extra` goes once, as the stream's `extra`. `stop`
+and any run-ending error half-close the stream, and the driver waits for the arm to
+stop before the RPC ends.
 
-Requirements and fallback: this needs the git-pinned `viam-sdk` 0.81.0 this
-module already depends on, and an xArm module at or after `d83b4d9`
-(2026-09-15). `"setpoint"` stays the default and is the fallback for any
-driver without the streamed RPC. The per-tick safety clamp applies identically
-on both paths — every interpolated point lies between two already-clamped
-targets, so streaming changes how often a target is sent, not how far it is
-allowed to move.
+Requirements and fallback: the git-pinned `viam-sdk` 0.81.0 this module already
+depends on, and an xArm module at or after `d83b4d9` (2026-09-15). `"setpoint"` stays
+the default and the fallback. The per-tick safety clamp applies identically on both
+paths: every interpolated point lies between two already-clamped targets, so streaming
+changes how often a target is sent, not how far it may move.
 
 ### Full worked example
 

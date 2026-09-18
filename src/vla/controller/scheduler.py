@@ -294,15 +294,10 @@ class AsyncScheduler(ChunkScheduler):
             self._start_background_inference()
 
     def _start_background_inference(self) -> None:
-        # `fired_at` is when inference was REQUESTED, not when it lands, and
-        # not quite when the observation was taken either -- the `infer`
-        # callback (the controller wires it to read the camera first) grabs
-        # the frame after this point, so the true observation is slightly
-        # later than `fired_at`, and aligned merge's elapsed-time estimate is
-        # slightly too long, erring the skip one row conservative rather
-        # than short. Keeping the task on `self` is load-bearing, not
-        # defensive: asyncio holds only a weak reference, so a bare handle
-        # can be garbage-collected before it ever runs.
+        # `fired_at` is the request time; the camera frame is grabbed slightly
+        # after it, so the aligned skip errs one row conservative, never short.
+        # Keeping the task on `self` is load-bearing: asyncio holds only a weak
+        # reference, so a bare handle can be garbage-collected before it runs.
         fired_at = self._clock()
         self._inflight = asyncio.create_task(self._infer_and_merge(fired_at))
 
