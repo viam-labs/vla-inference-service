@@ -211,6 +211,43 @@ def test_rejects_aligned_merge_with_sequential_mode():
 
 
 # ---------------------------------------------------------------------------
+# arm_write / stream_hz
+# ---------------------------------------------------------------------------
+
+
+def test_arm_write_defaults_to_setpoint():
+    cfg = ControllerConfig.parse(BASE)
+    assert cfg.arm_write == "setpoint"
+    assert cfg.stream_hz == 100.0
+
+
+def test_arm_write_stream_accepted():
+    cfg = ControllerConfig.parse({**BASE, "arm_write": "stream", "fps": 30.0})
+    assert cfg.arm_write == "stream"
+
+
+def test_rejects_unknown_arm_write():
+    with pytest.raises(ConfigError, match="arm_write"):
+        ControllerConfig.parse({**BASE, "arm_write": "bogus"})
+
+
+def test_rejects_stream_hz_below_fps():
+    with pytest.raises(ConfigError, match="stream_hz"):
+        ControllerConfig.parse({**BASE, "arm_write": "stream", "fps": 30.0, "stream_hz": 20.0})
+
+
+def test_rejects_stream_arm_write_with_delta_ee():
+    with pytest.raises(ConfigError, match="arm_write"):
+        ControllerConfig.parse(
+            {
+                **{k: v for k, v in BASE.items() if k != "state_joint_indices"},
+                "action_space": "delta-ee",
+                "arm_write": "stream",
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
 # state_joint_indices
 # ---------------------------------------------------------------------------
 

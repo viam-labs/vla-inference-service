@@ -84,6 +84,7 @@ from .observation import ObservationBuilder, pose_state_from_proto
 from .pose import orientation_vector, state_compose, state_rotation
 from .safety import CartesianSafetyLayer, SafetyLayer
 from .scheduler import AsyncScheduler, ChunkScheduler, SequentialScheduler
+from .trajectory import ArmStream
 from .units import to_degrees, to_working
 
 LOGGER = logging.getLogger(__name__)
@@ -110,6 +111,8 @@ class VLAController(Generic, EasyResource):
         self._scheduler: ChunkScheduler | None = None
         self._mode: str | None = None
         self._stop_task: asyncio.Task | None = None
+        self._stream: ArmStream | None = None
+        self._stream_points_sent = 0
 
     @classmethod
     def new(cls, config: ServiceConfig, dependencies: Mapping[Any, ResourceBase]) -> Self:
@@ -141,6 +144,8 @@ class VLAController(Generic, EasyResource):
         self._specs = None
         self._mode = None
         self._scheduler = None
+        self._stream = None
+        self._stream_points_sent = 0
         self._safety = None
         self._latencies.clear()
         self._measured_fps = 0.0
@@ -238,6 +243,13 @@ class VLAController(Generic, EasyResource):
             # made-up number.
             "queue_threshold": self._scheduler.queue_threshold if is_async else None,
             "dropped_stale_rows": self._scheduler.dropped_stale_rows if is_async else 0,
+            "arm_write": self._cfg.arm_write if self._cfg else "",
+            # Live count while the stream is open; the count it ended on
+            # afterward -- self._stream is set to None on close, but the
+            # total it sent must still be readable from status.
+            "stream_points_sent": (
+                self._stream.points_sent if self._stream is not None else self._stream_points_sent
+            ),
             "last_error": self._last_error or "",
         }
 
@@ -256,6 +268,8 @@ class VLAController(Generic, EasyResource):
         self._specs = None
         self._mode = None
         self._scheduler = None
+        self._stream = None
+        self._stream_points_sent = 0
         self._safety = None
         self._latencies.clear()
         self._measured_fps = 0.0
@@ -296,6 +310,16 @@ class VLAController(Generic, EasyResource):
             # the controller reports stopped. SequentialScheduler's close()
             # is an inherited no-op, so this is a no-op for it.
             await self._scheduler.close()
+        if self._stream is not None:
+            # Half-closes the batches iterator so the driver waits for
+            # motion to stop before the streamed RPC itself ends, same as
+            # the scheduler cleanup above: cancelling the loop task alone
+            # does not tear this down.
+            await self._stream.close()
+            # Captured before self._stream goes to None: status must still
+            # report the total this run sent after the stream is gone.
+            self._stream_points_sent = self._stream.points_sent
+            self._stream = None
         await self._safe_stop_arm()
         if was_active and self._state != "error":
             self._state = "stopped"
@@ -578,6 +602,19 @@ class VLAController(Generic, EasyResource):
                 self._check_joint_indices(measured, gripper)
             await self._preflight_gripper(gripper)
 
+            if cfg.arm_write == "stream":
+                # `measured` is bound here: this branch is only reachable
+                # under action_space="joints" (config rejects arm_write=
+                # "stream" with "delta-ee"), so the `else` above always ran.
+                # `start()` opens the RPC but sends nothing and waits for
+                # nothing -- a driver without the streamed RPC is discovered
+                # by `_command_joints`'s `check()` on the first tick instead,
+                # before any motion, not here.
+                self._stream = ArmStream(
+                    arm, fps=cfg.fps, stream_hz=cfg.stream_hz, extra=dict(cfg.arm_move_extra)
+                )
+                await self._stream.start(measured)
+
             # Only cameras the policy actually asked for: a camera configured
             # but not among specs.image_feature_keys must never be read or
             # sent -- it has no entry in image_sizes, so ObservationBuilder
@@ -608,6 +645,10 @@ class VLAController(Generic, EasyResource):
             self._state = "error"
             self._last_error = str(exc)
             LOGGER.error("controller stopped: %s", exc)
+            if self._stream is not None:
+                await self._stream.close()
+                self._stream_points_sent = self._stream.points_sent
+                self._stream = None
             await self._safe_stop_arm()
 
     async def _infer(self, builder: ObservationBuilder) -> np.ndarray:
@@ -805,14 +846,21 @@ class VLAController(Generic, EasyResource):
         # cleared the action, so there is no "try again next tick" that
         # would be safe -- the arm itself is reporting the fault.
         #
-        # `arm_move_extra` must make the driver return without waiting for
-        # the arm to physically settle: the next tick supersedes this
-        # setpoint, so a blocking driver spends the whole tick budget
-        # waiting for a target we are about to replace. See
-        # `DEFAULT_ARM_MOVE_EXTRA` for why it takes three keys.
-        await arm.move_to_joint_positions(
-            JointPositions(values=target), extra=dict(cfg.arm_move_extra)
-        )
+        # Under `arm_write: "setpoint"` (the default), `arm_move_extra` must
+        # make the driver return without waiting for the arm to physically
+        # settle: the next tick supersedes this setpoint, so a blocking
+        # driver spends the whole tick budget waiting for a target we are
+        # about to replace -- see `DEFAULT_ARM_MOVE_EXTRA` for why it takes
+        # three keys. Under `arm_write: "stream"`, `extra` rode along once
+        # when the stream opened, and this tick's target is densified into
+        # `stream_hz` interpolated servo setpoints instead.
+        if self._stream is not None:
+            self._stream.check()
+            await self._stream.send(target)
+        else:
+            await arm.move_to_joint_positions(
+                JointPositions(values=target), extra=dict(cfg.arm_move_extra)
+            )
         if gripper.has_normalized_tail:
             await gripper.write(float(safe[-1]))
 

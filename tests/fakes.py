@@ -54,6 +54,7 @@ class FakeArm:
     """
 
     def __init__(self, positions=None, pose=None):
+        self.name = "arm"
         self.positions = list(positions or [0.0] * 6)
         self.moves = []
         self.move_extras = []
@@ -64,6 +65,7 @@ class FakeArm:
         self.pose_move_extras = []
         self.fail_next_pose_move = False
         self.stream_points = []
+        self.stream_batches = []
         self.stream_extra = None
         self.stream_closed = False
         self.fail_stream_after_points = None
@@ -117,6 +119,7 @@ class FakeArm:
         # setpoint, and a non-increasing or repeated timestamp is a caller bug.
         self.stream_extra = extra
         async for batch in batches:
+            self.stream_batches.append(list(batch))
             for point in batch:
                 index = len(self.stream_points)
                 if index == 0:

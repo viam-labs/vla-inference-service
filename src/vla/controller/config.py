@@ -61,6 +61,18 @@ ever holds rows for the future. It requires `mode: "async"`: on the blocking
 scheduler, aligning would discard rows the loop just stalled to obtain,
 making the duty cycle worse, and `SequentialScheduler` does not track when
 its inference was fired anyway -- so `"append"` stays the default.
+
+`arm_write: "stream"` feeds the xArm's servo mode at `stream_hz` instead of at
+`fps`: a single `move_to_joint_positions` per control tick is a single servo
+setpoint, and the arm snaps to it and holds for a whole tick (~33 ms at 30 Hz)
+before the next one lands, which UFactory's own guidance calls out as a
+visible buzz -- servo mode wants setpoints at ~100 Hz. `"setpoint"` (the
+default) is what every action space used before this option existed, and
+stays the default because a driver without
+`move_through_joint_positions_streamed` cannot take the streamed path at all.
+`stream_hz` is rounded to the nearest whole number of points per control tick
+(`round(stream_hz / fps)`), so the actual rate is that count times `fps`, not
+`stream_hz` itself -- 100 at `fps: 30` runs at 90 Hz.
 """
 
 from __future__ import annotations
@@ -93,11 +105,20 @@ __all__ = [
     "ACTION_SPACES",
     "JOINTS",
     "DELTA_EE",
+    "ARM_WRITES",
 ]
 
 MODES = ("sequential", "async")
 MERGES = ("append", "aligned")
 ENCODINGS = ("jpeg", "png", "raw")
+
+# How each tick's joint target reaches the arm. "setpoint" (the default) is
+# one `move_to_joint_positions` per control tick -- what every action space
+# used before streaming existed, and the fallback for a driver without the
+# streamed RPC. "stream" densifies each tick into `stream_hz` interpolated
+# points sent over `move_through_joint_positions_streamed`; see [Smooth
+# servo streaming] in the README.
+ARM_WRITES = ("setpoint", "stream")
 
 # The two action spaces. `joints` is the original and the default: absolute
 # joint angles in degrees, written with `move_to_joint_positions`. `delta-ee`
@@ -518,6 +539,8 @@ class ControllerConfig:
         default_factory=lambda: dict(DEFAULT_ARM_MOVE_EXTRA)
     )
     action_space: str = JOINTS
+    arm_write: str = "setpoint"
+    stream_hz: float = 100.0
     # Operator-configurable rather than fixed module defaults: a checkpoint
     # run at 2 Hz and one at 10 Hz imply very different "this tick is late"
     # and "this frame is stale" thresholds. Defaults match observation.py's
@@ -593,6 +616,20 @@ class ControllerConfig:
                 "duty cycle worse, and it does not track when its inference was fired anyway"
             )
 
+        arm_write = as_choice(raw.get("arm_write", "setpoint"), "arm_write", ARM_WRITES)
+        stream_hz = as_float(raw.get("stream_hz", 100.0), "stream_hz", minimum=1.0, maximum=1000.0)
+        if arm_write == "stream":
+            if stream_hz < fps:
+                raise ConfigError(
+                    f"stream_hz={stream_hz} is below fps={fps}: interpolation needs at "
+                    "least one point per tick"
+                )
+            if delta_ee:
+                raise ConfigError(
+                    f'arm_write="stream" does not apply to action_space={DELTA_EE!r}: the '
+                    "pose path writes with move_to_position"
+                )
+
         return ControllerConfig(
             policy_service=policy_service,
             arm=arm,
@@ -653,6 +690,8 @@ class ControllerConfig:
                 raw.get("image_fit", _default_image_fit(action_space)), "image_fit", IMAGE_FITS
             ),
             action_space=action_space,
+            arm_write=arm_write,
+            stream_hz=stream_hz,
             arm_move_extra=_parse_arm_move_extra(raw.get("arm_move_extra")),
             duration_warn_s=as_float(
                 raw.get("duration_warn_s", DEFAULT_DURATION_WARN_S), "duration_warn_s", minimum=0.0

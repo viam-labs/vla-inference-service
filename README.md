@@ -328,6 +328,8 @@ backoff for up to `policy_ready_timeout_s`.
 | `jpeg_quality` | integer, 0–100 | `90` | |
 | `image_fit` | `pad` \| `stretch_bicubic` | `"pad"`, or `"stretch_bicubic"` under `delta-ee` | How a camera frame is resized onto the wire `(h, w)` — `specs.preprocess_image_size` when the policy reports one, else the checkpoint's declared shape — whenever the frame's shape differs from it. See below. |
 | `arm_move_extra` | object | `{"wait": false, "waitAtEnd": false, "interpolate": false}` | The `extra` struct sent with every `move_to_joint_positions`. Replaces the default wholesale; `{}` sends nothing. See [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle). |
+| `arm_write` | `setpoint` \| `stream` | `"setpoint"` | `joints` only. `"stream"` feeds the arm's servo mode at `stream_hz` instead of one setpoint per tick — see [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
+| `stream_hz` | number | `100.0` | `arm_write: "stream"` only. Must be ≥ `fps` — interpolation needs at least one point per tick. Rounded to a whole number of points per tick, so the actual rate is that count × `fps`, not `stream_hz` itself — `100` at `fps: 30` runs at 90 Hz. |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
 | `safety.max_joint_delta_degs` | number | `8.0` | `joints` only. Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
@@ -521,6 +523,8 @@ The one command to watch while a loop runs.
   "starved_ticks": 0,
   "queue_threshold": null,
   "dropped_stale_rows": 0,
+  "arm_write": "setpoint",
+  "stream_points_sent": 0,
   "last_error": ""
 }
 ```
@@ -547,6 +551,12 @@ What to read it for:
   [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then).
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
+- `arm_write` — `"setpoint"` or `"stream"`, echoing the configured value.
+- `stream_points_sent` — cumulative `TrajectoryPoint`s sent under `arm_write: "stream"`;
+  always `0` under `"setpoint"`. The first tick sends the rest point and its motion batch
+  together, so this jumps straight from `0` to `1 + n` — a value stuck at `0` while `state`
+  is `"running"` means the stream opened but no tick has sent a batch yet — see
+  [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream).
 
 ### Gripper variants
 
@@ -654,7 +664,49 @@ would silently keep the arm blocking.
 
 Note this is the *arm* channel only. The gripper's equivalent is opt-in: set
 `write_args: {"wait": false}` on a `do_command` block, as the so-101 example
-above does.
+above does. Under `arm_write: "stream"`, the same `extra` is passed once, when
+the stream opens, rather than on every tick.
+
+### Smooth servo streaming (`arm_write: "stream"`)
+
+`arm_write: "setpoint"` (the default) sends one `move_to_joint_positions` per
+control tick — one servo setpoint every 33 ms at `fps: 30`. The xArm snaps to
+each one and holds it until the next lands, which is a visible buzz; UFactory's
+own guidance for servo mode wants setpoints at 100 Hz or more. The unary
+`move_to_joint_positions` RPC on `viam:ufactory:xarm` already interpolates a
+single target up to 100 Hz internally, but its streamed counterpart,
+`move_through_joint_positions_streamed`, sends each `TrajectoryPoint` verbatim
+at its stamped time with no interpolation of its own — so under
+`arm_write: "stream"` the controller does the densifying itself.
+
+What gets sent: `round(stream_hz / fps)` linearly interpolated points per
+control tick, each stamped on a clock anchored to the first tick's motion
+batch, with a one-tick lead ahead of when each point is due. The lead matters
+because a point that arrives at the driver past its stamped time is sent
+immediately — a stream where every point is already late collapses back into
+bursts at `fps`, not `stream_hz`. The rest point at `time=0` and the measured
+joints — required at the start of every trajectory — ships in that *same*
+first batch, alongside tick one's motion points, rather than on its own:
+which point a driver anchors its wall clock to at stream start is itself
+driver-version-dependent, so keeping both together keeps either anchor within
+one transport hop of the clock this controller stamps against.
+
+Lifecycle: one stream per run. It opens in `start`, after every other
+pre-motion check, but nothing is sent until the first tick — a driver without
+the streamed RPC is refused on that first tick, before the arm has moved, the
+same discipline every other `_run()` check follows. `arm_move_extra` rides
+along once, as the stream's `extra`, rather than on every tick. `stop` (and
+any run-ending error) half-closes the stream, which is how the driver is told
+the trajectory is over — it waits for the arm to physically stop before the
+RPC itself ends.
+
+Requirements and fallback: this needs the git-pinned `viam-sdk` 0.81.0 this
+module already depends on, and an xArm module at or after `d83b4d9`
+(2026-09-15). `"setpoint"` stays the default and is the fallback for any
+driver without the streamed RPC. The per-tick safety clamp applies identically
+on both paths — every interpolated point lies between two already-clamped
+targets, so streaming changes how often a target is sent, not how far it is
+allowed to move.
 
 ### Full worked example
 

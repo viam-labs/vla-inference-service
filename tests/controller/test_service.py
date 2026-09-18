@@ -34,9 +34,12 @@ from tests.fakes import (
     PoselessArm,
     RefusingArm,
     StalledArm,
+    UnstreamableArm,
     default_pose,
 )
+from vla.controller.config import DEFAULT_ARM_MOVE_EXTRA
 from vla.controller.service import VLAController
+from vla.controller.trajectory import interpolate
 from tests.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
 from vla.wire import decode_image, encode_matrix
@@ -1356,6 +1359,8 @@ async def test_status_reports_every_documented_field():
         "starved_ticks",
         "queue_threshold",
         "dropped_stale_rows",
+        "arm_write",
+        "stream_points_sent",
         "last_error",
     ):
         assert key in status, f"missing status field: {key}"
@@ -2550,3 +2555,163 @@ async def test_the_startup_log_states_the_implied_tool_speed_and_the_joint_limit
     messages = [rec.getMessage() for rec in caplog.records]
     assert any("400.0000 mm/s" in m for m in messages)
     assert any("arm driver" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# arm_write: "stream"
+# ---------------------------------------------------------------------------
+
+
+def _stream_config(**overrides):
+    return _config(
+        fps=30.0,
+        arm_write="stream",
+        stream_hz=90.0,
+        safety={"max_start_delta_degs": 1000.0, "max_vel_degs_per_sec": 3000.0},
+        **overrides,
+    )
+
+
+class _IncrementingPolicy(FakePolicyClient):
+    """A new, larger `action_value` on every `infer()` call.
+
+    A constant action would clamp to the same target every tick here: under
+    `arm_write: "stream"` the arm's measured position never changes (that
+    path never calls `move_to_joint_positions`), so the safety clamp -- which
+    measures against the *measured* position -- would recompute the identical
+    target each time. Driving genuinely distinct, increasing targets is what
+    makes the chaining assertion below actually exercise the interpolation
+    math instead of trivially matching a value that never moved.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._ticks = 0
+
+    async def do_command(self, command, **kwargs):
+        if command.get("command") == "infer":
+            self._ticks += 1
+            self.action_value = float(self._ticks)
+        return await super().do_command(command, **kwargs)
+
+
+async def test_stream_mode_sends_a_rest_point_then_densified_ticks():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = _IncrementingPolicy(n=1)  # one action per chunk: infer() every tick
+    svc = _svc(config=_stream_config(), deps=_deps(policy=policy, arm=arm))
+    n = round(90.0 / 30.0)
+
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.stream_points) >= 1 + 3 * n, "at least 3 ticks streamed")
+    await svc.do_command({"command": "stop"})
+
+    points = arm.stream_points
+    assert points[0].time.total_seconds() == 0.0
+    assert points[0].positions == [0.0] * 6
+    assert len(points) > 1
+    assert (len(points) - 1) % n == 0
+
+    times = [p.time for p in points]
+    assert all(a < b for a, b in zip(times, times[1:]))
+
+    groups = [points[1 + i * n : 1 + (i + 1) * n] for i in range((len(points) - 1) // n)]
+    for prev_group, next_group in zip(groups, groups[1:]):
+        prev_target = prev_group[-1].positions
+        next_target = next_group[-1].positions
+        assert prev_target != next_target, "the policy must actually move between ticks"
+        # The chaining assertion that matters: this group's points must be
+        # exactly `interpolate(prev_target, next_target, n)` -- i.e. the
+        # prior group's last (clamped) target really is the `prev` this
+        # group interpolated from, not some stale or frozen value.
+        assert [p.positions for p in next_group] == interpolate(prev_target, next_target, n)
+        # Monotone within the group: every joint moves in one direction.
+        for j in range(len(next_target)):
+            column = [p.positions[j] for p in next_group]
+            assert column == sorted(column) or column == sorted(column, reverse=True)
+
+    assert arm.stream_extra == dict(DEFAULT_ARM_MOVE_EXTRA)
+    assert arm.moves == []
+
+
+async def test_stream_mode_stop_closes_the_stream_and_stops_the_arm():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=1.0, n=4)
+    svc = _svc(config=_stream_config(), deps=_deps(policy=policy, arm=arm))
+
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.stream_points) > 1, "at least one streamed tick")
+    status = await svc.do_command({"command": "status"})
+    assert status["arm_write"] == "stream"
+    assert status["stream_points_sent"] > 1
+
+    await svc.do_command({"command": "stop"})
+    assert arm.stream_closed is True
+    assert arm.stopped >= 1
+    # The count must survive the stream being torn down and self._stream
+    # going to None -- persisted in self._stream_points_sent.
+    assert (await svc.do_command({"command": "status"}))["stream_points_sent"] > 1
+
+
+async def test_stream_mode_unstreamable_arm_refuses_before_motion():
+    """The RPC is rejected before `check()` ever gets to `send()`: no rest
+    point, no motion point, nothing reaches the arm."""
+    arm = UnstreamableArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=1.0, n=4)
+    svc = _svc(config=_stream_config(), deps=_deps(policy=policy, arm=arm))
+
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "arm_write" in status["last_error"]
+    assert arm.stream_points == []
+    assert arm.stopped >= 1
+
+
+async def test_stream_mode_arm_fault_mid_trajectory_halts_and_stops_arm():
+    arm = FakeArm(positions=[0.0] * 6)
+    arm.fail_stream_after_points = 3
+    policy = FakePolicyClient(action_value=1.0, n=4)
+    svc = _svc(config=_stream_config(), deps=_deps(policy=policy, arm=arm))
+
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "arm fault" in status["last_error"]
+    assert arm.stopped >= 1
+
+
+class _NeverDrainsArm(FakeArm):
+    """Accepts the streamed RPC but never reads a batch off it -- a driver
+    or transport that has stalled, as opposed to an outright refusal."""
+
+    async def move_through_joint_positions_streamed(self, batches, *, extra=None, timeout=None, **kwargs):
+        self.stream_extra = extra
+        await asyncio.Event().wait()
+        yield  # pragma: no cover -- makes this an async generator
+
+
+async def test_stream_mode_stalled_driver_surfaces_as_a_tick_failure():
+    arm = _NeverDrainsArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=1.0, n=4)
+    svc = _svc(config=_stream_config(), deps=_deps(policy=policy, arm=arm))
+
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=5.0)
+    assert "not draining" in status["last_error"]
+    assert arm.stopped >= 1
+
+
+async def test_setpoint_mode_never_touches_the_streamed_path():
+    extras = await _extras_from_a_run()
+    assert extras  # sanity: the run actually commanded the arm
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(config=_config(), deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await svc.do_command({"command": "stop"})
+    assert arm.stream_points == []
+
+
+async def test_status_reports_setpoint_arm_write_and_zero_points_sent():
+    svc = _svc()
+    status = await svc.do_command({"command": "status"})
+    assert status["arm_write"] == "setpoint"
+    assert status["stream_points_sent"] == 0
