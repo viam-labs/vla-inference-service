@@ -40,9 +40,7 @@ class PolicySpecs:
     # pixels the weights were fitted on -- so this is the size a caller
     # should put on the wire.
     preprocess_image_size: list[int] | None
-    # Flow-matching / denoising steps the loaded policy will run per chunk,
-    # after any `num_steps` config override; None for a policy type that has
-    # no such setting. The dominant tunable term in inference latency.
+    # Denoising steps in force (after any override); None if the policy type has none.
     num_steps: int | None
     supports_rtc: bool
     rtc_enabled: bool

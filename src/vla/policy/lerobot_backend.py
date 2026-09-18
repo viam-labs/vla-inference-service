@@ -145,14 +145,8 @@ class LeRobotBackend:
 
     @staticmethod
     def _apply_num_steps(cfg, num_steps: int | None) -> None:
-        """Override the checkpoint's step count before the policy is built.
-
-        Set on the config rather than the policy because `from_pretrained`
-        takes the config and the policy reads `config.num_steps` on every
-        `predict_action_chunk`. Refused, not ignored, for a policy type that
-        has no such attribute: an inert latency knob would send an operator
-        chasing a speedup that never comes.
-        """
+        """Write the override onto the config before the policy is built; refuse a
+        type that has no such setting rather than ship an inert latency knob."""
         if num_steps is None:
             return
         if not hasattr(cfg, "num_steps"):
@@ -259,7 +253,7 @@ class LeRobotBackend:
             image_feature_keys=image_keys,
             declared_image_feature_keys=declared_image_keys,
             preprocess_image_size=self._preprocess_image_size(cfg),
-            num_steps=(int(cfg.num_steps) if getattr(cfg, "num_steps", None) is not None else None),
+            num_steps=getattr(cfg, "num_steps", None),
             supports_rtc=supports_rtc,
             rtc_enabled=self._rtc_enabled,
             relative_actions=self._detect_relative_actions(preprocessor),

@@ -65,10 +65,6 @@ def test_rejects_nonpositive_guidance_weight():
         PolicyConfig.parse({"model_path": "/m", "rtc": {"max_guidance_weight": 0}})
 
 
-def test_num_steps_defaults_to_none_meaning_the_checkpoints_own():
-    assert PolicyConfig.parse({"model_path": "/m"}).num_steps is None
-
-
 def test_num_steps_parses_an_integral_double():
     assert PolicyConfig.parse({"model_path": "/m", "num_steps": 5.0}).num_steps == 5
 

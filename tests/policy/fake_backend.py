@@ -67,7 +67,6 @@ class FakePolicyBackend:
         unused_image_features: frozenset[str] = frozenset(),
         num_steps: int | None = None,
     ) -> None:
-        self.num_steps = num_steps
         h, w = self._image_size
         input_features: dict[str, list[int]] = {key: [3, h, w] for key in self._camera_keys}
         input_features["observation.state"] = [self._state_dim]

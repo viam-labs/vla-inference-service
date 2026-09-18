@@ -77,11 +77,7 @@ class PolicyConfig:
     device: str = "auto"
     dtype: str = "auto"
     warmup_inferences: int = 2
-    # Overrides the checkpoint's own flow-matching / denoising step count
-    # (smolvla `num_steps`, default 10). Inference latency scales roughly
-    # linearly with it, and latency is what decides whether a chunk can be
-    # executed time-aligned or must be replayed stale (see the README's
-    # Performance section). None keeps the checkpoint's value.
+    # smolvla flow-matching steps; None keeps the checkpoint's. See README, Performance.
     num_steps: int | None = None
     # Bounds the whole resolve + load + warmup sequence so a hung download
     # transitions to "failed" with an actionable message instead of sitting
