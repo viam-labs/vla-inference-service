@@ -5,7 +5,9 @@ description = "Run pre-trained LeRobot VLA policies on Viam machines"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "viam-sdk>=0.80.0",
+    # Pinned to main for `Arm.move_through_joint_positions_streamed`, absent from
+    # every PyPI release as of 0.80.0; move back to a version bound once a release ships it.
+    "viam-sdk @ git+https://github.com/viamrobotics/viam-python-sdk@4ba5f2a1021353d253cc89cb86268273838af346",
     "numpy>=2.0.0,<2.3.0",
     "pillow>=10.0.0",
     # Rotation algebra for action_space="delta-ee" (src/vla/controller/pose.py).

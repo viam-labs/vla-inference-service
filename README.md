@@ -775,11 +775,13 @@ Applied to every action, in this fixed order, before it reaches the arm:
    `len(joint_limits_degs) == len(state_joint_indices) + (1 if gripper.type == "arm_joint" else 0)`.
    When absent, this layer is skipped and a warning is logged once at start, naming the
    arm driver as the sole limit authority.
-5. **There is no driver-side kinematic ceiling.** `move_through_joint_positions` and
-   `MoveOptions` — which would carry velocity/acceleration/TCP-speed limits — ship in no
-   released `viam-sdk` (installed 0.80.0, the latest on PyPI, has only
-   `move_to_joint_positions`, which takes no options). The velocity bound is instead
-   enforced entirely by layer 3:
+5. **There is no driver-side kinematic ceiling.** The calls that would carry one —
+   `move_through_joint_positions` (via `MoveOptions`) and
+   `move_through_joint_positions_streamed` (via each `TrajectoryPoint`'s
+   `KinematicConstraints`) — ship in no released `viam-sdk` (latest on PyPI is 0.80.0), so
+   this module pins `viam-sdk` to a git commit of `main` (0.81.0) that has them. The pin
+   makes those calls reachable; it does not set any constraint, so the velocity bound is
+   still enforced entirely by layer 3:
 
    ```
    max_joint_delta_degs = max_vel_degs_per_sec / fps
@@ -790,10 +792,8 @@ Applied to every action, in this fixed order, before it reaches the arm:
    implies at `reconfigure()` time. If both `max_vel_degs_per_sec` and
    `max_joint_delta_degs` are configured, they must agree (within floating-point
    tolerance) or configuration fails — silently preferring one over a contradictory
-   other would hide an operator mistake instead of surfacing it. Acceleration and
-   TCP-speed limiting are unavailable until the SDK ships the newer call;
-   `safety.max_start_delta_degs` covers the large-initial-jump case those would
-   otherwise soften.
+   other would hide an operator mistake instead of surfacing it. `safety.max_start_delta_degs`
+   covers the large-initial-jump case a driver-side kinematic ceiling would otherwise soften.
 6. **Every clamp is logged and counted**, split by layer, in `status.clamp_counts`
    (`delta` / `limit` / `gripper`). **Persistent clamping is the single most likely
    sign of wrong units or wrong joint order** — it is deliberately loud rather than
@@ -1032,10 +1032,13 @@ Rules for setting it:
   prefix would need re-anchoring against the cached raw state that this module does not
   yet implement, and applying guidance in the wrong coordinate frame would produce
   plausible-looking but wrong motion. Sequential mode is unaffected.
-- **No driver-side velocity/acceleration ceilings.** `move_through_joint_positions` (the
-  only method that consumes `MoveOptions`) ships in no released `viam-sdk`. The velocity
-  bound lives entirely in the safety layer's delta clamp (see [Safety](#safety)); acceleration and
-  TCP-speed limiting have no enforcement path at all right now.
+- **No driver-side velocity/acceleration ceilings.** The calls that would carry one —
+  `move_through_joint_positions` (via `MoveOptions`) and `move_through_joint_positions_streamed`
+  (via each `TrajectoryPoint`'s `KinematicConstraints`) — ship in no released `viam-sdk`
+  (latest on PyPI is 0.80.0), so this module pins `viam-sdk` to a git commit of `main`
+  (0.81.0) that has them. The pin makes those calls reachable; it does not set any
+  constraint, so the velocity bound still lives entirely in the safety layer's per-tick
+  clamp (see [Safety](#safety)).
 - **`dtype` is parsed and validated but not applied.** Casting weights with
   `policy.to(dtype=...)` breaks inference on at least one target (the deserialized
   `DeviceProcessorStep` has `float_dtype=None` and keeps emitting float32 regardless).
@@ -1050,6 +1053,20 @@ mise run test        # fast suite: no torch, no network, seconds
 mise run test-all     # everything, including integration/differential (needs the lerobot extra)
 uv sync --extra lerobot  # required once before test-all, or before running integration/differential directly
 ```
+
+The git-pinned `viam-sdk` (see [Safety](#safety) item 5) installs without `libviam_rust_utils`,
+the native library the PyPI wheel bundles. `action_space: "joints"` never touches it. But
+`action_space: "delta-ee"` does, independently of networking: `pose.py`'s `orientation_vector`
+goes through `viam.spatialmath`'s quaternion conversion, which lazily loads that library on
+first use — so `mise run test` will fail under delta-ee coverage without it, not just
+`tools/replay_eval.py`, which dials a robot over WebRTC and needs it for that. Either way, fetch
+it into the venv `viam-sdk` installed into: download `libviam_rust_utils-<arch>.<ext>` for your
+platform from the `viamrobotics/rust-utils` GitHub releases page into
+`.venv/lib/python3.12/site-packages/viam/rpc/`, renamed to `libviam_rust_utils.<ext>`. Use the
+arch/ext names the SDK's own `.github/workflows/build-wheels.yml` uses (for example
+`macosx_arm64.dylib`, `macosx_x86_64.dylib`, `linux_x86_64.so`, `linux_aarch64.so`). On the
+robot, `setup.sh` does this download itself, so this manual step is only needed on a dev
+machine.
 
 ### Validating a checkpoint — `tools/replay_eval.py`
 

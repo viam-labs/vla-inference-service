@@ -9,7 +9,12 @@ should have caught it.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import numpy as np
+from grpclib.const import Status
+from grpclib.exceptions import GRPCError
+from viam.components.arm import Arm
 
 
 def default_pose(x=305.4, y=-12.75, z=231.9, o_x=0.0139, o_y=-0.0271, o_z=-0.9995, theta=41.7):
@@ -27,15 +32,18 @@ def default_pose(x=305.4, y=-12.75, z=231.9, o_x=0.0139, o_y=-0.0271, o_z=-0.999
 
 
 class FakeArm:
-    """Duck-types `viam.components.arm.Arm` as it exists in the INSTALLED SDK.
+    """Duck-types `viam.components.arm.Arm` as the controller actually calls it.
 
-    The installed viam-sdk 0.80.0 -- the latest on PyPI -- exposes only
-    `get_joint_positions`, `move_to_joint_positions`, `get_end_position`,
-    `move_to_position`, `stop`, and `get_kinematics`. It has NO
-    `move_through_joint_positions`, and `MoveOptions` is a generated proto type
-    that no method consumes; both exist only in the unreleased dev checkout.
-    This fake deliberately omits them, so a caller that reaches for the newer
-    API fails here rather than on a robot.
+    No released viam-sdk ships `move_through_joint_positions_streamed`; this
+    module pins `viam-sdk` to a git commit of `main` (0.81.0) that has it, and
+    this fake implements it (see below) so tests can exercise the streamed
+    path. It exposes `get_joint_positions`, `move_to_joint_positions`,
+    `get_end_position`, `move_to_position`, `stop`, `get_kinematics`, and
+    `move_through_joint_positions_streamed` -- every call the controller
+    actually uses. It deliberately omits the non-streamed
+    `move_through_joint_positions` because the controller never calls it, not
+    because the installed SDK lacks it, so a caller that reaches for it fails
+    here rather than on a robot.
 
     The pose half backs `action_space="delta-ee"`. `move_to_position` snaps the
     reported pose to whatever was commanded, mirroring how
@@ -55,6 +63,10 @@ class FakeArm:
         self.pose_moves = []
         self.pose_move_extras = []
         self.fail_next_pose_move = False
+        self.stream_points = []
+        self.stream_extra = None
+        self.stream_closed = False
+        self.fail_stream_after_points = None
 
     async def get_end_position(self, **kwargs):
         return self.pose
@@ -95,6 +107,31 @@ class FakeArm:
 
     async def stop(self, **kwargs):
         self.stopped += 1
+
+    async def move_through_joint_positions_streamed(self, batches, *, extra=None, timeout=None, **kwargs):
+        # Asserts the SDK's two stated invariants on every point received, so
+        # any Task 2b stream test exercises the timestamping: the first point
+        # in the whole stream is at t=0, and every point after it (including
+        # across a batch boundary) is stamped strictly later than the one
+        # before it -- the driver sends each as an absolute-time servo
+        # setpoint, and a non-increasing or repeated timestamp is a caller bug.
+        self.stream_extra = extra
+        async for batch in batches:
+            for point in batch:
+                index = len(self.stream_points)
+                if index == 0:
+                    if point.time != timedelta(0):
+                        raise AssertionError(f"point 0 must have time=timedelta(0), got {point.time!r}")
+                elif point.time <= self.stream_points[-1].time:
+                    raise AssertionError(
+                        f"point {index} has time={point.time!r}, not strictly greater than "
+                        f"point {index - 1}'s time={self.stream_points[-1].time!r}"
+                    )
+                self.stream_points.append(point)
+            if self.fail_stream_after_points is not None and len(self.stream_points) >= self.fail_stream_after_points:
+                raise GRPCError(Status.ABORTED, "arm fault")
+            yield Arm.TrajectoryUpdate()
+        self.stream_closed = True
 
 
 class StalledArm(FakeArm):
@@ -148,6 +185,20 @@ class RefusingArm(FakeArm):
         self.refusals += 1
         raise RuntimeError("cannot plan to the requested pose: target unreachable")
 
+
+class UnstreamableArm(FakeArm):
+    """An arm whose driver does not implement the streaming RPC.
+
+    This is what the real client raises for a driver that has not implemented
+    `MoveThroughJointPositionsStreamed`: a `grpclib` `GRPCError` with
+    `Status.UNIMPLEMENTED`, raised before any batch is consumed. Still an
+    async generator (the `yield` below is unreachable) so it can be iterated
+    the same way a working stream would be.
+    """
+
+    async def move_through_joint_positions_streamed(self, batches, *, extra=None, timeout=None, **kwargs):
+        raise GRPCError(Status.UNIMPLEMENTED, "unimplemented")
+        yield  # pragma: no cover -- makes this an async generator
 
 
 class FakeCamera:

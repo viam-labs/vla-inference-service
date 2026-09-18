@@ -6,9 +6,10 @@ caller only ever needs `except ConfigError` to cover every rejection path
 here (and in `vla.policy.config`).
 
 `MoveOptions`-derived fields (`max_acc_degs_per_sec2`,
-`max_tcp_speed_m_per_sec`) do not exist in this config: `move_through_joint_
-positions`/`MoveOptions` ship in no released viam-sdk (installed 0.80.0 has
-only `move_to_joint_positions`), so those fields had no enforcement path and
+`max_tcp_speed_m_per_sec`) do not exist in this config: no released viam-sdk
+ships `move_through_joint_positions`/`MoveOptions` (this module pins
+`viam-sdk` to a git commit of `main`, 0.81.0, that has them, but nothing in
+this config consumes them yet), so those fields had no enforcement path and
 were dropped rather than kept as knobs that silently do nothing.
 `max_vel_degs_per_sec` is the one that survives, because the safety layer's
 existing `max_joint_delta_degs` per-tick clamp is directly derivable from it
@@ -72,10 +73,11 @@ def test_default_safety_config():
 
 
 def test_removed_move_options_fields_do_not_exist():
-    # These knobs have no enforcement path on any released viam-sdk
-    # (move_through_joint_positions / MoveOptions ship in none) -- a silent
-    # no-op knob is worse than an absent one, so they were deleted rather
-    # than kept unused.
+    # These knobs have no enforcement path: no released viam-sdk ships
+    # move_through_joint_positions/MoveOptions (this module pins viam-sdk to
+    # a git commit of main, 0.81.0, that has them, but nothing here consumes
+    # them yet) -- a silent no-op knob is worse than an absent one, so they
+    # were deleted rather than kept unused.
     cfg = ControllerConfig.parse(BASE)
     assert not hasattr(cfg.safety, "max_acc_degs_per_sec2")
     assert not hasattr(cfg.safety, "max_tcp_speed_m_per_sec")

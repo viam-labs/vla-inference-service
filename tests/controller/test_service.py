@@ -3,11 +3,13 @@
 Two corrections from the plan draft's Task 17 test listing, both load-bearing
 (see the "BLOCKER RESOLVED" callout in the design plan): the arm is commanded
 via ``arm.move_to_joint_positions(JointPositions(values=...))`` -- a single
-``JointPositions``, no ``MoveOptions`` -- because ``move_through_joint_
-positions``/``MoveOptions`` ship in no released viam-sdk (installed 0.80.0
-has only ``move_to_joint_positions``, which takes no options). Every test in
-the plan asserting on ``MoveOptions``/``options.HasField(...)`` is rewritten
-below to assert on the single-``JointPositions`` call instead, and the
+``JointPositions``, no ``MoveOptions`` -- because no released viam-sdk ships
+``move_through_joint_positions``/``MoveOptions`` (this module pins ``viam-sdk``
+to a git commit of ``main``, 0.81.0, that has them, but the controller's
+joints path still calls the plain ``move_to_joint_positions``, which takes no
+options). Every test in the plan asserting on
+``MoveOptions``/``options.HasField(...)`` is rewritten below to assert on the
+single-``JointPositions`` call instead, and the
 velocity-ceiling coverage moved to asserting the derived
 ``max_joint_delta_degs`` per-tick clamp (verifiable through ``ControllerConfig``
 tests) plus the startup log line, rather than a ``MoveOptions`` payload that
@@ -367,9 +369,10 @@ async def test_loop_runs_and_commands_the_arm():
 
 
 async def test_arm_commanded_via_move_to_joint_positions_single_call():
-    # move_to_joint_positions is the only method the installed SDK's Arm
-    # exposes that FakeArm implements; move_through_joint_positions does not
-    # exist. A single positions object, not a list wrapped in one. The write
+    # move_to_joint_positions is the joints-path method FakeArm implements;
+    # the controller never calls the non-streamed move_through_joint_positions
+    # here, even though the pinned SDK has it. A single positions object, not
+    # a list wrapped in one. The write
     # is full-width (every arm joint, 6 here), not just the 5 driven ones --
     # see test_non_contiguous_state_joint_indices_map_to_the_correct_arm_joints
     # for why a narrower, purely-positional write is actually wrong.

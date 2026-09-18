@@ -7,13 +7,14 @@ starvation bounds, status reporting, and the two `mode`s are common.
 
 ``action_space="joints"`` (the default) commands the arm via ``await
 arm.move_to_joint_positions(JointPositions(values=...))`` -- a single
-``JointPositions``, no options. Installed viam-sdk 0.80.0 (the latest on
-PyPI) has no ``move_through_joint_positions`` and nothing consumes
-``MoveOptions``; both exist only in an unreleased dev checkout. The velocity
-ceiling therefore lives entirely in the safety layer's per-tick
-``max_joint_delta_degs`` clamp (derived from ``max_vel_degs_per_sec`` by
-``ControllerConfig``), logged once at ``reconfigure()`` so an operator can
-see what their limit implies.
+``JointPositions``, no options. No released viam-sdk ships
+``move_through_joint_positions`` or ``move_through_joint_positions_streamed``,
+so nothing consumes ``MoveOptions`` or a ``TrajectoryPoint``'s
+``KinematicConstraints`` here; this module pins ``viam-sdk`` to a git commit
+of ``main`` (0.81.0) that has them. The velocity ceiling therefore lives
+entirely in the safety layer's per-tick ``max_joint_delta_degs`` clamp
+(derived from ``max_vel_degs_per_sec`` by ``ControllerConfig``), logged once
+at ``reconfigure()`` so an operator can see what their limit implies.
 
 ``action_space="delta-ee"`` reads the tool pose from ``get_end_position()``,
 builds the 9-dim state the dataset stored, and treats the policy's 6-dim
