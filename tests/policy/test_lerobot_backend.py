@@ -11,6 +11,7 @@ with no `@pytest.mark.integration` and no checkpoint download.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -201,6 +202,33 @@ def test_build_specs_allows_a_checkpoint_that_declares_no_image_features():
 # directly. Marked `differential` for the same reason every other
 # lerobot-requiring test here is: pyproject defines that marker as
 # "requires lerobot installed", and the fast suite deselects it.
+# ---------------------------------------------------------------------------
+# num_steps override: applied to the config before the policy is built.
+# ---------------------------------------------------------------------------
+
+
+def test_num_steps_override_is_written_onto_the_config(caplog):
+    cfg = SimpleNamespace(type="smolvla", num_steps=10)
+    with caplog.at_level(logging.INFO, logger="vla.policy.lerobot_backend"):
+        LeRobotBackend._apply_num_steps(cfg, 4)
+    assert cfg.num_steps == 4
+    assert any("declares 10, running 4" in r.getMessage() for r in caplog.records)
+
+
+def test_num_steps_none_leaves_the_checkpoint_value_alone():
+    cfg = SimpleNamespace(type="smolvla", num_steps=10)
+    LeRobotBackend._apply_num_steps(cfg, None)
+    assert cfg.num_steps == 10
+
+
+def test_num_steps_is_refused_for_a_policy_type_without_one():
+    """An inert latency knob is worse than an error: the operator would keep
+    turning it waiting for a speedup that never comes."""
+    cfg = SimpleNamespace(type="act")
+    with pytest.raises(ConfigError, match="num_steps"):
+        LeRobotBackend._apply_num_steps(cfg, 4)
+
+
 class _FakeTorch:
     """Enough torch surface for `_select_device`, with a controllable device.
 

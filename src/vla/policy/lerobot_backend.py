@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from ..config_util import ConfigError
 from .backend import PolicySpecs, resolve_image_feature_keys
 from .prefix import normalize_prefix_length
 
@@ -86,12 +87,14 @@ class LeRobotBackend:
         dtype: str,
         rtc: Any | None,
         unused_image_features: frozenset[str] = frozenset(),
+        num_steps: int | None = None,
     ) -> None:
         import torch
         from lerobot.configs.policies import PreTrainedConfig
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
         cfg = PreTrainedConfig.from_pretrained(checkpoint_dir)
+        self._apply_num_steps(cfg, num_steps)
         policy_cls = get_policy_class(cfg.type)
         policy = policy_cls.from_pretrained(checkpoint_dir, config=cfg)
 
@@ -139,6 +142,28 @@ class LeRobotBackend:
         self._specs = self._build_specs(
             cfg, policy, supports_rtc, preprocessor, resolved_device, unused_image_features
         )
+
+    @staticmethod
+    def _apply_num_steps(cfg, num_steps: int | None) -> None:
+        """Override the checkpoint's step count before the policy is built.
+
+        Set on the config rather than the policy because `from_pretrained`
+        takes the config and the policy reads `config.num_steps` on every
+        `predict_action_chunk`. Refused, not ignored, for a policy type that
+        has no such attribute: an inert latency knob would send an operator
+        chasing a speedup that never comes.
+        """
+        if num_steps is None:
+            return
+        if not hasattr(cfg, "num_steps"):
+            raise ConfigError(
+                f"num_steps={num_steps} was configured but policy type {cfg.type!r} has no "
+                "num_steps setting; remove it"
+            )
+        LOGGER.info(
+            "num_steps overridden: checkpoint declares %s, running %d", cfg.num_steps, num_steps
+        )
+        cfg.num_steps = num_steps
 
     @staticmethod
     def _configure_rtc(policy, rtc) -> None:
@@ -234,6 +259,7 @@ class LeRobotBackend:
             image_feature_keys=image_keys,
             declared_image_feature_keys=declared_image_keys,
             preprocess_image_size=self._preprocess_image_size(cfg),
+            num_steps=(int(cfg.num_steps) if getattr(cfg, "num_steps", None) is not None else None),
             supports_rtc=supports_rtc,
             rtc_enabled=self._rtc_enabled,
             relative_actions=self._detect_relative_actions(preprocessor),

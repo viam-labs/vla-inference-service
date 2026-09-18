@@ -77,6 +77,12 @@ class PolicyConfig:
     device: str = "auto"
     dtype: str = "auto"
     warmup_inferences: int = 2
+    # Overrides the checkpoint's own flow-matching / denoising step count
+    # (smolvla `num_steps`, default 10). Inference latency scales roughly
+    # linearly with it, and latency is what decides whether a chunk can be
+    # executed time-aligned or must be replayed stale (see the README's
+    # Performance section). None keeps the checkpoint's value.
+    num_steps: int | None = None
     # Bounds the whole resolve + load + warmup sequence so a hung download
     # transitions to "failed" with an actionable message instead of sitting
     # on "loading" forever. 30 min is generous for a large hub download on a
@@ -122,6 +128,11 @@ class PolicyConfig:
             ),
             load_timeout_s=as_float(
                 raw.get("load_timeout_s", 1800.0), "load_timeout_s", minimum=0.001, maximum=86400.0
+            ),
+            num_steps=(
+                as_int(raw["num_steps"], "num_steps", minimum=1, maximum=1000)
+                if raw.get("num_steps") is not None
+                else None
             ),
             rtc=RTCSettings.parse({} if rtc_raw is None else rtc_raw),
             unused_image_features=_parse_unused_image_features(raw.get("unused_image_features")),

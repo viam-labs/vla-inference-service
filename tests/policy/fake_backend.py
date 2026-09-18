@@ -65,7 +65,9 @@ class FakePolicyBackend:
         dtype: str,
         rtc: Any | None,
         unused_image_features: frozenset[str] = frozenset(),
+        num_steps: int | None = None,
     ) -> None:
+        self.num_steps = num_steps
         h, w = self._image_size
         input_features: dict[str, list[int]] = {key: [3, h, w] for key in self._camera_keys}
         input_features["observation.state"] = [self._state_dim]
@@ -90,6 +92,7 @@ class FakePolicyBackend:
             preprocess_image_size=(
                 list(self._preprocess_image_size) if self._preprocess_image_size else None
             ),
+            num_steps=num_steps,
             supports_rtc=self._supports_rtc,
             rtc_enabled=bool(rtc and getattr(rtc, "enabled", False)),
             relative_actions=self._relative_actions,

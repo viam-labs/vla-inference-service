@@ -63,6 +63,7 @@ The two settings most likely to bite you are `state_units`/`action_units` (see
 | `hf_token_env` | string | — | The **name** of an environment variable holding a Hugging Face token — never the token itself. Machine configs are readable by anyone with fleet access. |
 | `device` | `auto` \| `cuda` \| `mps` \| `cpu` | `"auto"` | `auto` tries cuda → mps → cpu, first available. Covers all three deployment targets with no per-machine edits. |
 | `dtype` | `auto` \| `float32` \| `bfloat16` \| `float16` | `"auto"` | Parsed and validated but **not yet applied** to loaded weights — see [Limitations](#limitations). |
+| `num_steps` | integer, 1–1000 | — (the checkpoint's own) | Overrides the policy's flow-matching / denoising step count (smolvla ships `10`). Inference latency scales roughly linearly with it; see [Cutting inference latency](#cutting-inference-latency-num_steps). Refused at load for a policy type that has no such setting. |
 | `warmup_inferences` | integer, 0–100 | `2` | Throwaway inferences run on synthetic input at load, before `status` reports `ready`. First-call latency on a cold GPU is often several times steady-state. |
 | `load_timeout_s` | number, 0.001–86400 | `1800` | Bounds checkpoint-resolve + load + warmup as a whole. A hang (stuck download, wedged deserialize) becomes `state: failed` with a message instead of `loading` forever. |
 | `rtc.enabled` | boolean | `false` | Enables the RTC processor on the policy, if the checkpoint supports it (ignored with a logged warning otherwise). |
@@ -176,6 +177,7 @@ controller's `cameras`, `state_joint_indices`, and `gripper` have to line up wit
     "observation.images.camera3"
   ],
   "preprocess_image_size": [512, 512],
+  "num_steps": 10,
   "supports_rtc": true,
   "rtc_enabled": false,
   "relative_actions": false,
@@ -952,6 +954,18 @@ would starve roughly half the time. At `num_steps: 4`, latency drops to 0.58 s =
 comfortably under half, and `aligned` runs with zero staleness and no starvation. This is why
 `merge` defaults to `"append"`: `"aligned"` is a clear win only once latency is known to sit
 well inside that half-chunk budget.
+
+### Cutting inference latency: `num_steps`
+
+Latency decides whether `merge: "aligned"` above is usable at all: it needs inference to
+finish in under half the chunk's duration. smolvla's `num_steps` (10 by default) is the
+flow-matching step count and the dominant tunable term in that latency. Measured on the
+Jetson Orin with `smolvla-box-bot-subtasks`: 1.07 s at 10 steps, 0.66 s at 5, 0.58 s at 4,
+roughly 0.25 s fixed plus 0.08 s per step. Set `num_steps` on the `#policy` service to trade
+some action quality for speed, and measure both: `avg_latency_s` in the controller's `status`
+for the speed, `tools/replay_eval.py` for the quality. The `#policy` `specs` report the value
+in force.
+
 
 ### Tuning `queue_threshold` — the single most actionable knob in `mode: "async"`
 
