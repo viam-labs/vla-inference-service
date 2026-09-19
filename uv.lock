@@ -1727,27 +1727,14 @@ wheels = [
 
 [[package]]
 name = "viam-sdk"
-version = "0.80.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.81.0"
+source = { git = "https://github.com/viamrobotics/viam-python-sdk?rev=4ba5f2a1021353d253cc89cb86268273838af346#4ba5f2a1021353d253cc89cb86268273838af346" }
 dependencies = [
     { name = "googleapis-common-protos" },
     { name = "grpclib" },
     { name = "protobuf" },
     { name = "pymongo" },
     { name = "typing-extensions" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e1/74/4742adfd724f84cb7bda84a3f81622c178e89cd9da5e9e985346b46bbfb4/viam_sdk-0.80.0-py3-none-linux_armv6l.whl", hash = "sha256:376866b206cd479608196d9f79c4bba5afa562605a6942753945ee90e475648e", size = 7665289, upload-time = "2026-07-28T15:32:38.148Z" },
-    { url = "https://files.pythonhosted.org/packages/da/dc/f9421ff0ccea90fe0c12a83b9ce954adbfbe7cbc1f3793044391c04d99d6/viam_sdk-0.80.0-py3-none-linux_armv7l.whl", hash = "sha256:d1e167e92389e675137a6b6ce37f3a6bc49eb8b02fa8e457796aa9b4ae236367", size = 7665565, upload-time = "2026-07-28T15:32:40.557Z" },
-    { url = "https://files.pythonhosted.org/packages/02/2a/5abd92473d74a0743b128fec7da2ffed6fe85db358eb7f7649777f065ae4/viam_sdk-0.80.0-py3-none-macosx_10_16_x86_64.whl", hash = "sha256:737974ee267f2129b818a029318a0b81a3ee4877ae2debeee45c512307745a0f", size = 7016407, upload-time = "2026-07-28T15:32:42.114Z" },
-    { url = "https://files.pythonhosted.org/packages/c1/da/f6e5d32e2ac9b6d8de135a6f29805e97e0c5d148dce457690aec31b63e19/viam_sdk-0.80.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:0198191ec6d346eb9312eadc401719d626cef1813f4fd443d0f183145bb7a42d", size = 6836986, upload-time = "2026-07-28T15:32:43.641Z" },
-    { url = "https://files.pythonhosted.org/packages/ec/71/a7eda36c418b343a258c22c5349115273e8f84bcc32784a6f755e6028ee6/viam_sdk-0.80.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:2a50c479410a440e31696925c84f8d2dbd791a762d8d7ff241650ffd45bd64f1", size = 7839311, upload-time = "2026-07-28T15:32:45.292Z" },
-    { url = "https://files.pythonhosted.org/packages/2b/cd/9e6625209290900d887d9970a4cf20f2ca66398c47d8c71919c90aaba45d/viam_sdk-0.80.0-py3-none-manylinux2014_x86_64.whl", hash = "sha256:8dc8295ed62540451e8d91e4266b1033d04a18b1e01f6a75b027b0a322637d61", size = 7622207, upload-time = "2026-07-28T15:32:46.828Z" },
-    { url = "https://files.pythonhosted.org/packages/c2/51/5d6a580f680d7094442e8a0eb29888446a60a29e6e45054fb64f2d67e6bd/viam_sdk-0.80.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:b0d1cd0feda36ca81a73d087137d4b311e7965499a098b733ac084aeec7dbc97", size = 7836713, upload-time = "2026-07-28T15:32:48.805Z" },
-    { url = "https://files.pythonhosted.org/packages/70/eb/d4b35a50e5c7a05d4ff09a9653907e211c799b0958b32c89a89c2b6cf97d/viam_sdk-0.80.0-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:c0c246aec3812d88740535a94c321fe035e448768502145a46c7096c28bcdc84", size = 7556973, upload-time = "2026-07-28T15:32:50.284Z" },
-    { url = "https://files.pythonhosted.org/packages/e7/b1/f45e35f1c383c41841b607094b4084493a2b0e9745a06574640d164d0ccb/viam_sdk-0.80.0-py3-none-musllinux_1_2_i686.whl", hash = "sha256:9e2d777459a91b1a1b85ed0a129ac02ce697545bdac3962f80a454f74f33993f", size = 7846680, upload-time = "2026-07-28T15:32:51.799Z" },
-    { url = "https://files.pythonhosted.org/packages/41/23/3313c06fa823e5868ba48898f9a1ddc2434dbc3a0ad044755e761c58a85e/viam_sdk-0.80.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:4fcb1d5b5765761becfeedfdc1b6f58a7c529b90a419911f0053314a5e47883a", size = 7837386, upload-time = "2026-07-28T15:32:53.346Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/dd/4edccc433371ff0c92a371db5ab2bc3afc6af82e164d7ae85082d54ab978/viam_sdk-0.80.0-py3-none-win_amd64.whl", hash = "sha256:fc4f73b89abadb160b2bcf88125b25f341d31b6a0deab55866c056c02a9d178b", size = 6656108, upload-time = "2026-07-28T15:32:55.459Z" },
 ]
 
 [[package]]
@@ -1778,7 +1765,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.0.0,<2.3.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "scipy", specifier = ">=1.11" },
-    { name = "viam-sdk", specifier = ">=0.80.0" },
+    { name = "viam-sdk", git = "https://github.com/viamrobotics/viam-python-sdk?rev=4ba5f2a1021353d253cc89cb86268273838af346" },
 ]
 provides-extras = ["lerobot"]
 

@@ -10,6 +10,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --extra lerobot
+      # The git-pinned viam-sdk installs without libviam_rust_utils, which the
+      # PyPI wheel bundles and viam.spatialmath (the delta-ee pose path) dlopens.
+      # Same fetch setup.sh does on the robot; keep the release tag in sync.
+      - name: Fetch libviam_rust_utils
+        run: |
+          RPC_DIR="$(uv run --no-sync python -c "import viam, pathlib; print(pathlib.Path(viam.__file__).parent / 'rpc')")"
+          curl -fsSL -o "$RPC_DIR/libviam_rust_utils.so" \
+            https://github.com/viamrobotics/rust-utils/releases/download/v0.6.1/libviam_rust_utils-linux_x86_64.so
       - name: Track lerobot main
         if: matrix.lerobot == 'main'
         run: uv pip install "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@main"

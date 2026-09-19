@@ -43,6 +43,44 @@ WHEEL="${WHEELS[0]}"
 # install succeeded. The heavy dependencies are untouched by this and stay cached.
 uv pip install --reinstall-package viam-vla-inference-service "${WHEEL}[lerobot]" -q
 
+# The git-pinned viam-sdk (see pyproject.toml) installs from source and does
+# not bundle libviam_rust_utils, the native library the PyPI wheel ships
+# alongside it. This module's own connection to viam-server does not need it
+# (a unix socket with disable_webrtc=True), but `viam.spatialmath` -- used by
+# the delta-ee pose path (src/vla/controller/pose.py) -- lazily dlopens it on
+# first use, so a delta-ee deployment needs it fetched here.
+# ponytail: VIAM_RUST_UTILS_VERSION override, for a newer rust-utils release.
+VIAM_RUST_UTILS_VERSION="${VIAM_RUST_UTILS_VERSION:-v0.6.1}"
+VIAM_RPC_DIR="$("$VENV_NAME/bin/python" -c "import viam, pathlib; print(pathlib.Path(viam.__file__).parent / 'rpc')")"
+# first_run cannot see the configured action_space, and a joints-only
+# deployment must not be bricked by a delta-ee-only dependency -- so an
+# unsupported arch or a failed fetch/load only warns, it never exits 1.
+if [ ! -f "$VIAM_RPC_DIR/libviam_rust_utils.so" ]; then
+  RUST_UTILS_ASSET=""
+  case "$(uname -m)" in
+    aarch64) RUST_UTILS_ASSET="linux_aarch64" ;;
+    x86_64) RUST_UTILS_ASSET="linux_x86_64" ;;
+    *)
+      echo "setup.sh: unsupported architecture $(uname -m) for libviam_rust_utils." >&2
+      echo "  action_space=\"delta-ee\" will fail at its first pose read without it; \"joints\" is unaffected." >&2
+      ;;
+  esac
+  if [ -n "$RUST_UTILS_ASSET" ]; then
+    RUST_UTILS_URL="https://github.com/viamrobotics/rust-utils/releases/download/${VIAM_RUST_UTILS_VERSION}/libviam_rust_utils-${RUST_UTILS_ASSET}.so"
+    echo "setup.sh: fetching libviam_rust_utils from ${RUST_UTILS_URL}"
+    if curl -fsSL -o "$VIAM_RPC_DIR/libviam_rust_utils.so.part" "$RUST_UTILS_URL"; then
+      mv "$VIAM_RPC_DIR/libviam_rust_utils.so.part" "$VIAM_RPC_DIR/libviam_rust_utils.so"
+    else
+      rm -f "$VIAM_RPC_DIR/libviam_rust_utils.so.part"
+      echo "setup.sh: could not fetch libviam_rust_utils from ${RUST_UTILS_URL} --" >&2
+      echo "  action_space=\"delta-ee\" will fail at its first pose read; \"joints\" is unaffected." >&2
+    fi
+  fi
+fi
+if ! "$VENV_NAME/bin/python" -c "from viam.spatialmath import OrientationVector; OrientationVector(0.0, 0.0, 1.0, 0.0).to_quaternion()"; then
+  echo "setup.sh: libviam_rust_utils failed to load -- action_space=\"delta-ee\" will fail at its first pose read; \"joints\" is unaffected." >&2
+fi
+
 # Jetson needs torch built for sm_87. The generic aarch64 cu128 wheels the
 # resolver picks (PyPI / download.pytorch.org) exclude Orin's compute
 # capability outright -- torch itself says so on load ("8.0 which supports

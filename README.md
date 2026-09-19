@@ -316,6 +316,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `fps` | number | `10.0` | Control loop rate. |
 | `mode` | `sequential` \| `async` | `"sequential"` | Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). |
 | `queue_threshold` | integer | derived (effective chunk length − 1) | `mode: "async"` only: refill fires once the queue has this many actions left. Derived from `actions_per_chunk` when set, else from the checkpoint's `n_action_steps`. Leave unset — see [Performance](#performance). |
+| `merge` | `append` \| `aligned` | `"append"` | `mode: "async"` only: how a landing chunk is merged into the queue. `aligned` drops stale head rows instead of appending behind them — see [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then). |
 | `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
@@ -325,6 +326,8 @@ backoff for up to `policy_ready_timeout_s`.
 | `jpeg_quality` | integer, 0–100 | `90` | |
 | `image_fit` | `pad` \| `stretch_bicubic` | `"pad"`, or `"stretch_bicubic"` under `delta-ee` | How a camera frame is resized onto the wire `(h, w)` — `specs.preprocess_image_size` when the policy reports one, else the checkpoint's declared shape — whenever the frame's shape differs from it. See below. |
 | `arm_move_extra` | object | `{"wait": false, "waitAtEnd": false, "interpolate": false}` | The `extra` struct sent with every `move_to_joint_positions`. Replaces the default wholesale; `{}` sends nothing. See [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle). |
+| `arm_write` | `setpoint` \| `stream` | `"setpoint"` | `joints` only. `"stream"` feeds the arm's servo mode at `stream_hz` instead of one setpoint per tick — see [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
+| `stream_hz` | number | `100.0` | `arm_write: "stream"` only. Must be ≥ `fps` — interpolation needs at least one point per tick. Rounded to a whole number of points per tick, so the actual rate is that count × `fps`, not `stream_hz` itself — `100` at `fps: 30` runs at 90 Hz. |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
 | `safety.max_joint_delta_degs` | number | `8.0` | `joints` only. Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
@@ -516,6 +519,10 @@ The one command to watch while a loop runs.
   "measured_fps": 9.94,
   "clamp_counts": { "delta": 0, "limit": 0, "gripper": 0 },
   "starved_ticks": 0,
+  "queue_threshold": null,
+  "dropped_stale_rows": 0,
+  "arm_write": "setpoint",
+  "stream_points_sent": 0,
   "last_error": ""
 }
 ```
@@ -534,8 +541,20 @@ What to read it for:
   `queue_threshold + chunk length`, and every action in it is that many ticks stale. 40–90
   with a 50-step chunk at 10 fps means the arm is executing observations 4–9 s old; see
   [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk).
+- `queue_threshold` — the scheduler's actual refill threshold under `mode: "async"`; `null`
+  under `sequential`, where the concept does not apply.
+- `dropped_stale_rows` — cumulative rows discarded by `merge: "aligned"` as too stale to
+  execute; always `0` under `append`. A persistently rising value means observed latency is
+  near or over half the chunk length — see
+  [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then).
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
+- `arm_write` — `"setpoint"` or `"stream"`, echoing the configured value.
+- `stream_points_sent` — cumulative `TrajectoryPoint`s sent under `arm_write: "stream"`;
+  always `0` under `"setpoint"`. The first tick sends the rest point and its motion batch
+  together, so this jumps straight from `0` to `1 + n` — a value stuck at `0` while `state`
+  is `"running"` means the stream opened but no tick has sent a batch yet — see
+  [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream).
 
 ### Gripper variants
 
@@ -643,7 +662,37 @@ would silently keep the arm blocking.
 
 Note this is the *arm* channel only. The gripper's equivalent is opt-in: set
 `write_args: {"wait": false}` on a `do_command` block, as the so-101 example
-above does.
+above does. Under `arm_write: "stream"`, the same `extra` is passed once, when
+the stream opens, rather than on every tick.
+
+### Smooth servo streaming (`arm_write: "stream"`)
+
+`arm_write: "setpoint"` (the default) sends one `move_to_joint_positions` per control
+tick: one servo setpoint every 33 ms at `fps: 30`. The xArm snaps to each and holds it
+until the next lands, a visible buzz; UFactory's guidance for servo mode is 100 Hz or
+more. The driver's unary RPC interpolates a single target up to 100 Hz itself, but its
+streamed RPC, `move_through_joint_positions_streamed`, sends each `TrajectoryPoint`
+verbatim at its stamped time, so under `arm_write: "stream"` the controller densifies.
+
+What gets sent: `round(stream_hz / fps)` linearly interpolated points per tick (100 at
+`fps: 30` rounds to 3 per tick, 90 Hz), stamped one tick ahead of when each is due. The
+lead matters because a point that arrives past its stamp is sent immediately, and a
+stream where every point is late collapses back into bursts at `fps`. The mandatory
+rest point at `time=0` ships in the *same* batch as tick one's motion points: which
+point a driver anchors its clock on is version-dependent, and keeping both together
+keeps either anchor within one transport hop of the controller's clock.
+
+Lifecycle: one stream per run, opened in `start` after every other pre-motion check.
+Nothing is sent until the first tick, so a driver without the RPC is refused there,
+before the arm has moved. `arm_move_extra` goes once, as the stream's `extra`. `stop`
+and any run-ending error half-close the stream, and the driver waits for the arm to
+stop before the RPC ends.
+
+Requirements and fallback: the git-pinned `viam-sdk` 0.81.0 this module already
+depends on, and an xArm module at or after `d83b4d9` (2026-09-15). `"setpoint"` stays
+the default and the fallback. The per-tick safety clamp applies identically on both
+paths: every interpolated point lies between two already-clamped targets, so streaming
+changes how often a target is sent, not how far it may move.
 
 ### Full worked example
 
@@ -764,11 +813,13 @@ Applied to every action, in this fixed order, before it reaches the arm:
    `len(joint_limits_degs) == len(state_joint_indices) + (1 if gripper.type == "arm_joint" else 0)`.
    When absent, this layer is skipped and a warning is logged once at start, naming the
    arm driver as the sole limit authority.
-5. **There is no driver-side kinematic ceiling.** `move_through_joint_positions` and
-   `MoveOptions` — which would carry velocity/acceleration/TCP-speed limits — ship in no
-   released `viam-sdk` (installed 0.80.0, the latest on PyPI, has only
-   `move_to_joint_positions`, which takes no options). The velocity bound is instead
-   enforced entirely by layer 3:
+5. **There is no driver-side kinematic ceiling.** The calls that would carry one —
+   `move_through_joint_positions` (via `MoveOptions`) and
+   `move_through_joint_positions_streamed` (via each `TrajectoryPoint`'s
+   `KinematicConstraints`) — ship in no released `viam-sdk` (latest on PyPI is 0.80.0), so
+   this module pins `viam-sdk` to a git commit of `main` (0.81.0) that has them. The pin
+   makes those calls reachable; it does not set any constraint, so the velocity bound is
+   still enforced entirely by layer 3:
 
    ```
    max_joint_delta_degs = max_vel_degs_per_sec / fps
@@ -779,10 +830,8 @@ Applied to every action, in this fixed order, before it reaches the arm:
    implies at `reconfigure()` time. If both `max_vel_degs_per_sec` and
    `max_joint_delta_degs` are configured, they must agree (within floating-point
    tolerance) or configuration fails — silently preferring one over a contradictory
-   other would hide an operator mistake instead of surfacing it. Acceleration and
-   TCP-speed limiting are unavailable until the SDK ships the newer call;
-   `safety.max_start_delta_degs` covers the large-initial-jump case those would
-   otherwise soften.
+   other would hide an operator mistake instead of surfacing it. `safety.max_start_delta_degs`
+   covers the large-initial-jump case a driver-side kinematic ceiling would otherwise soften.
 6. **Every clamp is logged and counted**, split by layer, in `status.clamp_counts`
    (`delta` / `limit` / `gripper`). **Persistent clamping is the single most likely
    sign of wrong units or wrong joint order** — it is deliberately loud rather than
@@ -876,6 +925,33 @@ lower `fps` (a chunk buys more wall-clock time per inference), a smaller/faster
 checkpoint, or fewer denoising steps. **For anything resembling a live demo, the x86+CUDA
 target remains the practical answer** — the numbers above are Mac-specific, and `async`
 narrows the gap without pretending to close it as well as faster hardware would.
+
+### `merge: "aligned"` — execute rows for now, not rows for then
+
+`mode: "async"`'s default, `merge: "append"`, queues every landing chunk behind whatever is
+still queued. A chunk predicted from an observation taken at time t0 has row i meaning "the
+pose the arm should be at at t0 + (i+1)/fps" — but by the time row 0 of the new chunk
+actually executes, however many ticks were still queued when it landed have already passed,
+so it describes a pose from the past. The arm follows the outgoing chunk's drifting tail,
+then the incoming chunk's head pulls it back to where the policy thought it should have been
+a moment earlier: a visible yank at every chunk boundary. Measured on the xArm: a delta-clamp
+burst every 1.72 s, exactly one per 50-row chunk at 29 fps.
+
+`merge: "aligned"` fixes this by dropping the head rows of every landing chunk whose moment
+has already passed, instead of appending them. With `L` ticks of observed inference latency
+and `q` rows still queued when the chunk lands, it skips the first `L + q - 1` rows, so the
+first row it actually merges is the first one whose intended tick is still in the future. The
+queue only ever holds rows for now or later, never for then — at the cost of throwing part of
+every chunk away, tracked in `status.dropped_stale_rows`.
+
+That only works while latency stays under about half the chunk length — past that, each
+chunk yields fewer fresh rows than the next inference takes to arrive, and the queue starves
+faster than it can be refilled. Measured on `smolvla-box-bot-subtasks` (chunk 50 at 30 fps =
+1.67 s): at `num_steps: 10`, latency was 1.07 s = 34 ticks — over half the chunk, so `aligned`
+would starve roughly half the time. At `num_steps: 4`, latency drops to 0.58 s = 18 ticks,
+comfortably under half, and `aligned` runs with zero staleness and no starvation. This is why
+`merge` defaults to `"append"`: `"aligned"` is a clear win only once latency is known to sit
+well inside that half-chunk budget.
 
 ### Tuning `queue_threshold` — the single most actionable knob in `mode: "async"`
 
@@ -994,10 +1070,13 @@ Rules for setting it:
   prefix would need re-anchoring against the cached raw state that this module does not
   yet implement, and applying guidance in the wrong coordinate frame would produce
   plausible-looking but wrong motion. Sequential mode is unaffected.
-- **No driver-side velocity/acceleration ceilings.** `move_through_joint_positions` (the
-  only method that consumes `MoveOptions`) ships in no released `viam-sdk`. The velocity
-  bound lives entirely in the safety layer's delta clamp (see [Safety](#safety)); acceleration and
-  TCP-speed limiting have no enforcement path at all right now.
+- **No driver-side velocity/acceleration ceilings.** The calls that would carry one —
+  `move_through_joint_positions` (via `MoveOptions`) and `move_through_joint_positions_streamed`
+  (via each `TrajectoryPoint`'s `KinematicConstraints`) — ship in no released `viam-sdk`
+  (latest on PyPI is 0.80.0), so this module pins `viam-sdk` to a git commit of `main`
+  (0.81.0) that has them. The pin makes those calls reachable; it does not set any
+  constraint, so the velocity bound still lives entirely in the safety layer's per-tick
+  clamp (see [Safety](#safety)).
 - **`dtype` is parsed and validated but not applied.** Casting weights with
   `policy.to(dtype=...)` breaks inference on at least one target (the deserialized
   `DeviceProcessorStep` has `float_dtype=None` and keeps emitting float32 regardless).
@@ -1012,6 +1091,20 @@ mise run test        # fast suite: no torch, no network, seconds
 mise run test-all     # everything, including integration/differential (needs the lerobot extra)
 uv sync --extra lerobot  # required once before test-all, or before running integration/differential directly
 ```
+
+The git-pinned `viam-sdk` (see [Safety](#safety) item 5) installs without `libviam_rust_utils`,
+the native library the PyPI wheel bundles. `action_space: "joints"` never touches it. But
+`action_space: "delta-ee"` does, independently of networking: `pose.py`'s `orientation_vector`
+goes through `viam.spatialmath`'s quaternion conversion, which lazily loads that library on
+first use — so `mise run test` will fail under delta-ee coverage without it, not just
+`tools/replay_eval.py`, which dials a robot over WebRTC and needs it for that. Either way, fetch
+it into the venv `viam-sdk` installed into: download `libviam_rust_utils-<arch>.<ext>` for your
+platform from the `viamrobotics/rust-utils` GitHub releases page into
+`.venv/lib/python3.12/site-packages/viam/rpc/`, renamed to `libviam_rust_utils.<ext>`. Use the
+arch/ext names the SDK's own `.github/workflows/build-wheels.yml` uses (for example
+`macosx_arm64.dylib`, `macosx_x86_64.dylib`, `linux_x86_64.so`, `linux_aarch64.so`). On the
+robot, `setup.sh` does this download itself, so this manual step is only needed on a dev
+machine.
 
 ### Validating a checkpoint — `tools/replay_eval.py`
 
@@ -1068,6 +1161,12 @@ closed-loop error, only rule out the config faults.
   `@pytest.mark.differential` (the controller's image resampling checked against
   lerobot's own preprocessing, on both the pinned SHA and `main`). Both need
   `uv sync --extra lerobot` first.
+- **Releasing:** publish a GitHub release whose tag is the module version (for example `v0.2.0`).
+  `.github/workflows/deploy.yml` then pushes `meta.json` to the registry and runs
+  `viamrobotics/build-action`, which executes the `build` block of `meta.json` on Viam's cloud
+  builders for `linux/arm64` and `linux/amd64` and uploads the result under that tag. It needs the
+  `viam_key_id` and `viam_key_value` repository secrets. The wheel's own version in `pyproject.toml`
+  stays static; the registry version is the tag, and `setup.sh` reinstalls the wheel on every reload.
 - `mise run build` / `mise run package` build the wheel and the deployable
   `module.tar.gz` (`meta.json` + `run.sh` + `setup.sh` + the wheel — no `docs/`, so
   internal specs and plans never leak to the module registry).

@@ -20,12 +20,16 @@ through different SDK calls with different guarantees:
   4. Joint limit clamp from the optional `joint_limits_degs` config,
      indexed in action-vector order, with a trailing gripper pair only when
      the gripper channel is itself in degrees (`gripper.type == "arm_joint"`).
-  5. There is no driver-side ceiling. `MoveOptions` -- and the
-     `move_through_joint_positions` call that would carry it -- ship in no
-     released viam-sdk, so the velocity bound is enforced entirely by layer 3:
-     `ControllerConfig` derives `max_joint_delta_degs = max_vel_degs_per_sec /
-     fps`, making the per-step delta clamp *the* velocity limit rather than a
-     redundant backstop. Acceleration and TCP-speed limiting are unavailable;
+  5. There is no driver-side ceiling. The calls that would carry one --
+     `move_through_joint_positions` (via `MoveOptions`) and
+     `move_through_joint_positions_streamed` (via each `TrajectoryPoint`'s
+     `KinematicConstraints`) -- ship in no released viam-sdk, so this module
+     pins `viam-sdk` to a git commit of `main` (0.81.0) that has them. The pin
+     makes those calls reachable; it does not set any constraint, so the
+     velocity bound is still enforced entirely by layer 3: `ControllerConfig`
+     derives `max_joint_delta_degs = max_vel_degs_per_sec / fps`, making the
+     per-step delta clamp *the* velocity limit rather than a redundant
+     backstop. Acceleration and TCP-speed limiting are unavailable;
      `check_start` covers the large-initial-jump case they would have softened.
      This layer only ever produces a target position.
   6. Every clamp is logged and counted in `clamp_counts`, split by which

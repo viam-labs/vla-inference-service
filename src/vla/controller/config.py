@@ -50,6 +50,17 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `mode: "async"` overlaps execution with inference instead of stalling the arm
 between chunks -- for the case where inference latency approaches or exceeds
 chunk duration. `"sequential"` is the default. See `AsyncScheduler`.
+
+`merge: "aligned"` drops the head rows of a landing chunk whose moment has
+already passed, so append mode's chunk-boundary yank disappears; it needs
+`mode: "async"` (the blocking scheduler just stalled for those rows and does not
+record when it fired). README: "merge: aligned".
+
+`arm_write: "stream"` densifies each tick's target into `round(stream_hz / fps)`
+servo setpoints over `move_through_joint_positions_streamed`; one setpoint per
+tick buzzes on the xArm. `"setpoint"` stays the default for drivers without the
+RPC. The real rate is `round(stream_hz / fps) * fps` (100 at 30 fps runs at 90 Hz).
+README: "Smooth servo streaming".
 """
 
 from __future__ import annotations
@@ -75,16 +86,23 @@ __all__ = [
     "SafetyConfig",
     "ControllerConfig",
     "MODES",
+    "MERGES",
     "ENCODINGS",
     "IMAGE_FITS",
     "DEFAULT_ARM_MOVE_EXTRA",
     "ACTION_SPACES",
     "JOINTS",
     "DELTA_EE",
+    "ARM_WRITES",
 ]
 
 MODES = ("sequential", "async")
+MERGES = ("append", "aligned")
 ENCODINGS = ("jpeg", "png", "raw")
+
+# "setpoint": one move_to_joint_positions per tick. "stream": interpolated
+# points over move_through_joint_positions_streamed (README, Smooth servo streaming).
+ARM_WRITES = ("setpoint", "stream")
 
 # The two action spaces. `joints` is the original and the default: absolute
 # joint angles in degrees, written with `move_to_joint_positions`. `delta-ee`
@@ -488,6 +506,7 @@ class ControllerConfig:
     task: str = ""
     fps: float = 10.0
     mode: str = "sequential"
+    merge: str = "append"
     queue_threshold: int | None = None
     actions_per_chunk: int | None = None
     starvation_grace_ticks: int = 3
@@ -504,6 +523,8 @@ class ControllerConfig:
         default_factory=lambda: dict(DEFAULT_ARM_MOVE_EXTRA)
     )
     action_space: str = JOINTS
+    arm_write: str = "setpoint"
+    stream_hz: float = 100.0
     # Operator-configurable rather than fixed module defaults: a checkpoint
     # run at 2 Hz and one at 10 Hz imply very different "this tick is late"
     # and "this frame is stale" thresholds. Defaults match observation.py's
@@ -570,6 +591,29 @@ class ControllerConfig:
                     f"expected {expected} (one per action dimension in degrees)"
                 )
 
+        mode = as_choice(raw.get("mode", "sequential"), "mode", MODES)
+        merge = as_choice(raw.get("merge", "append"), "merge", MERGES)
+        if merge == "aligned" and mode != "async":
+            raise ConfigError(
+                f"merge={merge!r} needs mode: \"async\" -- on the blocking scheduler, "
+                "aligning would discard rows the loop just stalled to obtain, making the "
+                "duty cycle worse, and it does not track when its inference was fired anyway"
+            )
+
+        arm_write = as_choice(raw.get("arm_write", "setpoint"), "arm_write", ARM_WRITES)
+        stream_hz = as_float(raw.get("stream_hz", 100.0), "stream_hz", minimum=1.0, maximum=1000.0)
+        if arm_write == "stream":
+            if stream_hz < fps:
+                raise ConfigError(
+                    f"stream_hz={stream_hz} is below fps={fps}: interpolation needs at "
+                    "least one point per tick"
+                )
+            if delta_ee:
+                raise ConfigError(
+                    f'arm_write="stream" does not apply to action_space={DELTA_EE!r}: the '
+                    "pose path writes with move_to_position"
+                )
+
         return ControllerConfig(
             policy_service=policy_service,
             arm=arm,
@@ -578,7 +622,8 @@ class ControllerConfig:
             gripper=gripper,
             task=as_str(raw.get("task", ""), "task"),
             fps=fps,
-            mode=as_choice(raw.get("mode", "sequential"), "mode", MODES),
+            mode=mode,
+            merge=merge,
             queue_threshold=(
                 as_int(raw["queue_threshold"], "queue_threshold", minimum=0)
                 if raw.get("queue_threshold") is not None
@@ -629,6 +674,8 @@ class ControllerConfig:
                 raw.get("image_fit", _default_image_fit(action_space)), "image_fit", IMAGE_FITS
             ),
             action_space=action_space,
+            arm_write=arm_write,
+            stream_hz=stream_hz,
             arm_move_extra=_parse_arm_move_extra(raw.get("arm_move_extra")),
             duration_warn_s=as_float(
                 raw.get("duration_warn_s", DEFAULT_DURATION_WARN_S), "duration_warn_s", minimum=0.0

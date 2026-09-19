@@ -7,13 +7,14 @@ starvation bounds, status reporting, and the two `mode`s are common.
 
 ``action_space="joints"`` (the default) commands the arm via ``await
 arm.move_to_joint_positions(JointPositions(values=...))`` -- a single
-``JointPositions``, no options. Installed viam-sdk 0.80.0 (the latest on
-PyPI) has no ``move_through_joint_positions`` and nothing consumes
-``MoveOptions``; both exist only in an unreleased dev checkout. The velocity
-ceiling therefore lives entirely in the safety layer's per-tick
-``max_joint_delta_degs`` clamp (derived from ``max_vel_degs_per_sec`` by
-``ControllerConfig``), logged once at ``reconfigure()`` so an operator can
-see what their limit implies.
+``JointPositions``, no options. No released viam-sdk ships
+``move_through_joint_positions`` or ``move_through_joint_positions_streamed``,
+so nothing consumes ``MoveOptions`` or a ``TrajectoryPoint``'s
+``KinematicConstraints`` here; this module pins ``viam-sdk`` to a git commit
+of ``main`` (0.81.0) that has them. The velocity ceiling therefore lives
+entirely in the safety layer's per-tick ``max_joint_delta_degs`` clamp
+(derived from ``max_vel_degs_per_sec`` by ``ControllerConfig``), logged once
+at ``reconfigure()`` so an operator can see what their limit implies.
 
 ``action_space="delta-ee"`` reads the tool pose from ``get_end_position()``,
 builds the 9-dim state the dataset stored, and treats the policy's 6-dim
@@ -83,6 +84,7 @@ from .observation import ObservationBuilder, pose_state_from_proto
 from .pose import orientation_vector, state_compose, state_rotation
 from .safety import CartesianSafetyLayer, SafetyLayer
 from .scheduler import AsyncScheduler, ChunkScheduler, SequentialScheduler
+from .trajectory import ArmStream
 from .units import to_degrees, to_working
 
 LOGGER = logging.getLogger(__name__)
@@ -109,6 +111,8 @@ class VLAController(Generic, EasyResource):
         self._scheduler: ChunkScheduler | None = None
         self._mode: str | None = None
         self._stop_task: asyncio.Task | None = None
+        self._stream: ArmStream | None = None
+        self._stream_points_sent = 0
 
     @classmethod
     def new(cls, config: ServiceConfig, dependencies: Mapping[Any, ResourceBase]) -> Self:
@@ -140,6 +144,8 @@ class VLAController(Generic, EasyResource):
         self._specs = None
         self._mode = None
         self._scheduler = None
+        self._stream = None
+        self._stream_points_sent = 0
         self._safety = None
         self._latencies.clear()
         self._measured_fps = 0.0
@@ -216,6 +222,7 @@ class VLAController(Generic, EasyResource):
 
     def _status(self) -> dict[str, Any]:
         avg = float(np.mean(self._latencies)) if self._latencies else 0.0
+        is_async = isinstance(self._scheduler, AsyncScheduler)
         return {
             "state": self._state,
             "mode": self._mode or (self._cfg.mode if self._cfg else ""),
@@ -231,6 +238,14 @@ class VLAController(Generic, EasyResource):
             # whole session, the same shape as clamp_counts, so an operator
             # can see the loop is quietly stalling without reading logs.
             "starved_ticks": self._starved_ticks,
+            # AsyncScheduler only; None/0 under sequential or before a scheduler exists.
+            "queue_threshold": self._scheduler.queue_threshold if is_async else None,
+            "dropped_stale_rows": self._scheduler.dropped_stale_rows if is_async else 0,
+            "arm_write": self._cfg.arm_write if self._cfg else "",
+            # Live while the stream is open; the final total after it closes.
+            "stream_points_sent": (
+                self._stream.points_sent if self._stream is not None else self._stream_points_sent
+            ),
             "last_error": self._last_error or "",
         }
 
@@ -249,6 +264,8 @@ class VLAController(Generic, EasyResource):
         self._specs = None
         self._mode = None
         self._scheduler = None
+        self._stream = None
+        self._stream_points_sent = 0
         self._safety = None
         self._latencies.clear()
         self._measured_fps = 0.0
@@ -289,6 +306,12 @@ class VLAController(Generic, EasyResource):
             # the controller reports stopped. SequentialScheduler's close()
             # is an inherited no-op, so this is a no-op for it.
             await self._scheduler.close()
+        if self._stream is not None:
+            # Half-close so the driver waits for motion to stop; cancelling the
+            # loop task alone does not tear the stream down.
+            await self._stream.close()
+            self._stream_points_sent = self._stream.points_sent
+            self._stream = None
         await self._safe_stop_arm()
         if was_active and self._state != "error":
             self._state = "stopped"
@@ -333,7 +356,13 @@ class VLAController(Generic, EasyResource):
         limit = self._cfg.actions_per_chunk
         if mode == "async":
             threshold = self._resolve_queue_threshold()
-            return AsyncScheduler(lambda: self._infer(builder), threshold, self._cfg.fps, limit)
+            return AsyncScheduler(
+                lambda: self._infer(builder),
+                threshold,
+                self._cfg.fps,
+                limit,
+                merge=self._cfg.merge,
+            )
         return SequentialScheduler(lambda: self._infer(builder), limit)
 
     def _effective_chunk_len(self) -> int:
@@ -358,12 +387,16 @@ class VLAController(Generic, EasyResource):
         harmless in the fast-inference regime, where the queue never drains
         far enough for the threshold to bind.
 
-        Note this is a *staleness* ceiling as much as a starvation floor.
-        `ActionQueue` merges in append mode, so with threshold T the action
-        executing at any instant was inferred between T and T + chunk_len
-        ticks ago. Deriving from the truncated length is what keeps that
-        window narrow: at `actions_per_chunk=12` it is 11-23 ticks, where
-        the untruncated 50-step chunk gives 49-98.
+        Under `merge="append"` (the default) this is a *staleness* ceiling as
+        much as a starvation floor: `ActionQueue` merges every landing chunk
+        onto the tail, so with threshold T the action executing at any
+        instant was inferred between T and T + chunk_len ticks ago. Deriving
+        from the truncated length is what keeps that window narrow: at
+        `actions_per_chunk=12` it is 11-23 ticks, where the untruncated
+        50-step chunk gives 49-98. Under `merge="aligned"` that staleness
+        window collapses to zero by construction (stale head rows are
+        dropped, not queued), so there the threshold is a starvation floor
+        only.
         """
         configured = self._cfg.queue_threshold
         if configured is not None:
@@ -561,6 +594,14 @@ class VLAController(Generic, EasyResource):
                 self._check_joint_indices(measured, gripper)
             await self._preflight_gripper(gripper)
 
+            if cfg.arm_write == "stream":
+                # `measured` is bound: config rejects "stream" with delta-ee. start()
+                # sends nothing; a driver without the RPC fails on tick one's check().
+                self._stream = ArmStream(
+                    arm, fps=cfg.fps, stream_hz=cfg.stream_hz, extra=dict(cfg.arm_move_extra)
+                )
+                await self._stream.start(measured)
+
             # Only cameras the policy actually asked for: a camera configured
             # but not among specs.image_feature_keys must never be read or
             # sent -- it has no entry in image_sizes, so ObservationBuilder
@@ -591,6 +632,10 @@ class VLAController(Generic, EasyResource):
             self._state = "error"
             self._last_error = str(exc)
             LOGGER.error("controller stopped: %s", exc)
+            if self._stream is not None:
+                await self._stream.close()
+                self._stream_points_sent = self._stream.points_sent
+                self._stream = None
             await self._safe_stop_arm()
 
     async def _infer(self, builder: ObservationBuilder) -> np.ndarray:
@@ -788,14 +833,16 @@ class VLAController(Generic, EasyResource):
         # cleared the action, so there is no "try again next tick" that
         # would be safe -- the arm itself is reporting the fault.
         #
-        # `arm_move_extra` must make the driver return without waiting for
-        # the arm to physically settle: the next tick supersedes this
-        # setpoint, so a blocking driver spends the whole tick budget
-        # waiting for a target we are about to replace. See
-        # `DEFAULT_ARM_MOVE_EXTRA` for why it takes three keys.
-        await arm.move_to_joint_positions(
-            JointPositions(values=target), extra=dict(cfg.arm_move_extra)
-        )
+        # setpoint: `arm_move_extra` makes the driver return without waiting to
+        # settle, since the next tick supersedes this target (DEFAULT_ARM_MOVE_EXTRA).
+        # stream: `extra` went with the stream open; the target is densified.
+        if self._stream is not None:
+            self._stream.check()
+            await self._stream.send(target)
+        else:
+            await arm.move_to_joint_positions(
+                JointPositions(values=target), extra=dict(cfg.arm_move_extra)
+            )
         if gripper.has_normalized_tail:
             await gripper.write(float(safe[-1]))
 
