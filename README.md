@@ -1163,6 +1163,12 @@ closed-loop error, only rule out the config faults.
   `@pytest.mark.differential` (the controller's image resampling checked against
   lerobot's own preprocessing, on both the pinned SHA and `main`). Both need
   `uv sync --extra lerobot` first.
+- **Releasing:** publish a GitHub release whose tag is the module version (for example `v0.2.0`).
+  `.github/workflows/deploy.yml` then pushes `meta.json` to the registry and runs
+  `viamrobotics/build-action`, which executes the `build` block of `meta.json` on Viam's cloud
+  builders for `linux/arm64` and `linux/amd64` and uploads the result under that tag. It needs the
+  `viam_key_id` and `viam_key_value` repository secrets. The wheel's own version in `pyproject.toml`
+  stays static; the registry version is the tag, and `setup.sh` reinstalls the wheel on every reload.
 - `mise run build` / `mise run package` build the wheel and the deployable
   `module.tar.gz` (`meta.json` + `run.sh` + `setup.sh` + the wheel — no `docs/`, so
   internal specs and plans never leak to the module registry).
