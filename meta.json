@@ -1,7 +1,7 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam-labs:vla",
-  "visibility": "private",
+  "visibility": "public",
   "url": "https://github.com/viam-labs/vla-inference-service",
   "description": "Run pre-trained LeRobot VLA policies (SmolVLA, Evo-1) on Viam machines",
   "build": {
