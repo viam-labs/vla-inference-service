@@ -65,6 +65,16 @@ def test_rejects_nonpositive_guidance_weight():
         PolicyConfig.parse({"model_path": "/m", "rtc": {"max_guidance_weight": 0}})
 
 
+def test_num_steps_parses_an_integral_double():
+    assert PolicyConfig.parse({"model_path": "/m", "num_steps": 5.0}).num_steps == 5
+
+
+@pytest.mark.parametrize("bad", [0, -1, 2.5, True, "5"])
+def test_num_steps_rejects_non_positive_and_non_integer_values(bad):
+    with pytest.raises(ConfigError, match="num_steps"):
+        PolicyConfig.parse({"model_path": "/m", "num_steps": bad})
+
+
 def test_rejects_negative_warmup():
     with pytest.raises(ConfigError, match="warmup_inferences"):
         PolicyConfig.parse({"model_path": "/m", "warmup_inferences": -1})

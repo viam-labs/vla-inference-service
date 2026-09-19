@@ -130,6 +130,7 @@ class VLAPolicy(Generic, EasyResource):
             dtype=cfg.dtype,
             rtc=rtc,
             unused_image_features=frozenset(cfg.unused_image_features),
+            num_steps=cfg.num_steps,
         )
         for _ in range(cfg.warmup_inferences):
             await asyncio.to_thread(self._warmup_once, backend)
