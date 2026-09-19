@@ -49,11 +49,9 @@ The two settings most likely to bite you are `state_units`/`action_units` (see
   install (no `lerobot` extra — config parsing, the controller's pure-numpy code, the
   wire codec) has no torch dependency at all and measured **81 MB** on the same machine.
 
-<a id="policy"></a>
+## Policy
 
-## `#policy` — `viam-labs:vla:policy`
-
-Has no dependencies; `validate_config` always returns `([], [])`.
+`viam-labs:vla:policy`
 
 ### Config
 
@@ -291,9 +289,9 @@ path):
 }
 ```
 
-<a id="controller"></a>
+## Controller
 
-## `#controller` — `viam-labs:vla:controller`
+`viam-labs:vla:controller`
 
 Dependencies: `policy_service`, `arm`, every resource named in `cameras`, plus the
 gripper resource named in `gripper` (if any) — all computed by `validate_config` and
