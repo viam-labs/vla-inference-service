@@ -690,7 +690,7 @@ before the arm has moved. `arm_move_extra` goes once, as the stream's `extra`. `
 and any run-ending error half-close the stream, and the driver waits for the arm to
 stop before the RPC ends.
 
-Requirements and fallback: the git-pinned `viam-sdk` 0.81.0 this module already
+Requirements and fallback: `viam-sdk` >= 0.82.0, which this module already
 depends on, and an xArm module at or after `d83b4d9` (2026-09-15). `"setpoint"` stays
 the default and the fallback. The per-tick safety clamp applies identically on both
 paths: every interpolated point lies between two already-clamped targets, so streaming
@@ -818,9 +818,8 @@ Applied to every action, in this fixed order, before it reaches the arm:
 5. **There is no driver-side kinematic ceiling.** The calls that would carry one —
    `move_through_joint_positions` (via `MoveOptions`) and
    `move_through_joint_positions_streamed` (via each `TrajectoryPoint`'s
-   `KinematicConstraints`) — ship in no released `viam-sdk` (latest on PyPI is 0.80.0), so
-   this module pins `viam-sdk` to a git commit of `main` (0.81.0) that has them. The pin
-   makes those calls reachable; it does not set any constraint, so the velocity bound is
+   `KinematicConstraints`) — are reachable on the `viam-sdk` >= 0.82.0 this module
+   requires, but this module sets no constraint on them, so the velocity bound is
    still enforced entirely by layer 3:
 
    ```
@@ -1086,11 +1085,9 @@ Rules for setting it:
   plausible-looking but wrong motion. Sequential mode is unaffected.
 - **No driver-side velocity/acceleration ceilings.** The calls that would carry one —
   `move_through_joint_positions` (via `MoveOptions`) and `move_through_joint_positions_streamed`
-  (via each `TrajectoryPoint`'s `KinematicConstraints`) — ship in no released `viam-sdk`
-  (latest on PyPI is 0.80.0), so this module pins `viam-sdk` to a git commit of `main`
-  (0.81.0) that has them. The pin makes those calls reachable; it does not set any
-  constraint, so the velocity bound still lives entirely in the safety layer's per-tick
-  clamp (see [Safety](#safety)).
+  (via each `TrajectoryPoint`'s `KinematicConstraints`) — are reachable on `viam-sdk`
+  >= 0.82.0, but this module sets no constraint on them, so the velocity bound still
+  lives entirely in the safety layer's per-tick clamp (see [Safety](#safety)).
 - **`dtype` is parsed and validated but not applied.** Casting weights with
   `policy.to(dtype=...)` breaks inference on at least one target (the deserialized
   `DeviceProcessorStep` has `float_dtype=None` and keeps emitting float32 regardless).
@@ -1105,20 +1102,6 @@ mise run test        # fast suite: no torch, no network, seconds
 mise run test-all     # everything, including integration/differential (needs the lerobot extra)
 uv sync --extra lerobot  # required once before test-all, or before running integration/differential directly
 ```
-
-The git-pinned `viam-sdk` (see [Safety](#safety) item 5) installs without `libviam_rust_utils`,
-the native library the PyPI wheel bundles. `action_space: "joints"` never touches it. But
-`action_space: "delta-ee"` does, independently of networking: `pose.py`'s `orientation_vector`
-goes through `viam.spatialmath`'s quaternion conversion, which lazily loads that library on
-first use — so `mise run test` will fail under delta-ee coverage without it, not just
-`tools/replay_eval.py`, which dials a robot over WebRTC and needs it for that. Either way, fetch
-it into the venv `viam-sdk` installed into: download `libviam_rust_utils-<arch>.<ext>` for your
-platform from the `viamrobotics/rust-utils` GitHub releases page into
-`.venv/lib/python3.12/site-packages/viam/rpc/`, renamed to `libviam_rust_utils.<ext>`. Use the
-arch/ext names the SDK's own `.github/workflows/build-wheels.yml` uses (for example
-`macosx_arm64.dylib`, `macosx_x86_64.dylib`, `linux_x86_64.so`, `linux_aarch64.so`). On the
-robot, `setup.sh` does this download itself, so this manual step is only needed on a dev
-machine.
 
 ### Validating a checkpoint — `tools/replay_eval.py`
 
