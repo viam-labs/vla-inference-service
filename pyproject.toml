@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # 0.82: first release with `Arm.move_through_joint_positions_streamed`.
-    "viam-sdk>=0.83.0",
+    "viam-sdk>=0.84.0",
     "numpy>=2.0.0,<2.3.0",
     "pillow>=10.0.0",
     # Rotation algebra for action_space="delta-ee" (src/vla/controller/pose.py).
