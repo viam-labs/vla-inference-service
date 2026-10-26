@@ -93,9 +93,10 @@ LOGGER = logging.getLogger(__name__)
 class TickSchedule:
     """Absolute tick deadlines: tick k starts at `anchor + k * period`.
 
-    The anchor is taken lazily, by the first `nominal()` or `advance()` -- in
-    the loop, right after the first, blocking `next_action()`, so the first
-    inference is not a late tick. A tick that ends up to one period late
+    The anchor is taken lazily, by `nominal()` just before tick one's stream
+    send, or otherwise by tick one's `advance()` -- in the loop, after the
+    first, blocking `next_action()`, so the first inference is not a late
+    tick. A tick that ends up to one period late
     shortens the next one and the loop catches up on the grid. A tick more
     than a period late, at its end or by the time it asks for its nominal
     start, re-anchors at now: replaying missed ticks would stamp them in the
@@ -178,7 +179,8 @@ class VLAController(Generic, EasyResource):
         self._stream_points_sent = 0
         # Every pacing and scheduling decision reads this, so the smoothness
         # harness can run the real loop on a virtual clock (tests/smoothness.py).
-        # Set it before reconfigure/start: the scheduler and the stream capture it when they are built.
+        # Set it before start: AsyncScheduler captures it when built; the tick
+        # schedule reads it each loop.
         self._clock = time.perf_counter
 
     @classmethod
