@@ -113,6 +113,9 @@ class VLAController(Generic, EasyResource):
         self._stop_task: asyncio.Task | None = None
         self._stream: ArmStream | None = None
         self._stream_points_sent = 0
+        # Every pacing and scheduling decision reads this, so the smoothness
+        # harness can run the real loop on a virtual clock (tests/smoothness.py).
+        self._clock = time.perf_counter
 
     @classmethod
     def new(cls, config: ServiceConfig, dependencies: Mapping[Any, ResourceBase]) -> Self:
@@ -362,6 +365,7 @@ class VLAController(Generic, EasyResource):
                 self._cfg.fps,
                 limit,
                 merge=self._cfg.merge,
+                clock=self._clock,
             )
         return SequentialScheduler(lambda: self._infer(builder), limit)
 
@@ -598,7 +602,11 @@ class VLAController(Generic, EasyResource):
                 # `measured` is bound: config rejects "stream" with delta-ee. start()
                 # sends nothing; a driver without the RPC fails on tick one's check().
                 self._stream = ArmStream(
-                    arm, fps=cfg.fps, stream_hz=cfg.stream_hz, extra=dict(cfg.arm_move_extra)
+                    arm,
+                    fps=cfg.fps,
+                    stream_hz=cfg.stream_hz,
+                    extra=dict(cfg.arm_move_extra),
+                    clock=self._clock,
                 )
                 await self._stream.start(measured)
 
@@ -657,21 +665,21 @@ class VLAController(Generic, EasyResource):
         return decode_matrix(out["actions"])
 
     def _record_tick(self, last_tick: float) -> float:
-        now = time.perf_counter()
+        now = self._clock()
         elapsed = now - last_tick
         if elapsed > 0:
             self._measured_fps = 1.0 / elapsed
         return now
 
     async def _pace(self, tick_started: float, period: float) -> None:
-        remaining = period - (time.perf_counter() - tick_started)
+        remaining = period - (self._clock() - tick_started)
         if remaining > 0:
             await asyncio.sleep(remaining)
         else:
             LOGGER.warning(
                 "tick overran its budget: took %.4fs against a %.4fs budget (fps=%.2f); "
                 "the loop cannot keep pace and will drift instead of holding fps",
-                time.perf_counter() - tick_started,
+                self._clock() - tick_started,
                 period,
                 self._cfg.fps,
             )
@@ -681,13 +689,13 @@ class VLAController(Generic, EasyResource):
         arm = self._resource(cfg.arm)
         period = 1.0 / cfg.fps
         first = True
-        last_tick = time.perf_counter()
+        last_tick = self._clock()
         consecutive_failures = 0
         consecutive_starved_ticks = 0
         consecutive_rejected_moves = 0
 
         while True:
-            tick_started = time.perf_counter()
+            tick_started = self._clock()
 
             try:
                 action = await scheduler.next_action()
