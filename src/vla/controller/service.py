@@ -65,7 +65,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Any, ClassVar, Mapping, Self, Sequence
+from typing import Any, Callable, ClassVar, Mapping, Self, Sequence
 
 import numpy as np
 from viam.proto.app.robot import ServiceConfig
@@ -90,6 +90,57 @@ from .units import to_degrees, to_working
 LOGGER = logging.getLogger(__name__)
 
 
+class TickSchedule:
+    """Absolute tick deadlines: tick k starts at `anchor + k * period`.
+
+    The anchor is taken lazily, by the first `nominal()` or `advance()` -- in
+    the loop, right after the first, blocking `next_action()`, so the first
+    inference is not a late tick. A tick that ends up to one period late
+    shortens the next one and the loop catches up on the grid. A tick more
+    than a period late, at its end or by the time it asks for its nominal
+    start, re-anchors at now: replaying missed ticks would stamp them in the
+    past and the driver would send them as a burst.
+    """
+
+    def __init__(self, period: float, clock: Callable[[], float]) -> None:
+        self.period = period
+        self._clock = clock
+        self._anchor: float | None = None
+        self._k = 0
+        self.reanchors = 0
+
+    def nominal(self) -> float:
+        """Nominal start of the current tick."""
+        now = self._clock()
+        if self._anchor is None:
+            self._anchor = now
+        elif now - (self._anchor + self._k * self.period) > self.period:
+            self._reanchor(now, now - (self._anchor + self._k * self.period))
+        return self._anchor + self._k * self.period
+
+    def advance(self) -> float:
+        """End the current tick; return the seconds to sleep before the next."""
+        now = self._clock()
+        if self._anchor is None:
+            self._anchor = now
+        deadline = self._anchor + (self._k + 1) * self.period
+        if now - deadline > self.period:
+            self._reanchor(now, now - deadline)
+            return 0.0
+        self._k += 1
+        return max(0.0, deadline - now)
+
+    def _reanchor(self, now: float, late_by: float) -> None:
+        LOGGER.warning(
+            "tick overran its slot by %.4fs (more than one %.4fs period); re-anchoring "
+            "the tick schedule rather than replaying the missed ticks as a burst",
+            late_by,
+            self.period,
+        )
+        self._anchor, self._k = now, 0
+        self.reanchors += 1
+
+
 class VLAController(Generic, EasyResource):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "vla"), "controller")
 
@@ -108,6 +159,7 @@ class VLAController(Generic, EasyResource):
         self._latencies: deque[float] = deque(maxlen=50)
         self._measured_fps = 0.0
         self._starved_ticks = 0
+        self._schedule: TickSchedule | None = None
         self._scheduler: ChunkScheduler | None = None
         self._mode: str | None = None
         self._stop_task: asyncio.Task | None = None
@@ -154,6 +206,7 @@ class VLAController(Generic, EasyResource):
         self._latencies.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
+        self._schedule = None
         self._state = "idle"
         self._last_error = None
         self._log_velocity_budget()
@@ -242,6 +295,11 @@ class VLAController(Generic, EasyResource):
             # whole session, the same shape as clamp_counts, so an operator
             # can see the loop is quietly stalling without reading logs.
             "starved_ticks": self._starved_ticks,
+            # Cumulative re-anchors of the tick schedule: ticks that ran more
+            # than a full period late, after which the loop resumed from now
+            # instead of replaying them. Expected at every chunk boundary under
+            # mode="sequential" (each one blocks for a whole inference).
+            "reanchors": self._schedule.reanchors if self._schedule else 0,
             # AsyncScheduler only; None/0 under sequential or before a scheduler exists.
             "queue_threshold": self._scheduler.queue_threshold if is_async else None,
             "dropped_stale_rows": self._scheduler.dropped_stale_rows if is_async else 0,
@@ -274,6 +332,7 @@ class VLAController(Generic, EasyResource):
         self._latencies.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
+        self._schedule = None
         self._state = "waiting_for_policy"
         # Ack immediately: waiting out policy_ready_timeout_s inline would
         # exceed the deadline most DoCommand callers use, so the "still
@@ -607,7 +666,6 @@ class VLAController(Generic, EasyResource):
                     fps=cfg.fps,
                     stream_hz=cfg.stream_hz,
                     extra=dict(cfg.arm_move_extra),
-                    clock=self._clock,
                 )
                 await self._stream.start(measured)
 
@@ -672,23 +730,15 @@ class VLAController(Generic, EasyResource):
             self._measured_fps = 1.0 / elapsed
         return now
 
-    async def _pace(self, tick_started: float, period: float) -> None:
-        remaining = period - (self._clock() - tick_started)
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        else:
-            LOGGER.warning(
-                "tick overran its budget: took %.4fs against a %.4fs budget (fps=%.2f); "
-                "the loop cannot keep pace and will drift instead of holding fps",
-                self._clock() - tick_started,
-                period,
-                self._cfg.fps,
-            )
+    async def _pace(self, schedule: TickSchedule) -> None:
+        delay = schedule.advance()
+        if delay > 0:
+            await asyncio.sleep(delay)
 
     async def _loop(self, scheduler: ChunkScheduler, gripper: GripperAdapter) -> None:
         cfg = self._cfg
         arm = self._resource(cfg.arm)
-        period = 1.0 / cfg.fps
+        schedule = self._schedule = TickSchedule(1.0 / cfg.fps, self._clock)
         first = True
         last_tick = self._clock()
         consecutive_failures = 0
@@ -696,8 +746,6 @@ class VLAController(Generic, EasyResource):
         consecutive_rejected_moves = 0
 
         while True:
-            tick_started = self._clock()
-
             try:
                 action = await scheduler.next_action()
             except asyncio.CancelledError:
@@ -731,7 +779,7 @@ class VLAController(Generic, EasyResource):
                         "regardless of stop_on_error"
                     ) from exc
                 last_tick = self._record_tick(last_tick)
-                await self._pace(tick_started, period)
+                await self._pace(schedule)
                 continue
 
             consecutive_failures = 0
@@ -757,7 +805,7 @@ class VLAController(Generic, EasyResource):
                         f"{cfg.starvation_grace_ticks}; stopping"
                     )
                 last_tick = self._record_tick(last_tick)
-                await self._pace(tick_started, period)
+                await self._pace(schedule)
                 continue
 
             consecutive_starved_ticks = 0
@@ -774,14 +822,22 @@ class VLAController(Generic, EasyResource):
                             f"{cfg.starvation_grace_ticks}; stopping"
                         )
             else:
-                await self._command_joints(arm, gripper, action, check_start=first)
+                await self._command_joints(
+                    arm, gripper, action, check_start=first, nominal_t=schedule.nominal()
+                )
                 first = False
 
             last_tick = self._record_tick(last_tick)
-            await self._pace(tick_started, period)
+            await self._pace(schedule)
 
     async def _command_joints(
-        self, arm: Any, gripper: GripperAdapter, action: np.ndarray, *, check_start: bool
+        self,
+        arm: Any,
+        gripper: GripperAdapter,
+        action: np.ndarray,
+        *,
+        check_start: bool,
+        nominal_t: float | None = None,
     ) -> None:
         """One tick of `action_space="joints"`: clamp, then write joint angles."""
         cfg = self._cfg
@@ -847,7 +903,7 @@ class VLAController(Generic, EasyResource):
         # stream: `extra` went with the stream open; the target is densified.
         if self._stream is not None:
             self._stream.check()
-            await self._stream.send(target)
+            await self._stream.send(target, nominal_t)
         else:
             await arm.move_to_joint_positions(
                 JointPositions(values=target), extra=dict(cfg.arm_move_extra)
