@@ -965,7 +965,7 @@ raw chunk and `L` the latency in ticks, it starves when the rows a landing leave
 roughly latency over half the policy's raw chunk without `actions_per_chunk`. Every landing
 is entirely stale once latency reaches the whole chunk. Measured on
 `smolvla-box-bot-subtasks` (chunk 50 at 30 fps = 1.67 s), `num_steps: 4` (0.58 s = 18 ticks,
-under 25) fits; `num_steps: 10` (1.07 s = 32 ticks) starves. `merge` still defaults to
+under 25) fits; `num_steps: 10` (1.07 s = 34 ticks) starves. `merge` still defaults to
 `"append"` until an on-robot run confirms the replace semantics.
 
 ### Cutting inference latency: `num_steps`
