@@ -99,10 +99,15 @@ class TickSchedule:
     shortens the next one and the loop catches up on the grid. A tick more
     than a period late, at its end or by the time it asks for its nominal
     start, re-anchors at now: replaying missed ticks would stamp them in the
-    past and the driver would send them as a burst.
+    past and the driver would send them as a burst. Catching up is stream-only
+    (`catch_up=False` restarts the grid after any late tick): without a stamped
+    grid, shortened ticks would pack arm commands closer than a full period.
     """
 
-    def __init__(self, period: float, clock: Callable[[], float]) -> None:
+    def __init__(
+        self, period: float, clock: Callable[[], float], *, catch_up: bool = True
+    ) -> None:
+        self._catch_up = catch_up
         self.period = period
         self._clock = clock
         self._anchor: float | None = None
@@ -126,6 +131,12 @@ class TickSchedule:
         deadline = self._anchor + (self._k + 1) * self.period
         if now - deadline > self.period:
             self._reanchor(now, now - deadline)
+            return 0.0
+        if not self._catch_up and now > deadline:
+            # No streamed grid to honour: start the next tick now rather than
+            # shortening it, so arm commands are never packed closer than the
+            # tick's own work -- the per-tick safety clamp assumes a full period.
+            self._anchor, self._k = now, 0
             return 0.0
         self._k += 1
         return max(0.0, deadline - now)
@@ -738,7 +749,9 @@ class VLAController(Generic, EasyResource):
     async def _loop(self, scheduler: ChunkScheduler, gripper: GripperAdapter) -> None:
         cfg = self._cfg
         arm = self._resource(cfg.arm)
-        schedule = self._schedule = TickSchedule(1.0 / cfg.fps, self._clock)
+        schedule = self._schedule = TickSchedule(
+            1.0 / cfg.fps, self._clock, catch_up=cfg.arm_write == "stream"
+        )
         first = True
         last_tick = self._clock()
         consecutive_failures = 0
@@ -823,7 +836,7 @@ class VLAController(Generic, EasyResource):
                         )
             else:
                 await self._command_joints(
-                    arm, gripper, action, check_start=first, nominal_t=schedule.nominal()
+                    arm, gripper, action, check_start=first, nominal=schedule.nominal
                 )
                 first = False
 
@@ -837,7 +850,7 @@ class VLAController(Generic, EasyResource):
         action: np.ndarray,
         *,
         check_start: bool,
-        nominal_t: float | None = None,
+        nominal: Callable[[], float],
     ) -> None:
         """One tick of `action_space="joints"`: clamp, then write joint angles."""
         cfg = self._cfg
@@ -903,7 +916,10 @@ class VLAController(Generic, EasyResource):
         # stream: `extra` went with the stream open; the target is densified.
         if self._stream is not None:
             self._stream.check()
-            await self._stream.send(target, nominal_t)
+            # Asked for here, after the reads above and right before the send: a
+            # tick more than a period late re-anchors in this call, which keeps
+            # the first stamp (nominal + lead + step) at least `step` in the future.
+            await self._stream.send(target, nominal())
         else:
             await arm.move_to_joint_positions(
                 JointPositions(values=target), extra=dict(cfg.arm_move_extra)

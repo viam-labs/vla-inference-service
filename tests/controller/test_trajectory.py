@@ -151,7 +151,7 @@ async def test_a_late_send_inside_the_lead_keeps_uniform_spacing():
     stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={})
     await stream.start([0.0, 0.0])
     await stream.send([3.0, 3.0], 0.0)
-    await asyncio.sleep(0.05)  # this tick's send runs 50 ms late in real time
+    await asyncio.sleep(0.05)  # deliberate real sleep: the late send under test; this tick's send runs 50 ms late in real time
     await stream.send([6.0, 6.0], 0.1)
     await _wait_for_points(arm, 7)
     times = [p.time.total_seconds() for p in arm.stream_points[1:]]
