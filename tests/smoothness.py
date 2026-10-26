@@ -53,7 +53,9 @@ class VirtualLoop(asyncio.SelectorEventLoop):
     """An event loop whose clock jumps to the next timer instead of waiting.
 
     `asyncio.sleep`, `wait_for`, and `call_at` all key off `time()`, so they
-    become virtual and event-ordered with no further injection.
+    become virtual and event-ordered with no further injection. It assumes all
+    awaited work is timer-driven: real threads (`to_thread`/executors) would
+    race the virtual clock.
     """
 
     def __init__(self) -> None:
@@ -98,7 +100,9 @@ class ScriptedPolicy:
     when the request arrived, plus the chunk's offset, so consecutive chunks
     disagree by a known amount at every seam. The first inference takes
     `cold_extra_s` longer: the schedule anchors after it, and without the
-    offset every later reply would land exactly on a tick boundary.
+    offset every later reply would land exactly on a tick boundary. It must
+    answer `ready`: `_await_policy` polls on a real `time.monotonic()` deadline
+    and would spin hot in virtual time otherwise.
     """
 
     def __init__(self, latency_s: float, offsets=(0.0,), cold_extra_s: float = 0.05):
@@ -301,7 +305,11 @@ def _landing_knots(session: Session, skip: int = 1) -> list[int]:
 
 def landing_obs_age(session: Session) -> float:
     """Max over landings of (exec time - observation time) for the first knot
-    after the landing. Observation age, not the README's 'staleness'."""
+    after the landing. Observation age, not the README's 'staleness'.
+
+    The TAG channel decodes the source chunk only while knots are unblended
+    rows, so don't combine this with `blend_ticks > 0`: a crossfade
+    interpolates the tag too."""
     ages = []
     for i in _landing_knots(session):
         t, positions = session.arm.knots[i]
@@ -321,7 +329,9 @@ def seam_jump(session: Session, window: int = 5) -> float:
     pos = np.array([p for _, p in session.arm.knots])[:, :TAG]
     acc = np.abs(np.diff(pos, n=2, axis=0)).max(axis=1)  # acc[m] is centred on knot m+1
     worst = 0.0
-    for i in _landing_knots(session, skip=2):
+    landings = _landing_knots(session, skip=2)
+    assert landings, "seam_jump: no background landings to measure"
+    for i in landings:
         lo, hi = max(0, i - 2), min(len(acc), i + window)
         if lo < hi:
             worst = max(worst, float(acc[lo:hi].max()))
