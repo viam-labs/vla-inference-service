@@ -774,6 +774,20 @@ def test_skip_composes_with_actions_per_chunk():
     np.testing.assert_allclose(queue.queue, [[4.0], [5.0], [6.0]])
 
 
+def test_skip_then_truncate_then_replace():
+    queue = ActionQueue()
+    queue.merge(np.full((5, 1), 99.0, dtype=np.float32))
+    processed = np.arange(10).reshape(10, 1).astype(np.float32)
+    skipped = _validate_and_merge(queue, processed, actions_per_chunk=3, skip=4, replace=True)
+    assert skipped == 4
+    np.testing.assert_array_equal(queue.queue, [[4.0], [5.0], [6.0]])  # old rows gone
+
+
+def test_async_scheduler_refuses_negative_blend_dims():
+    with pytest.raises(ValueError, match="blend_dims"):
+        AsyncScheduler(RampInfer(), queue_threshold=1, blend_dims=-1)
+
+
 async def test_aligned_merge_skips_rows_for_ticks_already_served_and_replaces():
     s = AsyncScheduler(RampInfer(n=10), queue_threshold=7, fps=10.0, merge="aligned")
 

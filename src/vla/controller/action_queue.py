@@ -86,13 +86,13 @@ class ActionQueue:
         with self.lock:
             new = actions.copy()
             old = None if self.queue is None else self.queue[self.last_index :]
+            if old is not None and old.shape[1] != new.shape[1]:
+                raise ActionQueueError(
+                    f"cannot replace a {old.shape[1]}-column queue with a "
+                    f"{new.shape[1]}-column chunk"
+                )
             b = 0 if old is None else min(blend_ticks, len(old), len(new))
             if b:
-                if old.shape[1] != new.shape[1]:
-                    raise ActionQueueError(
-                        f"cannot blend a {new.shape[1]}-column chunk into a "
-                        f"{old.shape[1]}-column queue"
-                    )
                 d = new.shape[1] if blend_dims is None else blend_dims
                 w = (np.arange(1, b + 1) / (b + 1))[:, None]
                 new[:b, :d] = old[:b, :d] + w * (new[:b, :d] - old[:b, :d])

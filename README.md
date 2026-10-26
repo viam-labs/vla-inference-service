@@ -320,7 +320,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `queue_threshold` | integer | derived (effective chunk length − 1) | `mode: "async"` only: refill fires once the queue has this many actions left. Derived from `actions_per_chunk` when set, else from the checkpoint's `n_action_steps`. Leave unset — see [Performance](#performance). |
 | `merge` | `append` \| `aligned` | `"append"` | `mode: "async"` only: how a landing chunk is merged into the queue. `aligned` replaces the queued rows with the landing chunk, minus rows for ticks already served — see [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then). |
 | `blend_ticks` | integer | `0` | `merge: "aligned"` only: crossfade the first N rows of each landing chunk from the rows they supersede, arm joints only (the gripper always switches outright). `0` is a hard switch. |
-| `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). |
+| `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). Under `merge: "aligned"`, N counts from the first row not already stale when the chunk lands. |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
 | `state_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). Under `delta-ee` this is per-segment; see [Units](#units). |
@@ -550,7 +550,7 @@ What to read it for:
   because their ticks had already been served when the chunk landed; always `0` under
   `append`. Rows the landing chunk supersedes are not counted. Ticks are counted in loop
   iterations, not wall time, so an overrun drops no rows. A value rising by a whole chunk at
-  a time means latency is over the effective chunk length — see
+  a time means latency is over the policy's raw chunk length — see
   [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then).
 - `reanchors` — cumulative ticks that ran more than a full period late, after which the loop
   resumed its schedule from now instead of replaying the missed ticks. Under
@@ -957,8 +957,8 @@ predictions. Start at `0` and raise it only if the seam is audible.
 
 With the default derived `queue_threshold`, inference runs back to back and each chunk
 supersedes the last: the most closed-loop setting the latency allows. It starves only when
-latency exceeds the effective chunk length, at which point every landing chunk is entirely
-stale. Measured on `smolvla-box-bot-subtasks` (chunk 50 at 30 fps = 1.67 s), both
+latency exceeds the policy's raw chunk length (`actions_per_chunk` truncates after the skip),
+at which point every landing chunk is entirely stale. Measured on `smolvla-box-bot-subtasks` (chunk 50 at 30 fps = 1.67 s), both
 `num_steps: 10` (1.07 s) and `num_steps: 4` (0.58 s) fit, the latter with three times the
 margin. `merge` still defaults to `"append"` until an on-robot run confirms the replace
 semantics.
@@ -966,7 +966,7 @@ semantics.
 ### Cutting inference latency: `num_steps`
 
 Latency decides whether `merge: "aligned"` above is usable at all: it needs inference to
-finish within the effective chunk's duration, and the shorter the latency the fresher every executed row. smolvla's `num_steps` (10 by default) is the
+finish within the policy's raw chunk duration, and the shorter the latency the fresher every executed row. smolvla's `num_steps` (10 by default) is the
 flow-matching step count and the dominant tunable term in that latency. Measured on the
 Jetson Orin with `smolvla-box-bot-subtasks`: 1.07 s at 10 steps, 0.66 s at 5, 0.58 s at 4,
 roughly 0.25 s fixed plus 0.08 s per step. Set `num_steps` on the `#policy` service to trade

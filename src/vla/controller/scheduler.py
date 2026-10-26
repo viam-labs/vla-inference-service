@@ -210,7 +210,8 @@ class AsyncScheduler(ChunkScheduler):
       - `next_action` never blocks except on the very first call (nothing
         queued, nothing in flight) and, symmetrically, whenever the queue
         has run dry before any background inference was requested (e.g.
-        `queue_threshold=0`).
+        `queue_threshold=0`), or after a background landing that was
+        entirely stale, or failed.
       - When the queue is empty and an inference is already in flight,
         `next_action` returns `None` immediately rather than blocking.
       - A background failure is never raised from inside the background
@@ -233,8 +234,9 @@ class AsyncScheduler(ChunkScheduler):
     immune to tick jitter. `blend_ticks` crossfades the first rows of the
     first `blend_dims` columns from old to new. With the derived threshold
     (effective chunk - 1) inference runs back to back and each chunk
-    supersedes the last. It starves only when latency exceeds the effective
-    chunk length, when every landing chunk is entirely stale.
+    supersedes the last. It starves only when latency exceeds the policy's
+    raw chunk length (actions_per_chunk truncates after the skip), when
+    every landing chunk is entirely stale.
     """
 
     def __init__(
@@ -254,6 +256,8 @@ class AsyncScheduler(ChunkScheduler):
         self._actions_per_chunk = actions_per_chunk
         self._fps = fps
         self._merge = merge
+        if blend_dims is not None and blend_dims < 0:
+            raise ValueError(f"blend_dims must be >= 0, got {blend_dims}")
         self._blend_ticks = blend_ticks
         self._blend_dims = blend_dims
         # Every next_action call, starved or not: the unit the aligned skip
