@@ -318,7 +318,8 @@ backoff for up to `policy_ready_timeout_s`.
 | `fps` | number | `10.0` | Control loop rate. |
 | `mode` | `sequential` \| `async` | `"sequential"` | Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). |
 | `queue_threshold` | integer | derived (effective chunk length − 1) | `mode: "async"` only: refill fires once the queue has this many actions left. Derived from `actions_per_chunk` when set, else from the checkpoint's `n_action_steps`. Leave unset — see [Performance](#performance). |
-| `merge` | `append` \| `aligned` | `"append"` | `mode: "async"` only: how a landing chunk is merged into the queue. `aligned` drops stale head rows instead of appending behind them — see [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then). |
+| `merge` | `append` \| `aligned` | `"append"` | `mode: "async"` only: how a landing chunk is merged into the queue. `aligned` replaces the queued rows with the landing chunk, minus rows for ticks already served — see [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then). |
+| `blend_ticks` | integer | `0` | `merge: "aligned"` only: crossfade the first N rows of each landing chunk from the rows they supersede, arm joints only (the gripper always switches outright). `0` is a hard switch. |
 | `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
@@ -545,10 +546,18 @@ What to read it for:
   [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk).
 - `queue_threshold` — the scheduler's actual refill threshold under `mode: "async"`; `null`
   under `sequential`, where the concept does not apply.
-- `dropped_stale_rows` — cumulative rows discarded by `merge: "aligned"` as too stale to
-  execute; always `0` under `append`. A persistently rising value means observed latency is
-  near or over half the chunk length — see
+- `dropped_stale_rows` — cumulative head rows of landing chunks skipped by `merge: "aligned"`
+  because their ticks had already been served when the chunk landed; always `0` under
+  `append`. Rows the landing chunk supersedes are not counted. Ticks are counted in loop
+  iterations, not wall time, so an overrun drops no rows. A value rising by a whole chunk at
+  a time means latency is over the effective chunk length — see
   [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then).
+- `reanchors` — cumulative ticks that ran more than a full period late, after which the loop
+  resumed its schedule from now instead of replaying the missed ticks. Under
+  `arm_write: "stream"`, a tick up to one period late is caught up silently on the fixed grid.
+  Other modes start the next tick immediately instead, so arm commands are never packed
+  closer than a tick's own work. Expected at every chunk boundary under `mode: "sequential"`,
+  where each refill blocks for a whole inference.
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
 - `arm_write` — `"setpoint"` or `"stream"`, echoing the configured value.
@@ -677,7 +686,7 @@ streamed RPC, `move_through_joint_positions_streamed`, sends each `TrajectoryPoi
 verbatim at its stamped time, so under `arm_write: "stream"` the controller densifies.
 
 What gets sent: `round(stream_hz / fps)` linearly interpolated points per tick (100 at
-`fps: 30` rounds to 3 per tick, 90 Hz), stamped one tick ahead of when each is due. The
+`fps: 30` rounds to 3 per tick, 90 Hz), stamped one tick ahead of the tick's *nominal* start on the loop's fixed schedule, not of when the tick happened to run, so tick-to-tick jitter in the control loop never reaches the arm. The
 lead matters because a point that arrives past its stamp is sent immediately, and a
 stream where every point is late collapses back into bursts at `fps`. The mandatory
 rest point at `time=0` ships in the *same* batch as tick one's motion points: which
@@ -938,26 +947,26 @@ then the incoming chunk's head pulls it back to where the policy thought it shou
 a moment earlier: a visible yank at every chunk boundary. Measured on the xArm: a delta-clamp
 burst every 1.72 s, exactly one per 50-row chunk at 29 fps.
 
-`merge: "aligned"` fixes this by dropping the head rows of every landing chunk whose moment
-has already passed, instead of appending them. With `L` ticks of observed inference latency
-and `q` rows still queued when the chunk lands, it skips the first `L + q - 1` rows, so the
-first row it actually merges is the first one whose intended tick is still in the future. The
-queue only ever holds rows for now or later, never for then — at the cost of throwing part of
-every chunk away, tracked in `status.dropped_stale_rows`.
+`merge: "aligned"` fixes this by having every landing chunk *replace* what is still queued,
+minus its head rows for ticks already served since the request fired. Those are counted in
+control-loop iterations, so the skip is exact whatever the tick jitter. The queue only ever
+holds rows for now or later, and they are always the freshest prediction available. Skipped
+head rows are tracked in `status.dropped_stale_rows`. `blend_ticks: N` crossfades the first
+N rows from the rows they supersede, which softens the switch at the cost of N ticks of mixed
+predictions. Start at `0` and raise it only if the seam is audible.
 
-That only works while latency stays under about half the chunk length — past that, each
-chunk yields fewer fresh rows than the next inference takes to arrive, and the queue starves
-faster than it can be refilled. Measured on `smolvla-box-bot-subtasks` (chunk 50 at 30 fps =
-1.67 s): at `num_steps: 10`, latency was 1.07 s = 34 ticks — over half the chunk, so `aligned`
-would starve roughly half the time. At `num_steps: 4`, latency drops to 0.58 s = 18 ticks,
-comfortably under half, and `aligned` runs with zero staleness and no starvation. This is why
-`merge` defaults to `"append"`: `"aligned"` is a clear win only once latency is known to sit
-well inside that half-chunk budget.
+With the default derived `queue_threshold`, inference runs back to back and each chunk
+supersedes the last: the most closed-loop setting the latency allows. It starves only when
+latency exceeds the effective chunk length, at which point every landing chunk is entirely
+stale. Measured on `smolvla-box-bot-subtasks` (chunk 50 at 30 fps = 1.67 s), both
+`num_steps: 10` (1.07 s) and `num_steps: 4` (0.58 s) fit, the latter with three times the
+margin. `merge` still defaults to `"append"` until an on-robot run confirms the replace
+semantics.
 
 ### Cutting inference latency: `num_steps`
 
 Latency decides whether `merge: "aligned"` above is usable at all: it needs inference to
-finish in under half the chunk's duration. smolvla's `num_steps` (10 by default) is the
+finish within the effective chunk's duration, and the shorter the latency the fresher every executed row. smolvla's `num_steps` (10 by default) is the
 flow-matching step count and the dominant tunable term in that latency. Measured on the
 Jetson Orin with `smolvla-box-bot-subtasks`: 1.07 s at 10 steps, 0.66 s at 5, 0.58 s at 4,
 roughly 0.25 s fixed plus 0.08 s per step. Set `num_steps` on the `#policy` service to trade

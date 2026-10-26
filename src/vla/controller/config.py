@@ -51,10 +51,12 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 between chunks -- for the case where inference latency approaches or exceeds
 chunk duration. `"sequential"` is the default. See `AsyncScheduler`.
 
-`merge: "aligned"` drops the head rows of a landing chunk whose moment has
-already passed, so append mode's chunk-boundary yank disappears; it needs
-`mode: "async"` (the blocking scheduler just stalled for those rows and does not
-record when it fired). README: "merge: aligned".
+`merge: "aligned"` replaces the queued rows with each landing chunk, minus its
+head rows for ticks already served since the request fired, so append mode's
+chunk-boundary yank disappears. `blend_ticks` (default 0, a hard switch)
+crossfades the first rows of the arm columns from old to new and needs
+`aligned`. `aligned` needs `mode: "async"` (the blocking scheduler just stalled
+for those rows and does not count ticks across a fire). README: "merge: aligned".
 
 `arm_write: "stream"` densifies each tick's target into `round(stream_hz / fps)`
 servo setpoints over `move_through_joint_positions_streamed`; one setpoint per
@@ -507,6 +509,7 @@ class ControllerConfig:
     fps: float = 10.0
     mode: str = "sequential"
     merge: str = "append"
+    blend_ticks: int = 0
     queue_threshold: int | None = None
     actions_per_chunk: int | None = None
     starvation_grace_ticks: int = 3
@@ -599,6 +602,12 @@ class ControllerConfig:
                 "aligning would discard rows the loop just stalled to obtain, making the "
                 "duty cycle worse, and it does not track when its inference was fired anyway"
             )
+        blend_ticks = as_int(raw.get("blend_ticks", 0), "blend_ticks", minimum=0)
+        if blend_ticks and merge != "aligned":
+            raise ConfigError(
+                f"blend_ticks={blend_ticks} needs merge: \"aligned\" -- only an aligned "
+                "merge replaces queued rows, so under append there is nothing to blend from"
+            )
 
         arm_write = as_choice(raw.get("arm_write", "setpoint"), "arm_write", ARM_WRITES)
         stream_hz = as_float(raw.get("stream_hz", 100.0), "stream_hz", minimum=1.0, maximum=1000.0)
@@ -624,6 +633,7 @@ class ControllerConfig:
             fps=fps,
             mode=mode,
             merge=merge,
+            blend_ticks=blend_ticks,
             queue_threshold=(
                 as_int(raw["queue_threshold"], "queue_threshold", minimum=0)
                 if raw.get("queue_threshold") is not None
