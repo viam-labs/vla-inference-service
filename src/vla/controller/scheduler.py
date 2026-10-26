@@ -234,9 +234,11 @@ class AsyncScheduler(ChunkScheduler):
     immune to tick jitter. `blend_ticks` crossfades the first rows of the
     first `blend_dims` columns from old to new. With the derived threshold
     (effective chunk - 1) inference runs back to back and each chunk
-    supersedes the last. It starves only when latency exceeds the policy's
-    raw chunk length (actions_per_chunk truncates after the skip), when
-    every landing chunk is entirely stale.
+    supersedes the last. It starves when the rows a landing leaves,
+    min(actions_per_chunk, N - L), are fewer than the L ticks until the next
+    landing (N the policy's raw chunk, L the latency in ticks): roughly
+    latency over half the policy's raw chunk without actions_per_chunk.
+    Every landing is entirely stale once latency reaches the whole chunk.
     """
 
     def __init__(

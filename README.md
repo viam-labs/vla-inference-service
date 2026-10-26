@@ -549,15 +549,17 @@ What to read it for:
 - `dropped_stale_rows` — cumulative head rows of landing chunks skipped by `merge: "aligned"`
   because their ticks had already been served when the chunk landed; always `0` under
   `append`. Rows the landing chunk supersedes are not counted. Ticks are counted in loop
-  iterations, not wall time, so an overrun drops no rows. A value rising by a whole chunk at
-  a time means latency is over the policy's raw chunk length — see
+  iterations, not wall time, so an overrun drops no rows. Latency over half the chunk shows
+  up as rising `starved_ticks`; a value rising by a whole chunk at a time means latency is
+  over the whole chunk — see
   [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then).
 - `reanchors` — cumulative ticks that ran more than a full period late, after which the loop
   resumed its schedule from now instead of replaying the missed ticks. Under
   `arm_write: "stream"`, a tick up to one period late is caught up silently on the fixed grid.
   Other modes start the next tick immediately instead, so arm commands are never packed
-  closer than a tick's own work. Expected at every chunk boundary under `mode: "sequential"`,
-  where each refill blocks for a whole inference.
+  closer than a tick's own work. Under other `arm_write` modes, an overrun shorter than a
+  period restarts the schedule silently and is not counted. Expected at every chunk boundary
+  under `mode: "sequential"`, where each refill blocks for a whole inference.
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
 - `arm_write` — `"setpoint"` or `"stream"`, echoing the configured value.
@@ -686,8 +688,9 @@ streamed RPC, `move_through_joint_positions_streamed`, sends each `TrajectoryPoi
 verbatim at its stamped time, so under `arm_write: "stream"` the controller densifies.
 
 What gets sent: `round(stream_hz / fps)` linearly interpolated points per tick (100 at
-`fps: 30` rounds to 3 per tick, 90 Hz), stamped one tick ahead of the tick's *nominal* start on the loop's fixed schedule, not of when the tick happened to run, so tick-to-tick jitter in the control loop never reaches the arm. The
-lead matters because a point that arrives past its stamp is sent immediately, and a
+`fps: 30` rounds to 3 per tick, 90 Hz), stamped one tick ahead of the tick's *nominal*
+start on the loop's fixed schedule, not of when the tick happened to run, so tick-to-tick
+jitter in the control loop never reaches the arm. The lead matters because a point that arrives past its stamp is sent immediately, and a
 stream where every point is late collapses back into bursts at `fps`. The mandatory
 rest point at `time=0` ships in the *same* batch as tick one's motion points: which
 point a driver anchors its clock on is version-dependent, and keeping both together
@@ -956,18 +959,21 @@ N rows from the rows they supersede, which softens the switch at the cost of N t
 predictions. Start at `0` and raise it only if the seam is audible.
 
 With the default derived `queue_threshold`, inference runs back to back and each chunk
-supersedes the last: the most closed-loop setting the latency allows. It starves only when
-latency exceeds the policy's raw chunk length (`actions_per_chunk` truncates after the skip),
-at which point every landing chunk is entirely stale. Measured on `smolvla-box-bot-subtasks` (chunk 50 at 30 fps = 1.67 s), both
-`num_steps: 10` (1.07 s) and `num_steps: 4` (0.58 s) fit, the latter with three times the
-margin. `merge` still defaults to `"append"` until an on-robot run confirms the replace
-semantics.
+supersedes the last: the most closed-loop setting the latency allows. With `N` the policy's
+raw chunk and `L` the latency in ticks, it starves when the rows a landing leaves,
+`min(actions_per_chunk, N − L)`, are fewer than the `L` ticks until the next landing:
+roughly latency over half the policy's raw chunk without `actions_per_chunk`. Every landing
+is entirely stale once latency reaches the whole chunk. Measured on
+`smolvla-box-bot-subtasks` (chunk 50 at 30 fps = 1.67 s), `num_steps: 4` (0.58 s = 18 ticks,
+under 25) fits; `num_steps: 10` (1.07 s = 32 ticks) starves. `merge` still defaults to
+`"append"` until an on-robot run confirms the replace semantics.
 
 ### Cutting inference latency: `num_steps`
 
 Latency decides whether `merge: "aligned"` above is usable at all: it needs inference to
-finish within the policy's raw chunk duration, and the shorter the latency the fresher every executed row. smolvla's `num_steps` (10 by default) is the
-flow-matching step count and the dominant tunable term in that latency. Measured on the
+finish within half the policy's raw chunk duration, and the shorter the latency the
+fresher every executed row. smolvla's `num_steps` (10 by default) is the flow-matching
+step count and the dominant tunable term in that latency. Measured on the
 Jetson Orin with `smolvla-box-bot-subtasks`: 1.07 s at 10 steps, 0.66 s at 5, 0.58 s at 4,
 roughly 0.25 s fixed plus 0.08 s per step. Set `num_steps` on the `#policy` service to trade
 some action quality for speed, and measure both: `avg_latency_s` in the controller's `status`

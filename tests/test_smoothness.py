@@ -139,3 +139,14 @@ def test_seam_blend_softens_the_switch():
     # (~0.25x). Measured while planning: 10.1 vs 2.58, before the first landing
     # was excluded from seam_jump.
     assert seam_jump(blended) <= 0.5 * seam_jump(hard), (seam_jump(blended), seam_jump(hard))
+
+
+def test_aligned_starves_past_half_the_chunk():
+    # Each landing leaves CHUNK - L fresh rows and the next lands L ticks
+    # later, so aligned keeps up only while L <= CHUNK / 2 (25 ticks here).
+    under = run_session(latency_s=1.97, duration_s=20.0, starvation_grace_ticks=3)
+    _assert_healthy(under)
+    assert under.status["starved_ticks"] == 0
+    over = run_session(latency_s=3.03, duration_s=20.0, starvation_grace_ticks=3)
+    assert over.status["state"] == "error", over.status
+    assert "starved" in over.status["last_error"]
