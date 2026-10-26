@@ -76,3 +76,35 @@ def test_schedule_advance_anchors_a_tick_that_never_asked_for_nominal():
     s = TickSchedule(0.1, clock)
     assert s.advance() == pytest.approx(0.1)
     assert s.reanchors == 0
+
+
+def test_schedule_without_catch_up_restarts_the_grid_after_any_late_tick():
+    clock = _Clock(0.0)
+    s = TickSchedule(0.1, clock, catch_up=False)
+    s.nominal()
+    clock.now = 0.16
+    assert s.advance() == 0.0
+    assert s.nominal() == pytest.approx(0.16)
+    assert s.reanchors == 0
+
+
+def test_schedule_a_tick_late_by_exactly_one_period_does_not_reanchor():
+    clock = _Clock(0.0)
+    s = TickSchedule(0.1, clock)
+    s.nominal()
+    clock.now = 0.2
+    assert s.advance() == 0.0
+    assert s.reanchors == 0
+
+
+def test_schedule_nominal_reanchor_then_advance_in_the_same_tick():
+    clock = _Clock(0.0)
+    s = TickSchedule(0.1, clock)
+    s.nominal()
+    clock.now = 0.05
+    s.advance()
+    clock.now = 2.0
+    assert s.nominal() == pytest.approx(2.0)
+    clock.now = 2.03
+    assert s.advance() == pytest.approx(0.07)
+    assert s.reanchors == 1
