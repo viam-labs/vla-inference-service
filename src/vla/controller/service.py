@@ -426,7 +426,9 @@ class VLAController(Generic, EasyResource):
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, 5.0)
 
-    def _build_scheduler(self, mode: str, builder: ObservationBuilder) -> ChunkScheduler:
+    def _build_scheduler(
+        self, mode: str, builder: ObservationBuilder, blend_dims: int
+    ) -> ChunkScheduler:
         limit = self._cfg.actions_per_chunk
         if mode == "async":
             threshold = self._resolve_queue_threshold()
@@ -436,9 +438,23 @@ class VLAController(Generic, EasyResource):
                 self._cfg.fps,
                 limit,
                 merge=self._cfg.merge,
+                blend_ticks=self._cfg.blend_ticks,
+                blend_dims=blend_dims,
                 clock=self._clock,
             )
         return SequentialScheduler(lambda: self._infer(builder), limit)
+
+    def _blend_dims(self, specs: dict[str, Any], gripper: GripperAdapter) -> int:
+        """How many leading action columns `blend_ticks` may crossfade.
+
+        The gripper channel, when there is one, is always the last action
+        column -- `_command_joints` appends it after the driven joints and
+        reads it back as `safe[-1]`, `arm_joint` included -- and must take the
+        new value outright. Every delta-EE column is a continuous delta.
+        """
+        if self._cfg.action_space == DELTA_EE:
+            return DELTA_EE_ACTION_DIM
+        return int(specs["action_dim"]) - (1 if gripper.in_state else 0)
 
     def _effective_chunk_len(self) -> int:
         """How many actions a merged chunk actually contributes to the queue.
@@ -700,7 +716,7 @@ class VLAController(Generic, EasyResource):
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
             )
             self._safety = self._build_safety(gripper)
-            self._scheduler = self._build_scheduler(mode, builder)
+            self._scheduler = self._build_scheduler(mode, builder, self._blend_dims(specs, gripper))
 
             self._state = "running"
             await self._loop(self._scheduler, gripper)

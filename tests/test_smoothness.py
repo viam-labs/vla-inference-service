@@ -114,7 +114,6 @@ def test_jittery_ticks():
     assert long_gaps(s.arm.stream_points) == 0
 
 
-@pytest.mark.xfail(raises=AssertionError, strict=True, reason="change 1: aligned keeps superseded queued rows")
 def test_slow_inference_lands_fresh_rows():
     latency = 1.23
     s = run_session(latency_s=latency)
@@ -122,7 +121,6 @@ def test_slow_inference_lands_fresh_rows():
     assert landing_obs_age(s) <= latency + 2 * PERIOD
 
 
-@pytest.mark.xfail(raises=AssertionError, strict=True, reason="change 1: the time-based skip discards every chunk, the blocking fill included, so the arm never moves")
 def test_starvation_holds_are_accounted_for():
     s = run_session(latency_s=5.5, duration_s=30.0)
     _assert_healthy(s)
@@ -131,7 +129,6 @@ def test_starvation_holds_are_accounted_for():
     # (FakeArm itself asserts every stamp is strictly increasing.)
 
 
-@pytest.mark.xfail(raises=AssertionError, strict=True, reason="change 1: no blend_ticks crossfade yet")
 def test_seam_blend_softens_the_switch():
     hard = run_session(latency_s=1.23, offsets=(1.0, -1.0))
     blended = run_session(latency_s=1.23, offsets=(1.0, -1.0), blend_ticks=3)

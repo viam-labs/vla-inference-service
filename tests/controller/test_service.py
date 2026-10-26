@@ -2088,10 +2088,12 @@ async def test_merge_config_is_plumbed_to_the_scheduler():
     )
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    status = await svc.do_command({"command": "status"})
+    # The blocking fill skips nothing; rows drop only at the first background
+    # landing, so wait for it instead of sampling at a fixed moment.
+    await _wait_until(
+        lambda: svc._status()["dropped_stale_rows"] > 0, "a background landing dropping stale rows"
+    )
     await svc.do_command({"command": "stop"})
-    assert status["dropped_stale_rows"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -2697,7 +2699,7 @@ async def test_stream_mode_stalled_driver_surfaces_as_a_tick_failure():
     await svc.do_command({"command": "start", "task": "t"})
     status = await _wait_for_state(svc, "error", timeout=5.0)
     assert "not draining" in status["last_error"]
-    assert arm.stopped >= 1
+    await _wait_until(lambda: arm.stopped, "the arm to be stopped")
 
 
 async def test_setpoint_mode_never_touches_the_streamed_path():
@@ -2716,3 +2718,18 @@ async def test_status_reports_setpoint_arm_write_and_zero_points_sent():
     status = await svc.do_command({"command": "status"})
     assert status["arm_write"] == "setpoint"
     assert status["stream_points_sent"] == 0
+
+
+async def test_blend_settings_reach_the_scheduler_and_skip_the_gripper_column():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_dim=6, n=20, action_value=0.01)
+    svc = _svc(
+        config=_config(mode="async", merge="aligned", blend_ticks=3, gripper=_DO_COMMAND_GRIPPER),
+        deps=_deps(policy=policy, arm=arm, g=FakeDoCommandGripper()),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    scheduler = svc._scheduler
+    await svc.do_command({"command": "stop"})
+    assert scheduler._blend_ticks == 3
+    assert scheduler._blend_dims == 5  # 6 action dims minus the trailing gripper channel
