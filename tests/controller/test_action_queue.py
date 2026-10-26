@@ -148,11 +148,12 @@ def test_replace_leaves_columns_past_blend_dims_untouched():
     np.testing.assert_allclose(q.get(), [2.0, 2.0, 4.0])  # the gripper column takes the new value
 
 
-def test_replace_refuses_a_column_mismatch_when_blending():
-    q = ActionQueue()
-    q.merge(np.zeros((3, 2), dtype=np.float32))
-    with pytest.raises(ActionQueueError, match="column"):
-        q.replace(np.zeros((3, 3), dtype=np.float32), blend_ticks=1)
+def test_replace_refuses_a_column_mismatch():
+    for blend_ticks in (0, 1):
+        q = ActionQueue()
+        q.merge(np.zeros((3, 2), dtype=np.float32))
+        with pytest.raises(ActionQueueError, match="column"):
+            q.replace(np.zeros((3, 3), dtype=np.float32), blend_ticks=blend_ticks)
 
 
 def test_replace_refuses_a_non_2d_chunk():
