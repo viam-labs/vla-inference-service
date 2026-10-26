@@ -115,6 +115,7 @@ class VLAController(Generic, EasyResource):
         self._stream_points_sent = 0
         # Every pacing and scheduling decision reads this, so the smoothness
         # harness can run the real loop on a virtual clock (tests/smoothness.py).
+        # Set it before reconfigure/start: the scheduler and the stream capture it when they are built.
         self._clock = time.perf_counter
 
     @classmethod
