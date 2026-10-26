@@ -76,17 +76,15 @@ async def test_start_enqueues_nothing():
 
 async def test_first_send_carries_the_rest_point_and_the_first_ticks_motion():
     arm = FakeArm(positions=[0.0] * 2)
-    box = [0.0]
-    stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={}, clock=lambda: box[0])
+    stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={})
     await stream.start([0.0, 0.0])
-    await stream.send([3.0, 30.0])
+    await stream.send([3.0, 30.0], 0.0)
     await _wait_for_points(arm, 4)
 
     n = round(30.0 / 10.0)
-    # The property that fixes C1: the rest point and the first tick's motion
-    # points must ship in the SAME batch, not two -- whichever point a driver
-    # anchors its wall clock to at stream start, this keeps it within one
-    # transport hop of `_t0`.
+    # The rest point and the first tick's motion points must ship in the SAME
+    # batch, not two: whichever point a driver anchors its wall clock to at
+    # stream start, this keeps it within one transport hop of `_t0`.
     assert len(arm.stream_batches) == 1
     assert len(arm.stream_batches[0]) == 1 + n
 
@@ -96,37 +94,29 @@ async def test_first_send_carries_the_rest_point_and_the_first_ticks_motion():
     motion = arm.stream_points[1:]
     assert [p.positions for p in motion] == [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]
     times = [p.time.total_seconds() for p in motion]
-    assert times[0] < times[1] < times[2]
-    # `timedelta` only holds microsecond precision, and each point is rounded
-    # to it independently, so the achievable tolerance on a *difference* of
-    # two such points is ~1us, not float epsilon.
+    # timedelta holds microseconds, each stamp rounded on its own: ~1us tolerance.
     assert abs((times[1] - times[0]) - 1 / 30.0) < 1e-6
     assert abs((times[2] - times[1]) - 1 / 30.0) < 1e-6
-    assert times[0] >= 1 / 10.0
+    assert abs(times[0] - (1 / 10.0 + 1 / 30.0)) < 1e-6
     await stream.close()
 
 
-async def test_origin_is_anchored_at_first_send_not_start():
-    """Regression: the clock must start at the first send(), not at start().
+async def test_origin_is_the_first_sends_nominal_time():
+    """t0 is the first send's nominal tick time, not anything before it.
 
     A real run blocks on the first inference between start() and the first
-    send() -- if _t0 were set in start(), every stamp in the run would carry
-    that whole delay as dead time, past due the moment it reaches the driver,
-    collapsing the stream back into bursts at fps.
+    send(); an origin taken earlier would carry that delay as dead time in
+    every stamp, past due on arrival.
     """
     arm = FakeArm(positions=[0.0] * 2)
-    box = [0.0]
-    stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={}, clock=lambda: box[0])
+    stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={})
     await stream.start([0.0, 0.0])
-    box[0] = 0.6  # simulate a slow first inference elapsing before the first send
-    await stream.send([3.0, 30.0])
+    await stream.send([3.0, 30.0], 0.6)  # first tick's nominal time, after a slow inference
     await _wait_for_points(arm, 4)
 
     assert arm.stream_points[0].time == timedelta(0)
-    assert arm.stream_points[0].positions == [0.0, 0.0]
-    step = 1.0 / 30.0
     first_motion = arm.stream_points[1]
-    assert abs(first_motion.time.total_seconds() - (1 / 10.0 + step)) < 1e-6
+    assert abs(first_motion.time.total_seconds() - (1 / 10.0 + 1 / 30.0)) < 1e-6
     await stream.close()
 
 
@@ -135,35 +125,47 @@ async def test_send_spacing_is_uniform_across_a_tick_boundary():
     1/(n*fps), not 1/stream_hz: at 100/30 (n=3) that would leave gaps of
     10, 10, 13.3ms instead of three even ~11.1ms gaps."""
     arm = FakeArm(positions=[0.0] * 2)
-    box = [0.0]
     fps, stream_hz = 30.0, 100.0
-    stream = ArmStream(arm, fps=fps, stream_hz=stream_hz, extra={}, clock=lambda: box[0])
+    stream = ArmStream(arm, fps=fps, stream_hz=stream_hz, extra={})
     n = round(stream_hz / fps)
     assert n == 3
     step = 1.0 / (n * fps)
 
     await stream.start([0.0, 0.0])
-    await stream.send([3.0, 3.0])
-    box[0] += 1.0 / fps  # simulate exactly one tick of real elapsed time
-    await stream.send([6.0, 6.0])
+    await stream.send([3.0, 3.0], 0.0)
+    await stream.send([6.0, 6.0], 1.0 / fps)
     await _wait_for_points(arm, 1 + 2 * n)
 
     motion_times = [p.time.total_seconds() for p in arm.stream_points[1:]]
     diffs = [b - a for a, b in zip(motion_times, motion_times[1:])]
-    assert len(diffs) == 2 * n - 1  # within both ticks and across their boundary
+    assert len(diffs) == 2 * n - 1
     for d in diffs:
         assert abs(d - step) < 1e-6
     await stream.close()
 
 
-async def test_send_monotonic_guard_survives_rewound_clock():
+async def test_a_late_send_inside_the_lead_keeps_uniform_spacing():
+    """The point of nominal stamping: when a send happens no longer changes
+    its stamps, so tick jitter never reaches the arm."""
     arm = FakeArm(positions=[0.0] * 2)
-    box = [0.0]
-    stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={}, clock=lambda: box[0])
+    stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={})
     await stream.start([0.0, 0.0])
-    await stream.send([3.0, 30.0])
-    box[0] = -100.0  # rewind
-    await stream.send([6.0, 60.0])
+    await stream.send([3.0, 3.0], 0.0)
+    await asyncio.sleep(0.05)  # this tick's send runs 50 ms late in real time
+    await stream.send([6.0, 6.0], 0.1)
+    await _wait_for_points(arm, 7)
+    times = [p.time.total_seconds() for p in arm.stream_points[1:]]
+    for a, b in zip(times, times[1:]):
+        assert abs((b - a) - 1 / 30.0) < 1e-6
+    await stream.close()
+
+
+async def test_send_monotonic_guard_survives_a_rewound_nominal_time():
+    arm = FakeArm(positions=[0.0] * 2)
+    stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={})
+    await stream.start([0.0, 0.0])
+    await stream.send([3.0, 30.0], 0.0)
+    await stream.send([6.0, 60.0], -100.0)  # rewind
     await _wait_for_points(arm, 7)
     times = [p.time for p in arm.stream_points]
     assert all(a < b for a, b in zip(times, times[1:]))
@@ -184,7 +186,7 @@ async def test_check_raises_stream_fault_once_then_closed_error():
     arm.fail_stream_after_points = 3
     stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={})
     await stream.start([0.0, 0.0])
-    await stream.send([1.0, 1.0])  # first batch: 1 rest point + 3 motion points >= 3
+    await stream.send([1.0, 1.0], 0.0)  # first batch: 1 rest point + 3 motion points >= 3
     await _drain(stream)
     with pytest.raises(GRPCError, match="arm fault"):
         stream.check()

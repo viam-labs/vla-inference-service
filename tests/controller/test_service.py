@@ -1357,6 +1357,7 @@ async def test_status_reports_every_documented_field():
         "measured_fps",
         "clamp_counts",
         "starved_ticks",
+        "reanchors",
         "queue_threshold",
         "dropped_stale_rows",
         "arm_write",

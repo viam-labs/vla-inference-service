@@ -90,7 +90,6 @@ def test_steady():
     print(f"steady knot_accel baseline: {knot_accel(s):.4f} deg")  # for #4; no gate
 
 
-@pytest.mark.xfail(raises=AssertionError, strict=True, reason="change 2: main stamps a second tick of lead after tick 0")
 def test_stream_lead_is_exactly_one_tick():
     # On main the first tick includes the blocking first inference and
     # overruns, so tick 1 runs at the same elapsed time; the monotonic guard
