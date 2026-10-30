@@ -23,8 +23,8 @@ each tick samples a lead (up to 2/fps) ahead of now.
 
 `expected_latency` is the max of the last 5 observation-to-landing intervals:
 an underestimate starves and an overestimate only fires early. Until the first
-sample exists it is the chunk duration, and the regime stays overlap, which
-fires right after each landing. The first sample usually includes warm-up and
+sample exists it is the chunk duration; the first chunk is fired by `wait()`,
+and its latency picks the regime. The first sample usually includes warm-up and
 overestimates, which errs toward sequential, the safe side.
 """
 

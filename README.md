@@ -323,7 +323,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `fps` | number | `10.0` | Control loop rate. |
 | `blend_s` | number | `2 / fps`, `0` under `delta-ee` | How long a landing chunk takes to crossfade in from the plan it supersedes. `0` switches outright. See [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s). |
 | `margin_s` | number | `2 / fps` | Extra lead the inference trigger keeps beyond the expected latency and the blend. |
-| `inference_timeout_s` | number | `30` | A wait for a chunk longer than this fails the run. |
+| `inference_timeout_s` | number | `30` | A wait for a chunk longer than this fails the tick (and the run, under the default `stop_on_error`). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts consecutive tick *failures* (when `stop_on_error` is `false`) and, under `delta-ee`, consecutive `move_to_position` refusals. Waiting for a chunk is never fatal and never counted here; see `starved_ticks`. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
 | `state_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). Under `delta-ee` this is per-segment; see [Units](#units). |
@@ -553,16 +553,16 @@ What to read it for:
 - `regime` — `overlap` fires on the buffer's remaining time. `sequential` waits for the plan
   to run out and observes at rest, because `2 * expected_latency_s + blend_s + margin_s` has
   reached the chunk duration. See [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s).
-- `buffer_horizon_s` — plan left past now. `0` before any chunk, and while a fresh chunk
-  awaits its first sample.
-- `staleness_s` — age of the observation behind the sample just commanded. Under `overlap`
-  it should sit near `expected_latency_s` plus a tick or two.
+- `buffer_horizon_s` — plan left past now. `0` before any chunk, once the plan has run out,
+  and while a fresh chunk awaits its first sample.
+- `staleness_s` — age of the observation behind the sample just commanded. It drops to
+  about `expected_latency_s` at each landing and grows until the next one.
 - `overlap_s` — the blend window actually used at the last landing; `0` after a rebase.
 - `rebases` — chunks that landed after the plan had run out, so the new plan was pinned to the
   moment the arm resumed rather than blended. Expected at every chunk under `sequential`;
   under `overlap`, a rising value means the trigger is firing too late (raise `margin_s`).
-- `skipped_rows` — cumulative head rows of landing chunks whose moment had already passed
-  and were never executed.
+- `skipped_rows` — delta-ee only: due rows skipped because a later row was also due, never
+  run late. Always `0` under `joints`.
 - `timing` — means over recent inferences, in seconds. `round_trip_s` is the controller's
   whole `infer` call; `server_s` and `compute_s` are the policy's own `server_s` and
   `compute_s` (see [`infer`](#infer)); `transport_s` is `round_trip_s - server_s`. A field is
@@ -575,9 +575,8 @@ What to read it for:
   resumed its schedule from now instead of replaying the missed ticks. Under
   `arm_write: "stream"`, a tick up to one period late is caught up silently on the fixed grid.
   Other modes start the next tick immediately instead, so arm commands are never packed
-  closer than a tick's own work. Under other `arm_write` modes, an overrun shorter than a
-  period restarts the schedule silently and is not counted. Expected at each chunk boundary
-  under `sequential`, where the tick waits for a whole inference.
+  closer than a tick's own work, and an overrun shorter than a period is not counted. A wait
+  for a chunk is not counted; see `starved_ticks`.
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
 - `arm_write` — `"setpoint"` or `"stream"`, echoing the configured value.
@@ -969,7 +968,7 @@ has passed are never executed, so there is nothing stale to drop or to tune.
   the max of the last five observation-to-landing intervals, and the chunk
   duration until the first one exists.
 - `inference_timeout_s` (default 30): a wait for a chunk longer than this fails
-  the run.
+  the tick (and the run, under the default `stop_on_error`).
 
 With one inference in flight, chunks land at most one per latency, and each
 is observed only when the previous one lands. So once

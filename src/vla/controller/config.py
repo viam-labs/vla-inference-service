@@ -36,7 +36,7 @@ defaults to two ticks, and to 0 under `"delta-ee"`, whose rows are per-tick
 deltas that cannot be blended. `margin_s` is the extra lead the inference
 trigger keeps beyond the expected latency and the blend. `inference_timeout_s`
 bounds a wait for a chunk once the plan has run out, so a hung policy fails the
-run instead of hanging it. See `reference_buffer.py` and `inference_loop.py`.
+tick (and the run, under the default `stop_on_error`) instead of hanging it. See `reference_buffer.py` and `inference_loop.py`.
 The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
 `actions_per_chunk`) are refused with their replacement; see `REMOVED_KEYS`.
 
