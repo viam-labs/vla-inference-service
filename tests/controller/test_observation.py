@@ -589,3 +589,11 @@ def test_a_frame_already_at_the_declared_shape_is_never_resampled():
     np.testing.assert_array_equal(
         decode_image(_encode_only(frame, "stretch_bicubic")), frame
     )
+
+
+async def test_t_obs_is_when_the_arm_read_returned_on_the_injected_clock():
+    ticks = iter([10.0, 10.25, 10.5])  # build start, arm read return, build end
+    builder = _builder(clock=lambda: next(ticks))
+    obs = await builder.build()
+    assert obs.t_obs == 10.25
+    assert obs.duration_s == 0.5

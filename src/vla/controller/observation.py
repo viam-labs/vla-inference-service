@@ -33,7 +33,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -98,6 +98,9 @@ class Observation:
     images: dict[str, dict[str, Any]]
     state: np.ndarray
     duration_s: float
+    # Controller-clock time the arm-state read returned. Row i of the chunk
+    # inferred from this observation means "be here at t_obs + (i+1)/fps".
+    t_obs: float
 
 
 class ObservationBuilder:
@@ -120,6 +123,7 @@ class ObservationBuilder:
         action_space: str = "joints",
         duration_warn_s: float = DEFAULT_DURATION_WARN_S,
         stale_frame_warn_s: float = STALE_FRAME_WARN_S,
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._cameras = dict(cameras)
         self._arm = arm
@@ -133,9 +137,10 @@ class ObservationBuilder:
         self._delta_ee = action_space == "delta-ee"
         self._duration_warn_s = duration_warn_s
         self._stale_frame_warn_s = stale_frame_warn_s
+        self._clock = clock
 
     async def build(self) -> Observation:
-        started = time.perf_counter()
+        started = self._clock()
         keys = list(self._cameras)
 
         # Gathered, not sequential: at 10 Hz the whole tick has a 100 ms
@@ -143,8 +148,14 @@ class ObservationBuilder:
         tasks: list[Any] = [self._read_camera(key) for key in keys]
         # One arm read either way, so the gather shape below is unchanged:
         # delta-EE needs the tool pose where joints mode needs joint angles.
+        async def stamped(read: Any) -> tuple[Any, float]:
+            # gather returns when the slowest read does; the arm's own instant is what
+            # a chunk's row times are anchored to.
+            result = await read
+            return result, self._clock()
+
         tasks.append(
-            self._arm.get_end_position() if self._delta_ee else self._arm.get_joint_positions()
+            stamped(self._arm.get_end_position() if self._delta_ee else self._arm.get_joint_positions())
         )
         needs_gripper_read = self._gripper.has_normalized_tail
         if needs_gripper_read:
@@ -165,6 +176,7 @@ class ObservationBuilder:
             arm_reading,
             "arm end-position read failed" if self._delta_ee else "arm joint read failed",
         )
+        arm_reading, t_obs = arm_reading
         if needs_gripper_read:
             self._raise_if_failed(gripper_value, "gripper read failed")
 
@@ -187,7 +199,7 @@ class ObservationBuilder:
             else self._build_state(list(arm_reading.values), gripper_value)
         )
 
-        duration = time.perf_counter() - started
+        duration = self._clock() - started
         if duration > self._duration_warn_s:
             LOGGER.warning(
                 "observation assembly took %.3fs, exceeding the %.3fs tick budget; "
@@ -195,7 +207,7 @@ class ObservationBuilder:
                 duration,
                 self._duration_warn_s,
             )
-        return Observation(images=images, state=state, duration_s=duration)
+        return Observation(images=images, state=state, duration_s=duration, t_obs=t_obs)
 
     @staticmethod
     def _raise_if_failed(result: Any, message: str) -> None:
