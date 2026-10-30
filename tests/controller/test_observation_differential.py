@@ -2,8 +2,8 @@
 
 `ObservationBuilder._resize_with_pad` is a hand port of lerobot's
 `resize_with_pad` (`lerobot/policies/common/vla_utils.py:219`) onto PIL, so
-it carries the same risk the `ActionQueue` port does and gets the same
-treatment: run both on identical inputs and compare. Requires lerobot:
+it carries a hand port's risk of drifting silently from upstream and gets
+the usual treatment: run both on identical inputs and compare. Requires lerobot:
 `uv sync --extra lerobot`.
 
 Scope note -- this compares *geometry*, not pixels. PIL's `BILINEAR` is

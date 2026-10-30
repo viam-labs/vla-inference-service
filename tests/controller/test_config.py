@@ -49,11 +49,6 @@ def test_parses_minimal_config():
     assert cfg.gripper == {"type": "none"}
     assert cfg.task == ""
     assert cfg.fps == 10.0
-    assert cfg.mode == "sequential"
-    # None, not a fixed number -- the right value is derived from the
-    # checkpoint's n_action_steps once specs are known (see config.py's
-    # docstring); config parsing alone has no access to that.
-    assert cfg.queue_threshold is None
     assert cfg.starvation_grace_ticks == 3
     assert cfg.policy_ready_timeout_s == 600
     assert cfg.state_units == "degrees"
@@ -165,69 +160,6 @@ def test_fps_as_protobuf_double_is_accepted():
     # Struct delivers every number as a double; 10 arrives as 10.0.
     cfg = ControllerConfig.parse({**BASE, "fps": 10.0})
     assert cfg.fps == 10.0
-
-
-# ---------------------------------------------------------------------------
-# mode
-# ---------------------------------------------------------------------------
-
-
-def test_rejects_unknown_mode():
-    with pytest.raises(ConfigError, match="mode"):
-        ControllerConfig.parse({**BASE, "mode": "turbo"})
-
-
-@pytest.mark.parametrize("mode", ["sequential", "async"])
-def test_accepts_every_known_mode(mode):
-    # Hardcoded literal, not MODES itself -- a mutant that shrinks MODES
-    # must not be able to shrink this test's coverage along with it.
-    cfg = ControllerConfig.parse({**BASE, "mode": mode})
-    assert cfg.mode == mode
-
-
-# ---------------------------------------------------------------------------
-# merge
-# ---------------------------------------------------------------------------
-
-
-def test_merge_defaults_to_append():
-    cfg = ControllerConfig.parse(BASE)
-    assert cfg.merge == "append"
-
-
-def test_merge_aligned_accepted_with_async_mode():
-    cfg = ControllerConfig.parse({**BASE, "mode": "async", "merge": "aligned"})
-    assert cfg.merge == "aligned"
-
-
-def test_rejects_unknown_merge():
-    with pytest.raises(ConfigError, match="merge"):
-        ControllerConfig.parse({**BASE, "merge": "replace"})
-
-
-def test_rejects_aligned_merge_with_sequential_mode():
-    with pytest.raises(ConfigError, match="merge"):
-        ControllerConfig.parse({**BASE, "mode": "sequential", "merge": "aligned"})
-
-
-def test_blend_ticks_defaults_to_zero():
-    assert ControllerConfig.parse(dict(BASE)).blend_ticks == 0
-
-
-def test_blend_ticks_accepted_with_aligned():
-    cfg = ControllerConfig.parse({**BASE, "mode": "async", "merge": "aligned", "blend_ticks": 3})
-    assert cfg.blend_ticks == 3
-
-
-def test_rejects_blend_ticks_without_aligned():
-    with pytest.raises(ConfigError, match="blend_ticks"):
-        ControllerConfig.parse({**BASE, "mode": "async", "blend_ticks": 3})
-
-
-def test_rejects_negative_or_fractional_blend_ticks():
-    for bad in (-1, 2.5):
-        with pytest.raises(ConfigError, match="blend_ticks"):
-            ControllerConfig.parse({**BASE, "mode": "async", "merge": "aligned", "blend_ticks": bad})
 
 
 # ---------------------------------------------------------------------------
@@ -576,31 +508,13 @@ def test_rejects_unknown_image_fit():
 
 
 # ---------------------------------------------------------------------------
-# task, queue_threshold, starvation_grace_ticks, policy_ready_timeout_s
+# task, starvation_grace_ticks, policy_ready_timeout_s
 # ---------------------------------------------------------------------------
 
 
 def test_task_is_passed_through():
     cfg = ControllerConfig.parse({**BASE, "task": "pick up the red block"})
     assert cfg.task == "pick up the red block"
-
-
-def test_queue_threshold_accepts_override():
-    cfg = ControllerConfig.parse({**BASE, "queue_threshold": 5})
-    assert cfg.queue_threshold == 5
-
-
-def test_queue_threshold_explicit_zero_is_not_treated_as_unset():
-    # 0 is a legitimate explicit value (fire the refill only once the queue
-    # is already empty) -- it must not collapse into the same "derive it"
-    # behavior as never mentioning the field at all.
-    cfg = ControllerConfig.parse({**BASE, "queue_threshold": 0})
-    assert cfg.queue_threshold == 0
-
-
-def test_queue_threshold_rejects_fractional_double():
-    with pytest.raises(ConfigError, match="queue_threshold"):
-        ControllerConfig.parse({**BASE, "queue_threshold": 5.5})
 
 
 def test_starvation_grace_ticks_accepts_override():
@@ -998,3 +912,49 @@ def test_delta_ee_dependencies_are_the_policy_arm_and_cameras():
 def test_safety_config_parse_still_defaults_to_the_joints_action_space():
     """`SafetyConfig.parse` is called directly by existing tests and callers."""
     assert SafetyConfig.parse({"max_joint_delta_degs": 3.0}, fps=10.0).max_joint_delta_degs == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Time-indexed buffer: blend_s, margin_s, inference_timeout_s, removed keys
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key,value,hint",
+    [
+        ("mode", "async", "overlaps"),
+        ("merge", "aligned", "blend_s"),
+        ("blend_ticks", 3, "blend_s"),
+        ("queue_threshold", 5, "margin_s"),
+        ("actions_per_chunk", 10, "nothing to truncate"),
+    ],
+)
+def test_removed_keys_fail_with_their_replacement(key, value, hint):
+    with pytest.raises(ConfigError, match=f"{key} was removed.*{hint}"):
+        ControllerConfig.parse({**BASE, key: value})
+
+
+def test_blend_and_margin_default_to_two_ticks():
+    cfg = ControllerConfig.parse({**BASE, "fps": 25.0})
+    assert cfg.blend_s == pytest.approx(0.08)
+    assert cfg.margin_s == pytest.approx(0.08)
+    assert cfg.inference_timeout_s == 30.0
+
+
+def test_blend_s_zero_is_a_hard_switch_and_negative_is_refused():
+    assert ControllerConfig.parse({**BASE, "blend_s": 0.0}).blend_s == 0.0
+    with pytest.raises(ConfigError, match="blend_s"):
+        ControllerConfig.parse({**BASE, "blend_s": -0.1})
+
+
+def test_delta_ee_defaults_blend_to_zero_and_refuses_a_blend():
+    base = {**DELTA_EE_BASE}
+    assert ControllerConfig.parse(base).blend_s == 0.0
+    with pytest.raises(ConfigError, match="blend_s"):
+        ControllerConfig.parse({**base, "blend_s": 0.1})
+
+
+@pytest.mark.parametrize("key,value", [("margin_s", -0.1), ("inference_timeout_s", 0)])
+def test_rejects_a_negative_margin_and_a_zero_inference_timeout(key, value):
+    with pytest.raises(ConfigError, match=key):
+        ControllerConfig.parse({**BASE, key: value})

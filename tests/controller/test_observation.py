@@ -589,3 +589,29 @@ def test_a_frame_already_at_the_declared_shape_is_never_resampled():
     np.testing.assert_array_equal(
         decode_image(_encode_only(frame, "stretch_bicubic")), frame
     )
+
+
+async def test_t_obs_is_when_the_arm_read_returned_on_the_injected_clock():
+    now = {"t": 10.0}
+
+    class StampingArm(FakeArm):
+        async def get_joint_positions(self, *a, **k):
+            result = await super().get_joint_positions(*a, **k)
+            now["t"] = 10.25
+            return result
+
+    class SlowCamera(FakeCamera):
+        async def get_images(self, *a, **k):
+            for _ in range(5):
+                await asyncio.sleep(0)
+            result = await super().get_images(*a, **k)
+            now["t"] = 99.0  # finishes after the arm, so gather returns later
+            return result
+
+    builder = _builder(
+        clock=lambda: now["t"],
+        arm=StampingArm(positions=[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]),
+        cameras={"observation.images.top": SlowCamera()},
+    )
+    obs = await builder.build()
+    assert obs.t_obs == 10.25

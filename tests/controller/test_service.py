@@ -1160,14 +1160,12 @@ async def test_first_action_within_start_delta_is_accepted():
 # ---------------------------------------------------------------------------
 
 
-async def test_sequential_mode_never_touches_rtc_fields():
-    # mode=sequential must not even look at supports_rtc/relative_actions.
+async def test_the_loop_never_touches_rtc_fields():
+    # The controller does not run RTC: it must not even look at
+    # supports_rtc/relative_actions.
     policy = FakePolicyClient(supports_rtc=False, relative=True)
     arm = FakeArm(positions=[0.0] * 6)
-    svc = _svc(
-        config=_config(mode="sequential"),
-        deps=_deps(policy=policy, arm=arm),
-    )
+    svc = _svc(deps=_deps(policy=policy, arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_state(svc, "running")
     await asyncio.sleep(0.1)
@@ -1351,37 +1349,24 @@ async def test_status_reports_every_documented_field():
     status = await svc.do_command({"command": "status"})
     for key in (
         "state",
-        "mode",
-        "queue_size",
         "avg_latency_s",
+        "expected_latency_s",
+        "regime",
+        "buffer_horizon_s",
+        "staleness_s",
+        "overlap_s",
+        "rebases",
+        "skipped_rows",
         "measured_fps",
         "clamp_counts",
         "starved_ticks",
         "reanchors",
-        "queue_threshold",
-        "dropped_stale_rows",
         "arm_write",
         "stream_points_sent",
+        "timing",
         "last_error",
     ):
         assert key in status, f"missing status field: {key}"
-
-
-async def test_status_queue_size_reflects_the_real_scheduler_not_hardcoded():
-    # A loose "0 <= queue_size <= 7" bound would pass even if queue_size were
-    # hardcoded to 0 -- deterministic instead: fps=2 (period 0.5s) means the
-    # second tick is not due for a long while, so shortly after the first
-    # tick completes (one infer, one merge of a 7-step chunk, one get()) the
-    # queue must hold exactly 6, not 0 and not 7.
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=7, action_value=0.01)
-    svc = _svc(config=_config(fps=2.0), deps=_deps(policy=policy, arm=arm))
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)  # first tick has completed; second is not due until t=0.5s
-    status = await svc.do_command({"command": "status"})
-    await svc.do_command({"command": "stop"})
-    assert status["queue_size"] == 6
 
 
 async def test_status_last_error_is_empty_string_before_any_failure():
@@ -1398,20 +1383,6 @@ async def test_status_avg_latency_reflects_recorded_latencies():
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
     assert status["avg_latency_s"] > 0
-
-
-async def test_mode_reports_configured_value_before_specs_resolve():
-    # mode="async" specifically (not "sequential"): with a cold policy that
-    # never leaves "loading", the loop never starts, so this stays reporting
-    # the *configured* value the whole time. Using "sequential" here would
-    # not catch a mutant that hardcoded status()'s mode field to
-    # "sequential" -- it would coincidentally match either way.
-    policy = FakePolicyClient(state="loading")
-    svc = _svc(config=_config(mode="async"), deps=_deps(policy=policy))
-    await svc.do_command({"command": "start", "task": "t"})
-    status = await svc.do_command({"command": "status"})
-    assert status["mode"] == "async"
-    await svc.do_command({"command": "stop"})
 
 
 # ---------------------------------------------------------------------------
@@ -1439,9 +1410,9 @@ async def test_measured_fps_reflects_actual_pace_not_the_configured_target():
     # must fail. fps=200 (period 5ms) is configured, but every tick is
     # forced to take ~50ms by the policy's own artificial delay, so the real
     # achieved pace is ~20fps -- nowhere near the configured target.
-    # n=1: without this, SequentialScheduler only calls infer() (and thus
-    # only pays infer_delay_s) once every n_action_steps ticks -- the other
-    # ticks drain the cached chunk almost instantly, and the *last* tick
+    # n=1: without this, the loop only waits out infer_delay_s once every
+    # n_action_steps ticks -- the other ticks sample the landed chunk
+    # almost instantly, and the *last* tick
     # before status() happens to be sampled could easily be one of those
     # fast ones, making measured_fps report near the configured target by
     # accident rather than the forced-slow actual pace.
@@ -1457,9 +1428,15 @@ async def test_measured_fps_reflects_actual_pace_not_the_configured_target():
 
 
 async def test_tick_overrun_warns_instead_of_silently_drifting(caplog):
-    arm = FakeArm(positions=[0.0] * 6)
+    # A slow arm write, not a slow inference: waiting for a chunk restarts the
+    # tick deliberately (TickSchedule.restart) and is not an overrun.
+    class SlowArm(FakeArm):
+        async def move_to_joint_positions(self, *a, **kw):
+            await asyncio.sleep(0.05)  # much longer than the 1/200s budget below
+            return await super().move_to_joint_positions(*a, **kw)
+
+    arm = SlowArm(positions=[0.0] * 6)
     policy = FakePolicyClient(action_value=0.01)
-    policy.infer_delay_s = 0.05  # much longer than the 1/200s budget below
     svc = _svc(config=_config(fps=200.0), deps=_deps(policy=policy, arm=arm))
     with caplog.at_level(logging.WARNING, logger="vla.controller.service"):
         await svc.do_command({"command": "start", "task": "t"})
@@ -1585,29 +1562,6 @@ async def test_high_duration_warn_threshold_suppresses_the_warning(caplog):
 
 
 # ---------------------------------------------------------------------------
-# The latency window caps at the most recent 50 entries, so avg_latency_s
-# never becomes a lifetime average. Tested directly on the buffer rather
-# than through the full timed loop -- deterministic.
-# ---------------------------------------------------------------------------
-
-
-async def test_latency_window_keeps_only_the_most_recent_50():
-    svc = VLAController("c")
-    for i in range(60):
-        svc._latencies.append(float(i))
-    assert len(svc._latencies) == 50
-    assert svc._latencies[0] == 10.0  # the first 10 (0..9) were pushed out
-    assert svc._latencies[-1] == 59.0
-
-
-async def test_latency_window_does_not_trim_under_50():
-    svc = VLAController("c")
-    for i in range(10):
-        svc._latencies.append(float(i))
-    assert list(svc._latencies) == [float(i) for i in range(10)]
-
-
-# ---------------------------------------------------------------------------
 # Dependency-key handling: production dependencies arrive keyed by an object
 # with a `.name` attribute (a ResourceName), not always a bare string.
 # ---------------------------------------------------------------------------
@@ -1640,25 +1594,24 @@ async def test_dependency_keys_with_name_attribute_are_resolved():
 
 
 # ---------------------------------------------------------------------------
-# mode: "async" -- end to end through the real controller loop (Task 22).
+# Overlap regime -- end to end through the real controller loop.
 # ---------------------------------------------------------------------------
 
 
-async def test_async_mode_end_to_end_commands_the_arm_and_reports_mode():
+async def test_overlap_regime_end_to_end_commands_the_arm():
+    # n=50 at 50 fps is a 1 s chunk: a millisecond fake inference is far
+    # inside the overlap bound, and margin_s=0.5 makes poll() fire the second
+    # request about halfway through it, while the plan still runs.
     arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=5)
-    svc = _svc(
-        config=_config(mode="async", fps=50.0, queue_threshold=3),
-        deps=_deps(policy=policy, arm=arm),
-    )
+    policy = FakePolicyClient(n=50)
+    svc = _svc(config=_config(fps=50.0, margin_s=0.5), deps=_deps(policy=policy, arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.2)
+    await _wait_until(lambda: policy.infer_calls >= 2, "a second inference", timeout=1.5)
     status = await svc.do_command({"command": "status"})
-    assert status["mode"] == "async"
     await svc.do_command({"command": "stop"})
+    assert status["regime"] == "overlap"
+    assert status["starved_ticks"] == 0  # fired on buffer time, landed before the plan ran out
     assert len(arm.moves) >= 1
-    assert policy.infer_calls >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -1733,62 +1686,11 @@ async def test_controller_runs_when_policy_declares_more_cameras_than_are_mapped
     assert len(arm.moves) >= 1
 
 
-async def test_async_mode_starvation_escalates_when_inference_stalls():
-    """The `action is None` branch in `_loop` is only reachable under
-    AsyncScheduler -- this exercises it end to end, not just at the
-    scheduler level. Once a background inference stalls indefinitely and
-    the queue drains, consecutive empty ticks must escalate past
-    `starvation_grace_ticks` and halt -- the same bound that already
-    escalates a run of consecutive tick *failures*, now doing the same job
-    for a run of consecutive *empty* ticks."""
-
-    class StallingPolicy(FakePolicyClient):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self._hang = asyncio.Event()
-
-        async def do_command(self, command, **kwargs):
-            if command.get("command") == "infer":
-                self.infer_calls += 1
-                if self.infer_calls > 1:
-                    # Never set: simulates a policy call that never returns,
-                    # so every inference after the first stalls forever.
-                    await self._hang.wait()
-                chunk = np.full((self.n, self.action_dim), self.action_value, dtype=np.float32)
-                return {
-                    "actions": encode_matrix(chunk),
-                    "raw_actions": encode_matrix(chunk),
-                    "latency_s": 0.001,
-                }
-            return await super().do_command(command, **kwargs)
-
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = StallingPolicy(n=3)
-    svc = _svc(
-        config=_config(
-            mode="async",
-            fps=100.0,
-            queue_threshold=2,
-            starvation_grace_ticks=2,
-            safety={"max_start_delta_degs": 1000.0},
-        ),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    status = await _wait_for_state(svc, "error", timeout=5.0)
-    assert "starvation_grace_ticks" in status["last_error"]
-    assert "starved" in status["last_error"].lower()
-    assert arm.stopped >= 1
-    # The first chunk's real actions were commanded before starvation took
-    # over -- this is not a "nothing ever worked" failure.
-    assert len(arm.moves) >= 1
-
-
-async def test_async_mode_stop_cancels_a_background_inference_not_on_the_call_stack():
+async def test_stop_cancels_a_background_inference_not_on_the_call_stack():
     """The background inference is not always on the loop task's own await
-    stack -- once AsyncScheduler starts serving already-queued actions
-    instead of blocking on it, cancelling the loop task alone does not
-    reach it. `_stop()` must still reach it via `scheduler.close()`, or it
+    stack -- a request `poll()` fired while the plan still runs is not
+    awaited by the loop, so cancelling the loop task alone does not reach
+    it. `_stop()` must still reach it via `InferenceLoop.close()`, or it
     would keep running orphaned past the point the controller reports
     stopped."""
 
@@ -1813,9 +1715,11 @@ async def test_async_mode_stop_cancels_a_background_inference_not_on_the_call_st
             return await super().do_command(command, **kwargs)
 
     arm = FakeArm(positions=[0.0] * 6)
-    policy = ControllablePolicy(n=5)
+    # A 1 s chunk and margin_s=0.5: poll() fires the 2nd request with about
+    # half the plan left, so the loop is still sampling, not in wait(), at stop.
+    policy = ControllablePolicy(n=100)
     svc = _svc(
-        config=_config(mode="async", fps=200.0, queue_threshold=4),
+        config=_config(fps=100.0, margin_s=0.5),
         deps=_deps(policy=policy, arm=arm),
     )
     await svc.do_command({"command": "start", "task": "t"})
@@ -1825,104 +1729,7 @@ async def test_async_mode_stop_cancels_a_background_inference_not_on_the_call_st
     await asyncio.sleep(0.05)
     await svc.do_command({"command": "stop"})
 
-    assert svc._scheduler._inflight is None
-
-
-# ---------------------------------------------------------------------------
-# queue_threshold: derived default vs. explicit override (Task 22 follow-up).
-# ---------------------------------------------------------------------------
-
-
-async def test_async_mode_derives_queue_threshold_from_n_action_steps_when_unset():
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=7)  # n_action_steps=7 -> derived threshold = 6
-    svc = _svc(
-        config=_config(mode="async", fps=50.0),  # queue_threshold left unset
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    await svc.do_command({"command": "stop"})
-    assert svc._scheduler.queue_threshold == 6
-
-
-async def test_async_mode_explicit_queue_threshold_overrides_the_derived_default():
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=7)  # would derive 6 if left unset
-    svc = _svc(
-        config=_config(mode="async", fps=50.0, queue_threshold=2),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    await svc.do_command({"command": "stop"})
-    assert svc._scheduler.queue_threshold == 2
-
-
-async def test_async_mode_explicit_zero_threshold_is_honored_not_derived():
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=7)
-    svc = _svc(
-        config=_config(mode="async", fps=50.0, queue_threshold=0),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    await svc.do_command({"command": "stop"})
-    assert svc._scheduler.queue_threshold == 0
-
-
-async def test_derived_threshold_follows_actions_per_chunk_not_n_action_steps():
-    """The derived threshold is a staleness ceiling: append-mode merging
-    means the executing action was inferred between `threshold` and
-    `threshold + chunk_len` ticks ago. Deriving from the untruncated
-    n_action_steps would leave the queue holding chunks it will never
-    execute, defeating the truncation entirely."""
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=50)  # would derive 49 without truncation
-    svc = _svc(
-        config=_config(mode="async", fps=50.0, actions_per_chunk=4),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_first_move(arm)
-    await svc.do_command({"command": "stop"})
-    assert svc._scheduler.queue_threshold == 3
-
-
-async def test_actions_per_chunk_above_n_action_steps_cannot_strand_the_threshold():
-    """An operator budgeting more actions than the policy emits must not get
-    a threshold the queue can never reach -- the refill would then fire on
-    every single tick."""
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=7)
-    svc = _svc(
-        config=_config(mode="async", fps=50.0, actions_per_chunk=99),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_first_move(arm)
-    await svc.do_command({"command": "stop"})
-    assert svc._scheduler.queue_threshold == 6
-
-
-async def test_sequential_mode_also_honors_actions_per_chunk():
-    # The knob is about how far ahead actions are committed, which is not an
-    # async-only concern -- sequential must not silently ignore it.
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=20)
-    svc = _svc(
-        config=_config(mode="sequential", actions_per_chunk=5),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_first_move(arm)
-    status = await svc.do_command({"command": "status"})
-    await svc.do_command({"command": "stop"})
-    assert status["queue_size"] < 5
+    assert svc._inference._inflight is None
 
 
 # ---------------------------------------------------------------------------
@@ -1936,43 +1743,22 @@ async def test_status_reports_starved_ticks_zero_before_any_starvation():
 
 
 async def test_status_starved_ticks_increments_while_holding_position():
-    class StallingPolicy(FakePolicyClient):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self._hang = asyncio.Event()
-
-        async def do_command(self, command, **kwargs):
-            if command.get("command") == "infer":
-                self.infer_calls += 1
-                if self.infer_calls > 1:
-                    await self._hang.wait()  # never set: stalls forever
-                chunk = np.full((self.n, self.action_dim), self.action_value, dtype=np.float32)
-                return {
-                    "actions": encode_matrix(chunk),
-                    "raw_actions": encode_matrix(chunk),
-                    "latency_s": 0.001,
-                }
-            return await super().do_command(command, **kwargs)
-
+    # n=4 at 50 fps is an 80 ms chunk against a 200 ms inference: the plan
+    # runs out after every landing, and each wait for the next is starved.
     arm = FakeArm(positions=[0.0] * 6)
-    policy = StallingPolicy(n=3)
+    policy = FakePolicyClient(n=4)
+    policy.infer_delay_s = 0.2
     svc = _svc(
-        config=_config(
-            mode="async",
-            fps=100.0,
-            queue_threshold=2,
-            starvation_grace_ticks=1_000_000,  # never escalate -- only measure the counter
-            safety={"max_start_delta_degs": 1000.0},
-        ),
+        config=_config(fps=50.0, safety={"max_start_delta_degs": 1000.0}),
         deps=_deps(policy=policy, arm=arm),
     )
     await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    status = await svc.do_command({"command": "status"})
+    status = await _wait_until(
+        lambda: svc._status()["starved_ticks"] > 0 and svc._status(), "a starved wait"
+    )
     await svc.do_command({"command": "stop"})
     assert status["starved_ticks"] > 0
-    assert status["state"] == "running"  # not escalated -- the grace bound was never hit
+    assert status["state"] == "running"  # starvation is not a failure
 
 
 async def test_starved_ticks_does_not_carry_over_across_a_restart():
@@ -1980,157 +1766,23 @@ async def test_starved_ticks_does_not_carry_over_across_a_restart():
     # run's telemetry" guarantee for avg_latency_s/measured_fps/clamp_counts
     # -- a fresh start() must not report yesterday's starved_ticks as if
     # they belonged to a run that has not produced a single tick yet.
-    class StallingPolicy(FakePolicyClient):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self._hang = asyncio.Event()
-
-        async def do_command(self, command, **kwargs):
-            if command.get("command") == "infer":
-                self.infer_calls += 1
-                if self.infer_calls > 1:
-                    await self._hang.wait()
-                chunk = np.full((self.n, self.action_dim), self.action_value, dtype=np.float32)
-                return {
-                    "actions": encode_matrix(chunk),
-                    "raw_actions": encode_matrix(chunk),
-                    "latency_s": 0.001,
-                }
-            return await super().do_command(command, **kwargs)
-
     arm = FakeArm(positions=[0.0] * 6)
-    policy = StallingPolicy(n=3)
-    cfg = _config(
-        mode="async",
-        fps=100.0,
-        queue_threshold=2,
-        starvation_grace_ticks=1_000_000,
-        safety={"max_start_delta_degs": 1000.0},
-    )
+    policy = FakePolicyClient(n=4)
+    policy.infer_delay_s = 0.2
+    cfg = _config(fps=50.0, safety={"max_start_delta_degs": 1000.0})
     svc = _svc(config=cfg, deps=_deps(policy=policy, arm=arm))
 
     await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    first_run_status = await svc.do_command({"command": "status"})
-    assert first_run_status["starved_ticks"] > 0
+    await _wait_until(lambda: svc._status()["starved_ticks"] > 0, "a starved wait")
     await svc.do_command({"command": "stop"})
 
     # Restart the *same* controller instance directly (no reconfigure() in
     # between, which has its own reset) -- this isolates start()'s own
     # reset of starved_ticks specifically.
-    policy.infer_calls = 0  # let the 2nd run's first inference succeed again
     await svc.do_command({"command": "start", "task": "t"})
     status = await svc.do_command({"command": "status"})
     assert status["starved_ticks"] == 0
     await svc.do_command({"command": "stop"})
-
-
-async def test_sequential_mode_never_reports_starved_ticks():
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=3)
-    svc = _svc(deps=_deps(policy=policy, arm=arm))  # default mode="sequential"
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    status = await svc.do_command({"command": "status"})
-    await svc.do_command({"command": "stop"})
-    assert status["starved_ticks"] == 0
-
-
-# ---------------------------------------------------------------------------
-# status.queue_threshold / status.dropped_stale_rows (Task 1: aligned merge).
-# ---------------------------------------------------------------------------
-
-
-async def test_status_reports_queue_threshold_and_dropped_stale_rows_for_async():
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=7)
-    svc = _svc(
-        config=_config(mode="async", fps=50.0, queue_threshold=3),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    status = await svc.do_command({"command": "status"})
-    await svc.do_command({"command": "stop"})
-    assert status["queue_threshold"] == 3
-    assert status["dropped_stale_rows"] == 0  # default merge="append" drops nothing
-
-
-async def test_status_queue_threshold_and_dropped_stale_rows_are_null_and_zero_for_sequential():
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=3)
-    svc = _svc(deps=_deps(policy=policy, arm=arm))  # default mode="sequential"
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.1)
-    status = await svc.do_command({"command": "status"})
-    await svc.do_command({"command": "stop"})
-    assert status["queue_threshold"] is None
-    assert status["dropped_stale_rows"] == 0
-
-
-async def test_merge_config_is_plumbed_to_the_scheduler():
-    # Proves `_build_scheduler` forwards `merge=self._cfg.merge` specifically
-    # -- mutating that call to pass e.g. `self._cfg.mode` instead (also a
-    # string the AsyncScheduler constructor accepts without erroring) must
-    # fail this: `mode="async"` is not a valid `merge` choice, so it would
-    # silently fall back to whatever AsyncScheduler treats as not "aligned"
-    # (append), and dropped_stale_rows would stay 0.
-    arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(n=20, action_value=0.01)
-    policy.infer_delay_s = 0.05  # 5 ticks of latency at fps=100 below
-    svc = _svc(
-        config=_config(mode="async", merge="aligned", fps=100.0, queue_threshold=19),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    # The blocking fill skips nothing; rows drop only at the first background
-    # landing, so wait for it instead of sampling at a fixed moment.
-    await _wait_until(
-        lambda: svc._status()["dropped_stale_rows"] > 0, "a background landing dropping stale rows"
-    )
-    await svc.do_command({"command": "stop"})
-
-
-# ---------------------------------------------------------------------------
-# End-to-end: the starvation-risk warning fires through the real controller.
-# ---------------------------------------------------------------------------
-
-
-async def test_async_mode_warns_when_queue_threshold_too_low_for_observed_latency(caplog):
-    class SlowPolicy(FakePolicyClient):
-        async def do_command(self, command, **kwargs):
-            if command.get("command") == "infer":
-                self.infer_calls += 1
-                await asyncio.sleep(0.03)
-                chunk = np.full((self.n, self.action_dim), self.action_value, dtype=np.float32)
-                return {
-                    "actions": encode_matrix(chunk),
-                    "raw_actions": encode_matrix(chunk),
-                    "latency_s": 0.001,
-                }
-            return await super().do_command(command, **kwargs)
-
-    arm = FakeArm(positions=[0.0] * 6)
-    # fps=100, latency~0.03s -> required = ceil(0.03*100) = 3, comfortably
-    # above the deliberately-too-low threshold=0.
-    policy = SlowPolicy(n=5)
-    svc = _svc(
-        config=_config(mode="async", fps=100.0, queue_threshold=0),
-        deps=_deps(policy=policy, arm=arm),
-    )
-    with caplog.at_level(logging.WARNING, logger="vla.controller.scheduler"):
-        await svc.do_command({"command": "start", "task": "t"})
-        await _wait_for_state(svc, "running")
-        await asyncio.sleep(0.3)
-        await svc.do_command({"command": "stop"})
-
-    messages = [r.message for r in caplog.records]
-    assert any("queue_threshold=0" in m and "queue_threshold>=" in m for m in messages), messages
 
 
 @pytest.mark.parametrize("cls", [FakeArm, StalledArm])
@@ -2720,16 +2372,191 @@ async def test_status_reports_setpoint_arm_write_and_zero_points_sent():
     assert status["stream_points_sent"] == 0
 
 
-async def test_blend_settings_reach_the_scheduler_and_skip_the_gripper_column():
+async def test_infer_request_carries_seq_and_t_obs():
+    policy = FakePolicyClient()
+    svc = _svc(deps=_deps(policy=policy))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: policy.infer_calls >= 2, "two inferences")
+    await svc.do_command({"command": "stop"})
+    assert policy.last_infer["seq"] >= 2
+    assert isinstance(policy.last_infer["t_obs"], float)
+
+
+async def test_status_reports_transport_from_server_time():
+    class TimedPolicy(FakePolicyClient):
+        async def do_command(self, command, **kwargs):
+            out = await super().do_command(command, **kwargs)
+            if command.get("command") == "infer":
+                out = {**out, "server_s": 0.01, "compute_s": 0.005}
+            return out
+
+    svc = _svc(deps=_deps(policy=TimedPolicy()))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    status = await _wait_until(
+        lambda: svc._status()["timing"]["transport_s"] is not None and svc._status(),
+        "a timed inference",
+    )
+    await svc.do_command({"command": "stop"})
+    timing = status["timing"]
+    assert timing["server_s"] == pytest.approx(0.01)
+    assert timing["compute_s"] == pytest.approx(0.005)
+    assert timing["transport_s"] == pytest.approx(timing["round_trip_s"] - 0.01)
+
+
+async def test_status_timing_is_unknown_for_an_older_policy():
+    svc = _svc()  # FakePolicyClient sends no server_s
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: svc._status()["timing"]["round_trip_s"] is not None, "an inference")
+    await svc.do_command({"command": "stop"})
+    assert svc._status()["timing"]["transport_s"] is None
+
+
+async def test_trace_records_commanded_measured_and_clamps_per_tick():
     arm = FakeArm(positions=[0.0] * 6)
-    policy = FakePolicyClient(action_dim=6, n=20, action_value=0.01)
+    policy = FakePolicyClient(action_value=50.0)  # far from 0: the delta clamp engages
     svc = _svc(
-        config=_config(mode="async", merge="aligned", blend_ticks=3, gripper=_DO_COMMAND_GRIPPER),
-        deps=_deps(policy=policy, arm=arm, g=FakeDoCommandGripper()),
+        config=_config(safety={"max_start_delta_degs": 1000.0, "max_joint_delta_degs": 1.0}),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(svc._trace) >= 3, "three ticks")
+    await svc.do_command({"command": "stop"})
+    trace = await svc.do_command({"command": "trace"})
+    n = len(trace["nominal_t"])
+    assert n >= 3
+    assert len(trace["commanded"]) == len(trace["measured"]) == len(trace["clamped"]) == n
+    assert len(trace["commanded"][0]) == 6
+    assert trace["clamped"][0] is True
+    assert trace["nominal_t"] == sorted(trace["nominal_t"])
+    assert trace["measured"][0] == [0.0] * 6
+    # Each row is what the arm actually received, in order.
+    for i in range(n):
+        assert trace["commanded"][i] == list(arm.moves[i].values)
+
+
+async def test_trace_marks_no_clamp_when_the_action_is_within_limits():
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(deps=_deps(policy=FakePolicyClient(action_value=0.0), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(svc._trace) >= 3, "three ticks")
+    await svc.do_command({"command": "stop"})
+    trace = await svc.do_command({"command": "trace"})
+    assert trace["clamped"] and not any(trace["clamped"])
+
+
+async def test_status_reports_the_time_axis():
+    svc = _svc()
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(svc._deps["a"])
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    for key in ("expected_latency_s", "regime", "buffer_horizon_s", "staleness_s",
+                "overlap_s", "rebases", "skipped_rows"):
+        assert key in status, key
+    assert status["rebases"] >= 1
+    assert status["regime"] in ("overlap", "sequential")
+
+
+async def test_a_hung_policy_fails_the_run_after_inference_timeout_s():
+    policy = FakePolicyClient()
+    policy.infer_delay_s = 60.0
+    svc = _svc(config=_config(inference_timeout_s=0.05), deps=_deps(policy=policy))
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "did not land" in status["last_error"]
+
+
+async def test_trace_records_the_sample_time():
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.moves) >= 3, "three ticks")
+    await svc.do_command({"command": "stop"})
+    trace = await svc.do_command({"command": "trace"})
+    # setpoint mode samples one tick ahead of the tick's nominal start
+    for nominal, sample in zip(trace["nominal_t"], trace["sample_t"]):
+        assert sample == pytest.approx(nominal + 1 / 50.0)
+
+
+async def test_buffer_gets_blend_and_holds_the_gripper_column():
+    svc = _svc(
+        config=_config(blend_s=0.3, gripper=_DO_COMMAND_GRIPPER),
+        deps=_deps(policy=FakePolicyClient(action_dim=6), g=FakeDoCommandGripper()),
     )
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_state(svc, "running")
-    scheduler = svc._scheduler
+    buf = svc._buffer
     await svc.do_command({"command": "stop"})
-    assert scheduler._blend_ticks == 3
-    assert scheduler._blend_dims == 5  # 6 action dims minus the trailing gripper channel
+    assert buf._blend_s == 0.3
+    assert buf._interp_cols == 5  # 6 action dims minus the trailing gripper channel
+
+
+async def test_a_failing_run_cancels_the_inference_poll_fired():
+    # The arm faults while a request poll() fired is still hung. _run must
+    # close the inference loop itself: _stop is never called on this path,
+    # and the request is not on the loop task's call stack.
+    class HangingPolicy(FakePolicyClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.second_call_started = asyncio.Event()
+            self.cancelled = False
+
+        async def do_command(self, command, **kwargs):
+            if command.get("command") == "infer" and self.infer_calls >= 1:
+                self.infer_calls += 1
+                self.second_call_started.set()
+                try:
+                    await asyncio.Event().wait()  # never set
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+            return await super().do_command(command, **kwargs)
+
+    policy = HangingPolicy(n=100)
+
+    class FaultingArm(FakeArm):
+        async def move_to_joint_positions(self, *a, **kw):
+            if policy.second_call_started.is_set():
+                raise RuntimeError("arm fault")
+            return await super().move_to_joint_positions(*a, **kw)
+
+    # A 1 s chunk and margin_s=0.5: the second request fires mid-plan.
+    svc = _svc(
+        config=_config(fps=100.0, margin_s=0.5),
+        deps=_deps(policy=policy, arm=FaultingArm(positions=[0.0] * 6)),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "arm fault" in status["last_error"]
+    await _wait_until(lambda: policy.cancelled, "the hung request to be cancelled", timeout=0.5)
+
+
+async def test_the_first_fill_is_not_counted_as_starvation():
+    # Every run starts with an empty buffer and waits out one inference; only
+    # a plan that ran out after commanding something is starved. A 1 s chunk
+    # against 200 ms inference overlaps, so no later wait starves either.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=50)
+    policy.infer_delay_s = 0.2
+    svc = _svc(config=_config(fps=50.0), deps=_deps(policy=policy, arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.moves) >= 5, "five moves")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["starved_ticks"] == 0
+
+
+async def test_status_buffer_horizon_is_the_plan_left():
+    # Deterministic: fps=2 and n=7 is a 3.5 s chunk, and the second tick is
+    # not due for 0.5 s, so shortly after the first move the plan left is
+    # positive and at most the whole chunk.
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(config=_config(fps=2.0), deps=_deps(policy=FakePolicyClient(n=7), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await asyncio.sleep(0.05)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert 0 < status["buffer_horizon_s"] <= 3.5
+    assert status["staleness_s"] > 0

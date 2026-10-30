@@ -5,7 +5,7 @@ Every numeric/choice field goes through `vla.config_util`'s `as_int`/
 delivers every number as a double, so each field needs the same "accept 2.0,
 reject 2.5, reject True, reject NaN" treatment.
 
-Two fields carry non-obvious semantics:
+One field carries non-obvious semantics:
 
   - `max_vel_degs_per_sec` is the operator-facing velocity knob;
     `max_joint_delta_degs` is derivable from it as `max_vel_degs_per_sec /
@@ -14,23 +14,6 @@ Two fields carry non-obvious semantics:
     Both may appear in config, but if both are given they must agree --
     silently preferring one over a contradictory other would hide an
     operator mistake on a safety-critical limit.
-
-  - `queue_threshold: None` means "derive it", not "zero". The right value is
-    a property of the checkpoint (`n_action_steps`) or of
-    `actions_per_chunk`, neither of which config parsing can see, so
-    `VLAController._build_scheduler` derives `effective_chunk - 1` once
-    `specs` is known. A sentinel of `0` could not be distinguished from an
-    operator who genuinely wants `0`.
-
-  - `actions_per_chunk: None` means "execute the whole chunk". An int
-    truncates every chunk to its first N actions before it is queued,
-    mirroring lerobot's server-side `actions_per_chunk`
-    (`async_inference/policy_server.py`, `chunk[:, : self.actions_per_chunk, :]`).
-    A checkpoint whose `chunk_size` covers 5s of motion is 5s of open loop;
-    truncating re-observes every N ticks instead. N is floored by inference
-    latency -- below `latency * fps` the queue cannot refill in time -- so
-    this is only useful with `mode: "async"`, where `sequential`'s
-    per-refill stall would otherwise dominate the duty cycle.
 
 `state_units`/`action_units` change *shape* with `action_space`. Under
 `"joints"` (the default, and unchanged) they are a single unit string
@@ -47,16 +30,15 @@ state layout is the kind of config an operator reasonably assumes is in
 force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `"joints"` for the same reason.
 
-`mode: "async"` overlaps execution with inference instead of stalling the arm
-between chunks -- for the case where inference latency approaches or exceeds
-chunk duration. `"sequential"` is the default. See `AsyncScheduler`.
-
-`merge: "aligned"` replaces the queued rows with each landing chunk, minus its
-head rows for ticks already served since the request fired, so append mode's
-chunk-boundary yank disappears. `blend_ticks` (default 0, a hard switch)
-crossfades the first rows of the arm columns from old to new and needs
-`aligned`. `aligned` needs `mode: "async"` (the blocking scheduler just stalled
-for those rows and does not count ticks across a fire). README: "merge: aligned".
+`blend_s` is how long a landing chunk takes to crossfade in from the plan it
+replaces, in seconds on the buffer's time axis (0 replaces outright); it
+defaults to two ticks, and to 0 under `"delta-ee"`, whose rows are per-tick
+deltas that cannot be blended. `margin_s` is the extra lead the inference
+trigger keeps beyond the expected latency and the blend. `inference_timeout_s`
+bounds a wait for a chunk once the plan has run out, so a hung policy fails the
+tick (and the run, under the default `stop_on_error`) instead of hanging it. See `reference_buffer.py` and `inference_loop.py`.
+The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
+`actions_per_chunk`) are refused with their replacement; see `REMOVED_KEYS`.
 
 `arm_write: "stream"` densifies each tick's target into `round(stream_hz / fps)`
 servo setpoints over `move_through_joint_positions_streamed`; one setpoint per
@@ -87,8 +69,6 @@ __all__ = [
     "ConfigError",
     "SafetyConfig",
     "ControllerConfig",
-    "MODES",
-    "MERGES",
     "ENCODINGS",
     "IMAGE_FITS",
     "DEFAULT_ARM_MOVE_EXTRA",
@@ -98,13 +78,22 @@ __all__ = [
     "ARM_WRITES",
 ]
 
-MODES = ("sequential", "async")
-MERGES = ("append", "aligned")
 ENCODINGS = ("jpeg", "png", "raw")
 
 # "setpoint": one move_to_joint_positions per tick. "stream": interpolated
 # points over move_through_joint_positions_streamed (README, Smooth servo streaming).
 ARM_WRITES = ("setpoint", "stream")
+
+# Keys removed with the time-indexed buffer. A config that still sets one fails
+# with its replacement, rather than being silently ignored by raw.get().
+REMOVED_KEYS = {
+    "mode": "inference overlaps execution, and runs whole chunks on its own when "
+    "latency approaches the chunk duration",
+    "merge": "chunks merge on the time axis; set blend_s (0 replaces outright)",
+    "blend_ticks": "use blend_s, in seconds (blend_ticks / fps)",
+    "queue_threshold": "inference fires on the buffer's remaining time; tune margin_s",
+    "actions_per_chunk": "every row keeps its own time, so there is nothing to truncate",
+}
 
 # The two action spaces. `joints` is the original and the default: absolute
 # joint angles in degrees, written with `move_to_joint_positions`. `delta-ee`
@@ -112,7 +101,7 @@ ARM_WRITES = ("setpoint", "stream")
 # `EndPosition` and written with `move_to_position`. They differ in the
 # observation they build, the arm call they make, the safety layer that
 # clamps them, and the shape of their unit config -- and in nothing else:
-# the scheduler, action queue, and RTC/async modes are shared.
+# the reference buffer and the inference loop are shared.
 JOINTS = "joints"
 DELTA_EE = "delta-ee"
 ACTION_SPACES = (JOINTS, DELTA_EE)
@@ -181,7 +170,7 @@ def _parse_arm_move_extra(raw: Any) -> dict[str, Any]:
 
 
 # Sanity ceilings/floors, not physical limits: they turn an obvious typo (a
-# negative fps, a fractional queue_threshold) into a config-time error.
+# negative fps, a negative blend_s) into a config-time error.
 _MIN_FPS = 1e-6
 _MAX_FPS = 1000.0
 _MIN_POSITIVE_DEG = 1e-6
@@ -507,11 +496,14 @@ class ControllerConfig:
     gripper: dict[str, Any] = field(default_factory=lambda: {"type": "none"})
     task: str = ""
     fps: float = 10.0
-    mode: str = "sequential"
-    merge: str = "append"
-    blend_ticks: int = 0
-    queue_threshold: int | None = None
-    actions_per_chunk: int | None = None
+    # Seconds a landing chunk takes to crossfade in from the old plan (0 replaces
+    # outright); parse() defaults it to 2/fps, or 0 under delta-ee.
+    blend_s: float = 0.2
+    # Extra lead on the inference trigger beyond the expected latency and blend.
+    margin_s: float = 0.2
+    # A wait for a chunk longer than this fails the tick; _infer passes no
+    # DoCommand timeout, so without it a hung policy hangs the controller.
+    inference_timeout_s: float = 30.0
     starvation_grace_ticks: int = 3
     policy_ready_timeout_s: int = 600
     # A plain unit string under action_space="joints" (a joint vector is one
@@ -542,6 +534,12 @@ class ControllerConfig:
         if not policy_service:
             raise ConfigError("policy_service is required")
         policy_service = as_str(policy_service, "policy_service")
+
+        removed = sorted(k for k in REMOVED_KEYS if k in raw)
+        if removed:
+            raise ConfigError(
+                "; ".join(f"{k} was removed: {REMOVED_KEYS[k]}" for k in removed)
+            )
 
         arm = raw.get("arm")
         if not arm:
@@ -594,20 +592,18 @@ class ControllerConfig:
                     f"expected {expected} (one per action dimension in degrees)"
                 )
 
-        mode = as_choice(raw.get("mode", "sequential"), "mode", MODES)
-        merge = as_choice(raw.get("merge", "append"), "merge", MERGES)
-        if merge == "aligned" and mode != "async":
+        blend_s = as_float(
+            raw.get("blend_s", 0.0 if delta_ee else 2.0 / fps), "blend_s", minimum=0.0
+        )
+        if delta_ee and blend_s:
             raise ConfigError(
-                f"merge={merge!r} needs mode: \"async\" -- on the blocking scheduler, "
-                "aligning would discard rows the loop just stalled to obtain, making the "
-                "duty cycle worse, and it does not track when its inference was fired anyway"
+                f"blend_s={blend_s} is not supported under action_space={DELTA_EE!r}: its rows "
+                "are per-tick deltas, and blending two would apply part of each. Remove it."
             )
-        blend_ticks = as_int(raw.get("blend_ticks", 0), "blend_ticks", minimum=0)
-        if blend_ticks and merge != "aligned":
-            raise ConfigError(
-                f"blend_ticks={blend_ticks} needs merge: \"aligned\" -- only an aligned "
-                "merge replaces queued rows, so under append there is nothing to blend from"
-            )
+        margin_s = as_float(raw.get("margin_s", 2.0 / fps), "margin_s", minimum=0.0)
+        inference_timeout_s = as_float(
+            raw.get("inference_timeout_s", 30.0), "inference_timeout_s", minimum=0.001
+        )
 
         arm_write = as_choice(raw.get("arm_write", "setpoint"), "arm_write", ARM_WRITES)
         stream_hz = as_float(raw.get("stream_hz", 100.0), "stream_hz", minimum=1.0, maximum=1000.0)
@@ -631,19 +627,9 @@ class ControllerConfig:
             gripper=gripper,
             task=as_str(raw.get("task", ""), "task"),
             fps=fps,
-            mode=mode,
-            merge=merge,
-            blend_ticks=blend_ticks,
-            queue_threshold=(
-                as_int(raw["queue_threshold"], "queue_threshold", minimum=0)
-                if raw.get("queue_threshold") is not None
-                else None
-            ),
-            actions_per_chunk=(
-                as_int(raw["actions_per_chunk"], "actions_per_chunk", minimum=1)
-                if raw.get("actions_per_chunk") is not None
-                else None
-            ),
+            blend_s=blend_s,
+            margin_s=margin_s,
+            inference_timeout_s=inference_timeout_s,
             starvation_grace_ticks=as_int(
                 raw.get("starvation_grace_ticks", 3), "starvation_grace_ticks", minimum=0
             ),

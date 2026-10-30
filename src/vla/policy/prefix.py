@@ -14,12 +14,12 @@ mirroring the tensor version's `dtype=prev_actions.dtype`).
 One deliberate divergence: upstream returns the input tensor itself
 (aliased) when `steps == target_steps`, and a view
 (`prev_actions[:target_steps]`) when truncating. This port always returns a
-copy in every branch. The RTC scheduler stores a chunk's raw actions in
-`ActionQueue` and this function's output is fed straight back in on a later
-tick as `prev_chunk_left_over`; a caller mutating the returned array in
-place (unit conversion, clamping, ...) must never be able to corrupt the
-queue's stored chunk. See `tests/policy/test_prefix.py` for the enforced
-non-aliasing contract.
+copy in every branch. An RTC caller keeps a chunk's raw actions in its own
+buffer (the controller ignores `raw_actions`), and this function's output is
+fed straight back in on a later tick as `prev_chunk_left_over`; a caller
+mutating the returned array in place (unit conversion, clamping, ...) must
+never be able to corrupt the buffer's stored chunk. See
+`tests/policy/test_prefix.py` for the enforced non-aliasing contract.
 """
 
 from __future__ import annotations

@@ -51,6 +51,10 @@ class VLAPolicy(Generic, EasyResource):
         self._error: str | None = None
         self._load_task: asyncio.Task | None = None
         self._closed = False
+        # One predict_chunk at a time. asyncio.to_thread uses the default pool, so
+        # two controllers sharing this policy would otherwise run the model
+        # concurrently on one device.
+        self._infer_lock = asyncio.Lock()
 
     @classmethod
     def new(cls, config: ServiceConfig, dependencies: Mapping[Any, ResourceBase]) -> Self:
@@ -243,6 +247,7 @@ class VLAPolicy(Generic, EasyResource):
             raise RuntimeError(f"policy not ready (state={self._state}, error={self._error})")
 
     async def _infer(self, command: Mapping[str, Any]) -> Mapping[str, Any]:
+        entered = time.perf_counter()
         self._require_ready()
         # Captured once so this request keeps using the backend that was
         # ready when it started, even if a concurrent reconfigure() swaps
@@ -321,12 +326,23 @@ class VLAPolicy(Generic, EasyResource):
             prefix = raw_rtc.get("prev_chunk_left_over")
             rtc_kwargs["prev_chunk_left_over"] = decode_matrix(prefix) if prefix else None
 
-        started = time.perf_counter()
-        actions, raw = await asyncio.to_thread(backend.predict_chunk, images, state, task, rtc_kwargs)
-        latency = time.perf_counter() - started
+        async with self._infer_lock:
+            started = time.perf_counter()
+            actions, raw = await asyncio.to_thread(
+                backend.predict_chunk, images, state, task, rtc_kwargs
+            )
+            compute = time.perf_counter() - started
 
-        return {
+        out: dict[str, Any] = {
             "actions": encode_matrix(actions),
             "raw_actions": encode_matrix(raw),
-            "latency_s": latency,
+            # Durations only: the controller may run on another machine, so this
+            # service's absolute clock must never be compared with the caller's.
+            # server_s deliberately includes lock wait and decode, so
+            # server_s - compute_s is queueing plus overhead.
+            "compute_s": compute,
         }
+        if "seq" in command:
+            out["seq"] = command["seq"]
+        out["server_s"] = time.perf_counter() - entered
+        return out
