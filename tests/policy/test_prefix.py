@@ -82,11 +82,11 @@ def test_empty_prefix_is_padded_to_all_zeros():
 # ---------------------------------------------------------------------------
 # Aliasing (item 4). Chosen behavior: always return a copy, in every branch
 # -- including the steps == target_steps and truncation branches, where
-# upstream (torch) returns the input itself / a view. The RTC scheduler
-# stores a chunk's raw actions in ActionQueue and this function's output is
-# fed straight back in as prev_chunk_left_over on a later tick; a caller
-# that mutates the returned array in place (unit conversion, clamping, ...)
-# must never be able to corrupt the queue's stored chunk.
+# upstream (torch) returns the input itself / a view. An RTC caller keeps
+# a chunk's raw actions in its buffer (ReferenceBuffer on the controller) and
+# this function's output is fed straight back in as prev_chunk_left_over on a
+# later tick; a caller that mutates the returned array in place (unit
+# conversion, clamping, ...) must never be able to corrupt the stored chunk.
 # ---------------------------------------------------------------------------
 
 
