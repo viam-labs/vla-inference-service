@@ -180,9 +180,13 @@ class ReferenceBuffer:
             rows[:, :n] = w * rows[:, :n] + (1.0 - w) * old
         self.overlap_s = min(self._blend_s, max(0.0, float(self.times[-1]) - seam))
         keep = self.times < times[0]
+        old_rows = self.rows[keep]  # fancy index: a copy
+        # Held columns (the gripper) take the new value from the seam, even on
+        # old rows kept between the seam and the first new row.
+        old_rows[self.times[keep] > seam, n:] = rows[0, n:]
         self._set(
             np.concatenate([self.times[keep], times]),
-            np.vstack([self.rows[keep], rows]),
+            np.vstack([old_rows, rows]),
             np.concatenate([self.obs_t[keep], obs]),
         )
 
