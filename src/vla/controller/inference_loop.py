@@ -22,14 +22,16 @@ The remaining time is measured from the buffer's last sample, not the clock:
 each tick samples a lead (up to 2/fps) ahead of now.
 
 `expected_latency` is the max of the last 5 observation-to-landing intervals:
-an underestimate starves and an overestimate only fires early. Until two
-samples exist it is the chunk duration, and the regime stays overlap, which
-fires right after each landing.
+an underestimate starves and an overestimate only fires early. Until the first
+sample exists it is the chunk duration, and the regime stays overlap, which
+fires right after each landing. The first sample usually includes warm-up and
+overestimates, which errs toward sequential, the safe side.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import deque
 from typing import Awaitable, Callable
 
@@ -42,7 +44,7 @@ from .reference_buffer import ReferenceBuffer
 InferFn = Callable[[], Awaitable[tuple[np.ndarray, float]]]
 
 _EXPECTED_WINDOW = 5
-_MIN_SAMPLES = 2
+_MIN_SAMPLES = 1
 
 
 class InferenceError(VLAError, RuntimeError):
@@ -91,6 +93,8 @@ class InferenceLoop:
     def poll(self) -> None:
         """Called once per tick: raise a background failure, maybe fire."""
         self._raise_pending_error()
+        if self._buffer.last_sampled == -math.inf:
+            return  # nothing sampled yet: no plan to measure, wait() does the first fire
         if self._inflight is not None or self.regime != "overlap":
             return
         lead = self.expected_latency + self._blend_s + self._margin_s
@@ -142,6 +146,8 @@ class InferenceLoop:
                 exc if isinstance(exc, InferenceError) else InferenceError(f"inference failed: {exc}")
             )
         else:
+            # A timed-out or failed request adds no sample, on purpose: the
+            # failure already fails the tick.
             self.latencies.append(self._clock() - t_obs)
         finally:
             self._inflight = None

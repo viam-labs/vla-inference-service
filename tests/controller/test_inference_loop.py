@@ -52,14 +52,19 @@ async def test_wait_fires_and_lands_and_records_observation_to_landing():
     assert list(loop.latencies) == [pytest.approx(0.3)]
 
 
-async def test_prior_is_the_chunk_duration_until_two_samples():
+async def test_prior_is_the_chunk_duration_until_the_first_sample():
     clock, calls, buf = Clock(), [], ReferenceBuffer(10.0)
     loop = _loop(_timed_infer(clock, 0.1, calls), buf, clock)
     assert loop.expected_latency == 1.0
     await loop.wait()
-    assert loop.expected_latency == 1.0
-    await loop.wait()
     assert loop.expected_latency == pytest.approx(0.1)
+
+
+async def test_one_slow_sample_already_selects_sequential():
+    clock, calls, buf = Clock(), [], ReferenceBuffer(10.0)
+    loop = _loop(_timed_infer(clock, 0.7, calls), buf, clock)
+    await loop.wait()
+    assert loop.regime == "sequential"
 
 
 async def test_expected_latency_is_the_max_of_the_last_five():
