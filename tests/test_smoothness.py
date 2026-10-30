@@ -11,17 +11,21 @@ from __future__ import annotations
 import asyncio
 import time
 
+import numpy as np
 import pytest
 
 from tests.smoothness import VirtualLoop, run_virtual
 from tests.smoothness import (
     PERIOD,
     STAMP_TOL,
+    TAG,
     gap_jitter,
     knot_accel,
     landing_obs_age,
     lead_error,
     long_gaps,
+    residual,
+    residual_accel,
     run_session,
     seam_jump,
     seeded_jitter,
@@ -79,7 +83,8 @@ def test_wait_for_times_out_in_virtual_time():
 def _assert_healthy(session):
     assert session.status["state"] == "running", session.status
     assert session.status["last_error"] == "", session.status
-    assert len(session.arm.knots) > 50
+    # Knots are only recorded when streaming; setpoints only in setpoint mode.
+    assert len(session.arm.knots) + len(session.arm.setpoints) > 50
 
 
 def test_steady():
@@ -116,7 +121,8 @@ def test_jittery_ticks():
 
 def test_slow_inference_lands_fresh_rows():
     latency = 1.23
-    s = run_session(latency_s=latency)
+    # Unblended rows: the TAG decode in landing_obs_age needs them.
+    s = run_session(latency_s=latency, blend_s=0.0)
     _assert_healthy(s)
     assert landing_obs_age(s) <= latency + 2 * PERIOD
 
@@ -130,23 +136,91 @@ def test_starvation_holds_are_accounted_for():
 
 
 def test_seam_blend_softens_the_switch():
-    hard = run_session(latency_s=1.23, offsets=(1.0, -1.0))
-    blended = run_session(latency_s=1.23, offsets=(1.0, -1.0), blend_ticks=3)
+    hard = run_session(latency_s=1.23, offsets=(1.0, -1.0), blend_s=0.0)
+    blended = run_session(latency_s=1.23, offsets=(1.0, -1.0), blend_s=0.3)
     _assert_healthy(hard)
     _assert_healthy(blended)
     # Consecutive chunks disagree by 2 deg; a hard switch puts that into one
-    # second difference, and a 3-tick linear crossfade spreads it over 4 steps
-    # (~0.25x). Measured while planning: 10.1 vs 2.58, before the first landing
-    # was excluded from seam_jump.
+    # second difference, and a 3-tick smoothstep spreads the 2-degree step over
+    # 3 increments of 0.26/0.48/0.26 of it.
     assert seam_jump(blended) <= 0.5 * seam_jump(hard), (seam_jump(blended), seam_jump(hard))
 
 
-def test_aligned_starves_past_half_the_chunk():
-    # Each landing leaves CHUNK - L fresh rows and the next lands L ticks
-    # later, so aligned keeps up only while L <= CHUNK / 2 (25 ticks here).
-    under = run_session(latency_s=1.97, duration_s=20.0, starvation_grace_ticks=3)
-    _assert_healthy(under)
-    assert under.status["starved_ticks"] == 0
-    over = run_session(latency_s=3.03, duration_s=20.0, starvation_grace_ticks=3)
-    assert over.status["state"] == "error", over.status
-    assert "starved" in over.status["last_error"]
+def test_targets_land_on_the_reference_at_their_due_time():
+    for arm_write in ("stream", "setpoint"):
+        s = run_session(latency_s=0.33, blend_s=0.0, arm_write=arm_write)
+        _assert_healthy(s)
+        assert s.status["rebases"] == 1, s.status
+        _, res = residual(s, after=s.policy.reply_times[1] + 3 * PERIOD)
+        # Observations fall on the tick grid here, so samples land on rows and the
+        # measured residual is ~2e-7. The bound is the worst case off-grid:
+        # linear interpolation of the 4 s, 5-degree sinusoid errs by at most
+        # h^2/8 * max|f''| = 0.1^2/8 * 5*(2*pi/4)^2 ~ 0.0154 deg. A target a tick
+        # early or late is ~0.8 deg off.
+        assert len(res) > 100
+        assert np.abs(res).max() <= 0.016, (arm_write, np.abs(res).max())
+
+
+def test_crossfade_adds_less_acceleration_than_the_motion_itself_has():
+    fps, d = 30.0, 0.2
+    # A B-tick smoothstep peaks at 6*d/B^2 deg/tick^2: 0.0053 at B = 15. The
+    # reference's own peak is 5*(2*pi/4)^2 / fps^2 ~ 0.0137 at 30 fps.
+    blend_s = 15 / fps
+    kwargs = dict(fps=fps, latency_s=0.3, offsets=(d / 2, -d / 2), duration_s=20.0)
+    soft = run_session(blend_s=blend_s, **kwargs)
+    hard = run_session(blend_s=0.0, **kwargs)
+    _assert_healthy(soft)
+    _assert_healthy(hard)
+    assert soft.status["regime"] == "overlap", soft.status
+    # Past the rebased first chunk and the blend that supersedes it.
+    after = soft.policy.reply_times[1] + blend_s + 3 / fps
+    assert residual_accel(soft, after=after) <= 0.01
+    assert residual_accel(hard, after=hard.policy.reply_times[1] + 3 / fps) >= 0.15
+
+
+def test_overlap_keeps_up_below_the_regime_threshold():
+    # One request in flight: landings 2L apart. 2*2.2 + 0.2 + 0.2 = 4.8 < 5.0.
+    s = run_session(latency_s=2.2, duration_s=30.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "overlap"
+    assert s.status["starved_ticks"] == 0
+
+
+def test_past_half_the_chunk_switches_to_sequential():
+    # 2*3.03 + 0.4 >= 5.0: overlap would starve every chunk here (measured: 49
+    # starved ticks under the old single-L threshold), so it runs whole chunks.
+    s = run_session(latency_s=3.03, duration_s=30.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "sequential"
+    assert s.status["overlap_s"] == 0.0
+
+
+def test_latency_above_the_chunk_runs_whole_chunks_from_their_start():
+    s = run_session(latency_s=5.5, duration_s=40.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "sequential"
+    assert s.status["overlap_s"] == 0.0
+    # The fill's own latency sample already says sequential, so every chunk
+    # after it is observed at rest and rebased whole.
+    assert s.status["rebases"] >= 3
+    # Each rebased chunk runs to its end: about CHUNK ticks each, minus the
+    # couple of rows already behind the freeze point.
+    assert len(s.arm.knots) >= 45 * (s.status["rebases"] - 1)
+    # The TAG column names each knot's row. Every hold follows a chunk's last
+    # row, and the next chunk resumes at its first rows: observed at rest, its
+    # freeze point is row 0. (A position-continuity check across a hold needs a
+    # policy that reacts to the observed state; ScriptedPolicy is open-loop in
+    # time, so that property is pinned by the ReferenceBuffer unit tests.)
+    tags = np.array([p[TAG] for _, p in s.arm.knots])
+    stamps = np.array([stamp for _, stamp in s.arm.batch_stamps])
+    holds = np.flatnonzero(np.diff(stamps) > 2 * PERIOD)
+    assert len(holds) >= 2
+    for i in holds:
+        assert tags[i] % 1000 >= 47, (i, tags[i])
+        assert tags[i + 1] % 1000 <= 2, (i, tags[i + 1])
+
+
+def test_a_hung_policy_fails_after_inference_timeout_s():
+    s = run_session(latency_s=1e6, duration_s=10.0, inference_timeout_s=5.0)
+    assert s.status["state"] == "error"
+    assert "did not land" in s.status["last_error"]

@@ -96,8 +96,8 @@ def reference(t: float) -> np.ndarray:
 class ScriptedPolicy:
     """The policy service's DoCommand surface, with deterministic chunks.
 
-    Row i of a chunk is `reference(obs_t + (i + 1) * PERIOD)`, where obs_t is
-    when the request arrived, plus the chunk's offset, so consecutive chunks
+    Row i of a chunk is `reference(obs_t + (i + 1) * period)`, where obs_t is
+    the request's `t_obs` (the controller's observation instant), plus the chunk's offset, so consecutive chunks
     disagree by a known amount at every seam. The first inference takes
     `cold_extra_s` longer: the schedule anchors after it, and without the
     offset every later reply would land exactly on a tick boundary. It must
@@ -105,8 +105,11 @@ class ScriptedPolicy:
     and would spin hot in virtual time otherwise.
     """
 
-    def __init__(self, latency_s: float, offsets=(0.0,), cold_extra_s: float = 0.05):
+    def __init__(
+        self, latency_s: float, offsets=(0.0,), cold_extra_s: float = 0.05, fps: float = FPS
+    ):
         self.latency_s = latency_s
+        self.period = 1.0 / fps
         self.offsets = tuple(offsets)
         self.cold_extra_s = cold_extra_s
         self.obs_times: list[float] = []
@@ -137,19 +140,22 @@ class ScriptedPolicy:
         if name == "infer":
             loop = asyncio.get_running_loop()
             chunk_id = len(self.obs_times)
-            obs_t = loop.time()
+            # The harness's controller clock is loop.time, so t_obs is the
+            # controller's own observation instant.
+            obs_t = float(command.get("t_obs", loop.time()))
             self.obs_times.append(obs_t)
             await asyncio.sleep(self.latency_s + (self.cold_extra_s if chunk_id == 0 else 0.0))
             offset = self.offsets[chunk_id % len(self.offsets)]
             rows = np.empty((CHUNK, DIM), dtype=np.float32)
             for i in range(CHUNK):
-                rows[i, :TAG] = reference(obs_t + (i + 1) * PERIOD) + offset
+                rows[i, :TAG] = reference(obs_t + (i + 1) * self.period) + offset
                 rows[i, TAG] = chunk_id * 1000 + i
             self.reply_times.append(loop.time())
             return {
                 "actions": encode_matrix(rows),
                 "raw_actions": encode_matrix(rows),
-                "latency_s": self.latency_s,
+                "compute_s": self.latency_s,
+                "server_s": self.latency_s,
             }
         raise ValueError(name)
 
@@ -170,12 +176,18 @@ class TrackingArm(FakeArm):
         self.knots: list[tuple[float, list[float]]] = []
         # (virtual receive time, last point's stamp in seconds) per batch.
         self.batch_stamps: list[tuple[float, float]] = []
+        # (virtual receive time, commanded positions) per setpoint write.
+        self.setpoints: list[tuple[float, list[float]]] = []
 
     async def get_joint_positions(self, **kwargs):
         delay = self.jitter()
         if delay:
             await asyncio.sleep(delay)
         return await super().get_joint_positions(**kwargs)
+
+    async def move_to_joint_positions(self, positions, *, extra=None, timeout=None, **kwargs):
+        self.setpoints.append((asyncio.get_running_loop().time(), list(positions.values)))
+        return await super().move_to_joint_positions(positions, extra=extra, timeout=timeout, **kwargs)
 
     async def move_through_joint_positions_streamed(self, batches, *, extra=None, timeout=None, **kwargs):
         async def recording():
@@ -204,15 +216,13 @@ def seeded_jitter(seed: int, probability: float = 0.2, max_fraction: float = 0.6
     return jitter
 
 
-def _config(**overrides) -> ServiceConfig:
+def _config(fps: float = FPS, **overrides) -> ServiceConfig:
     attrs = {
         "policy_service": "p",
         "arm": "a",
         "cameras": {"observation.images.top": "cam"},
         "state_joint_indices": list(range(DIM)),
-        "fps": FPS,
-        "mode": "async",
-        "merge": "aligned",
+        "fps": fps,
         "arm_write": "stream",
         "stream_hz": STREAM_HZ,
         # Starvation is measured here, not fatal.
@@ -233,23 +243,26 @@ class Session:
     arm: TrackingArm
     policy: ScriptedPolicy
     status: dict
+    fps: float
 
 
-def run_session(*, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), **config) -> Session:
+def run_session(
+    *, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), fps=FPS, **config
+) -> Session:
     """Run the real controller for `duration_s` virtual seconds and return what it did."""
 
     async def main() -> Session:
         loop = asyncio.get_running_loop()
         arm = TrackingArm(jitter=jitter)
-        policy = ScriptedPolicy(latency_s, offsets)
+        policy = ScriptedPolicy(latency_s, offsets, fps=fps)
         svc = VLAController("c")
         svc._clock = loop.time
-        svc.reconfigure(_config(**config), {"p": policy, "a": arm, "cam": FakeCamera()})
+        svc.reconfigure(_config(fps=fps, **config), {"p": policy, "a": arm, "cam": FakeCamera()})
         await svc.do_command({"command": "start", "task": "t"})
         await asyncio.sleep(duration_s)
         status = await svc.do_command({"command": "status"})
         await svc.do_command({"command": "stop"})
-        return Session(arm=arm, policy=policy, status=status)
+        return Session(arm=arm, policy=policy, status=status, fps=fps)
 
     return run_virtual(main())
 
@@ -264,19 +277,21 @@ def _gaps(points) -> np.ndarray:
     return np.diff(times)
 
 
-def gap_jitter(points) -> float:
-    """Max |gap - STEP| over gaps no longer than one period."""
+def gap_jitter(points, fps: float = FPS) -> float:
+    """Max |gap - step| over gaps no longer than one period."""
+    period = 1.0 / fps
+    step = 1.0 / (round(STREAM_HZ / fps) * fps)
     d = _gaps(points)
-    short = d[d <= PERIOD]
-    return float(np.max(np.abs(short - STEP))) if short.size else 0.0
+    short = d[d <= period]
+    return float(np.max(np.abs(short - step))) if short.size else 0.0
 
 
-def long_gaps(points) -> int:
+def long_gaps(points, fps: float = FPS) -> int:
     """Gaps longer than a period: holds (starvation or re-anchor), not jitter."""
-    return int(np.sum(_gaps(points) > PERIOD))
+    return int(np.sum(_gaps(points) > 1.0 / fps))
 
 
-def lead_error(arm: TrackingArm) -> float:
+def lead_error(arm: TrackingArm, fps: float = FPS) -> float:
     """Max deviation of each batch's last stamp from exactly one tick of lead.
 
     A batch received at virtual time r (relative to the first) carries its
@@ -284,8 +299,11 @@ def lead_error(arm: TrackingArm) -> float:
     lead is one period. Only meaningful without injected jitter, where the
     receive time is the tick's nominal start.
     """
+    period = 1.0 / fps
+    n = round(STREAM_HZ / fps)
+    step = 1.0 / (n * fps)
     r0 = arm.batch_stamps[0][0]
-    want = PERIOD + N * STEP
+    want = period + n * step
     return max(abs(stamp - (r - r0) - want) for r, stamp in arm.batch_stamps)
 
 
@@ -308,7 +326,7 @@ def landing_obs_age(session: Session) -> float:
     after the landing. Observation age, not the README's 'staleness'.
 
     The TAG channel decodes the source chunk only while knots are unblended
-    rows, so don't combine this with `blend_ticks > 0`: a crossfade
+    rows, so don't combine this with `blend_s > 0`: a crossfade
     interpolates the tag too."""
     ages = []
     for i in _landing_knots(session):
@@ -342,3 +360,32 @@ def knot_accel(session: Session) -> float:
     """Max |second difference| over all knots. Baseline for cubic densification (#4)."""
     pos = np.array([p for _, p in session.arm.knots])[:, :TAG]
     return float(np.abs(np.diff(pos, n=2, axis=0)).max())
+
+
+def residual(session: Session, *, after: float) -> tuple[np.ndarray, np.ndarray]:
+    """(due time, executed - reference) per tick target due at or after `after`.
+
+    Streamed: a batch's last point is the tick's target, due at the stream
+    anchor plus its stamp; the anchor is the first batch's receive time (exact
+    without jitter). Setpoint: due one period after the arm received it.
+    Joint columns only.
+    """
+    arm = session.arm
+    if arm.batch_stamps:
+        r0 = arm.batch_stamps[0][0]
+        due = [r0 + stamp for _, stamp in arm.batch_stamps]
+        pos = [p for _, p in arm.knots]
+    else:
+        due = [t + 1.0 / session.fps for t, _ in arm.setpoints]
+        pos = [p for _, p in arm.setpoints]
+    t = np.array(due)
+    keep = t >= after
+    res = np.array([np.asarray(p[:TAG]) - reference(ti) for ti, p in zip(t, pos)])
+    return t[keep], res[keep]
+
+
+def residual_accel(session: Session, *, after: float) -> float:
+    """Max |second difference| of the residual: acceleration the merge added on
+    top of the reference's own. A hard seam puts the whole disagreement here."""
+    _, res = residual(session, after=after)
+    return float(np.abs(np.diff(res, n=2, axis=0)).max())
