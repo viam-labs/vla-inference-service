@@ -145,6 +145,7 @@ def test_land_twice_before_any_sample_keeps_the_newest_chunk():
     b.land(ramp(3, cols=1), 0.0)
     b.land(ramp(3, start=9.0, cols=1), 0.0)
     np.testing.assert_array_equal(b.sample(1.0), [9.0])
+    assert b.rebases == 1
 
 
 def test_sampled_obs_t_names_the_observation_behind_the_sample():
@@ -190,3 +191,32 @@ def test_consume_mode_ignores_blend_and_replaces_unrun_rows():
     b.take(P)
     b.land(ramp(10, start=100.0, cols=1), t_obs=P)  # rows at 2P, ...
     np.testing.assert_array_equal(b.take(2 * P), [100])
+
+
+def test_take_loses_no_rows_to_rounding_at_a_non_dyadic_fps():
+    b = ReferenceBuffer(30.0, consume=True)
+    t0 = 1000.123
+    b.land(np.arange(200.0)[:, None], t_obs=t0 - 0.5)
+    got = [b.take(t0 + k / 30) for k in range(150)]
+    assert all(g is not None for g in got)
+    assert b.skipped_rows == 0
+    assert [float(g[0]) for g in got] == list(range(150))
+
+
+def test_crossfade_keeps_the_old_row_between_the_seam_and_the_first_new_row():
+    b = ReferenceBuffer(FPS, blend_s=8 * P)
+    b.land(np.array([[0.0], [1.0], [0.0], [0.0], [0.0]]), 0.0)
+    b.sample(P)
+    np.testing.assert_allclose(b.sample(1.5 * P), [0.5])
+    b.land(np.zeros((20, 1)), t_obs=1.25 * P)
+    np.testing.assert_allclose(b.sample(1.75 * P), [0.75], atol=0.01)
+
+
+def test_land_does_not_alias_the_callers_array_or_the_returned_sample():
+    b = ReferenceBuffer(FPS)
+    chunk = np.ones((5, 2), dtype=np.float32)
+    b.land(chunk, 0.0)
+    out = b.sample(1.0)
+    out[:] = 99.0
+    chunk[:] = 77.0
+    np.testing.assert_array_equal(b.sample(1.0 + P), [1.0, 1.0])

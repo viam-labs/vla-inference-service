@@ -59,6 +59,9 @@ class ReferenceBuffer:
         consume: bool = False,
     ) -> None:
         self._period = 1.0 / fps
+        # Row times and tick times are the same instants computed two ways;
+        # compare with slack so rounding noise never decides a row.
+        self._tol = self._period * 1e-6
         self._blend_s = 0.0 if consume else blend_s
         self._interp_cols = 0 if consume else interp_cols
         self._consume = consume
@@ -85,7 +88,8 @@ class ReferenceBuffer:
         """Nothing left to command at `t`: the caller waits for a landing.
 
         Records that the plan ran out, which is what decides the next landing's
-        path; the controller calls this every tick before sampling.
+        path, so call it with the tick's sample time, never wall-clock now.
+        The controller calls this every tick before sampling.
         """
         if not len(self.times):
             return True
@@ -133,6 +137,7 @@ class ReferenceBuffer:
             self._crossfade(times, rows, obs)
 
     def _rebase(self, times, rows, obs, t_obs: float) -> None:
+        was_pinned = self._pin is not None
         self._ran_out = False
         freeze = max(self.last_sampled, t_obs + self._period)
         if freeze > times[-1]:
@@ -153,7 +158,8 @@ class ReferenceBuffer:
             obs = np.concatenate([[obs[0]], obs[keep]])
         self._set(times, rows, obs)
         self._pin = freeze
-        self.rebases += 1
+        if not was_pinned:
+            self.rebases += 1
         self.overlap_s = 0.0
 
     def _crossfade(self, times, rows, obs) -> None:
@@ -173,7 +179,7 @@ class ReferenceBuffer:
             )
             rows[:, :n] = w * rows[:, :n] + (1.0 - w) * old
         self.overlap_s = min(self._blend_s, max(0.0, float(self.times[-1]) - seam))
-        keep = self.times <= seam
+        keep = self.times < times[0]
         self._set(
             np.concatenate([self.times[keep], times]),
             np.vstack([self.rows[keep], rows]),
@@ -198,13 +204,14 @@ class ReferenceBuffer:
     def take(self, t: float) -> np.ndarray | None:
         """`consume` mode: the latest unconsumed row due by `t`, at most once.
 
-        None means hold: the next row is not due yet. Older due rows are
+        None means hold (the next row is not due yet) or exhausted, so callers
+        check `exhausted()` first. Older due rows are
         skipped (counted), never run late in a burst.
         """
         if self.exhausted(t):
             return None
         self._apply_pin(t)
-        due = int(np.searchsorted(self.times, t, side="right"))
+        due = int(np.searchsorted(self.times, t + self._tol, side="right"))
         self.last_sampled = t
         if due == 0:
             return None
