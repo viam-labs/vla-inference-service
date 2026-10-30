@@ -351,6 +351,8 @@ class VLAController(Generic, EasyResource):
             # "overlap" fires on buffer time; "sequential" waits for the plan to run
             # out and observes at rest, because latency is too close to the chunk.
             "regime": inf.regime if inf else "",
+            # Plan left past now; 0 before any chunk, and 0 while a fresh chunk
+            # awaits its first sample (a rebase has no times until it is pinned).
             "buffer_horizon_s": horizon - now if math.isfinite(horizon) else 0.0,
             # Age of the observation behind the sample just commanded.
             "staleness_s": (
@@ -428,13 +430,11 @@ class VLAController(Generic, EasyResource):
                 # so _stop() itself never raises.
                 LOGGER.exception("loop task raised while stopping")
         if self._inference is not None:
-            # Cancelling the loop task above does not guarantee the inference
-            # loop's in-flight request gets cancelled too -- that only cascades
-            # when the loop task happened to be suspended *directly* on it (in
-            # `wait()`). A request fired by `poll()` runs independently, so
-            # without this it would keep running orphaned past the point the
-            # controller reports stopped. Only after the loop task is done:
-            # close() must never race a `wait()` still blocked on that request.
+            # Normally a no-op: _run's `finally` already closed the inference
+            # loop, cancelling a request poll() fired that was not on the loop
+            # task's call stack. Kept as a backstop, and only after the loop
+            # task is done: close() must never race a `wait()` still blocked
+            # on that request.
             await self._inference.close()
         if self._stream is not None:
             # Half-close so the driver waits for motion to stop; cancelling the
@@ -713,7 +713,7 @@ class VLAController(Generic, EasyResource):
                 interp_cols=self._blend_dims(specs, gripper),
                 consume=cfg.action_space == DELTA_EE,
             )
-            self._inference = InferenceLoop(
+            inference = self._inference = InferenceLoop(
                 lambda: self._infer(builder),
                 self._buffer,
                 chunk_s=int(specs["n_action_steps"]) / cfg.fps,
@@ -723,8 +723,15 @@ class VLAController(Generic, EasyResource):
                 clock=self._clock,
             )
 
-            self._state = "running"
-            await self._loop(self._inference, self._buffer, gripper)
+            try:
+                self._state = "running"
+                await self._loop(inference, self._buffer, gripper)
+            finally:
+                # Every way out of the loop -- a failure, a stop, a reconfigure --
+                # cancels a request poll() fired, which is not on this task's call
+                # stack. The local reference matters: reconfigure clears
+                # self._inference before this cancelled task gets to run.
+                await inference.close()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -795,7 +802,9 @@ class VLAController(Generic, EasyResource):
             t = schedule.nominal() + lead
             try:
                 # Before sampling: a raise here must not use up this tick's sample.
-                # Reads the previous tick's last_sampled, which is fine.
+                # Reads the previous tick's last_sampled, which is fine. A
+                # background failure raised here costs this tick under
+                # stop_on_error=false: it is skipped like any other failure.
                 inference.poll()
                 if buffer.exhausted(t):
                     # Nothing to command until a chunk lands. Wait for it, then

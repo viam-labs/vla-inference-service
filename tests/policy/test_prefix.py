@@ -67,8 +67,8 @@ def test_negative_target_steps_raises():
 
 
 # ---------------------------------------------------------------------------
-# An empty prefix is a real input -- the queue returns (0, dim) on the very
-# first tick (item 3).
+# An empty prefix is a real input -- an RTC caller's leftover is (0, dim)
+# on the very first chunk (item 3).
 # ---------------------------------------------------------------------------
 
 
@@ -83,10 +83,11 @@ def test_empty_prefix_is_padded_to_all_zeros():
 # Aliasing (item 4). Chosen behavior: always return a copy, in every branch
 # -- including the steps == target_steps and truncation branches, where
 # upstream (torch) returns the input itself / a view. An RTC caller keeps
-# a chunk's raw actions in its buffer (ReferenceBuffer on the controller) and
-# this function's output is fed straight back in as prev_chunk_left_over on a
-# later tick; a caller that mutates the returned array in place (unit
-# conversion, clamping, ...) must never be able to corrupt the stored chunk.
+# a chunk's raw actions in its own buffer (the controller ignores
+# raw_actions), and this function's output is fed straight back in as
+# prev_chunk_left_over on a later tick; a caller that mutates the returned
+# array in place (unit conversion, clamping, ...) must never be able to
+# corrupt the stored chunk.
 # ---------------------------------------------------------------------------
 
 
