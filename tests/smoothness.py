@@ -75,8 +75,6 @@ def run_virtual(coro):
 FPS = 10.0
 PERIOD = 1.0 / FPS
 STREAM_HZ = 100.0
-N = round(STREAM_HZ / FPS)
-STEP = 1.0 / (N * FPS)
 CHUNK = 50
 # Joints 0-4 follow the reference trajectory. Joint 5 is a bookkeeping tag:
 # chunk_id * 1000 + row, so every executed knot names the chunk it came from.
@@ -97,8 +95,9 @@ class ScriptedPolicy:
     """The policy service's DoCommand surface, with deterministic chunks.
 
     Row i of a chunk is `reference(obs_t + (i + 1) * period)`, where obs_t is
-    the request's `t_obs` (the controller's observation instant), plus the chunk's offset, so consecutive chunks
-    disagree by a known amount at every seam. The first inference takes
+    the request's `t_obs` (the controller's observation instant), plus the
+    chunk's offset, so consecutive chunks disagree by a known amount at every
+    seam. The first inference takes
     `cold_extra_s` longer: the schedule anchors after it, and without the
     offset every later reply would land exactly on a tick boundary. It must
     answer `ready`: `_await_policy` polls on a real `time.monotonic()` deadline
@@ -295,7 +294,7 @@ def lead_error(arm: TrackingArm, fps: float = FPS) -> float:
     """Max deviation of each batch's last stamp from exactly one tick of lead.
 
     A batch received at virtual time r (relative to the first) carries its
-    tick's last point, which should be stamped r + lead + N * STEP, where
+    tick's last point, which should be stamped r + lead + n * step, where
     lead is one period. Only meaningful without injected jitter, where the
     receive time is the tick's nominal start.
     """
@@ -367,7 +366,7 @@ def residual(session: Session, *, after: float) -> tuple[np.ndarray, np.ndarray]
 
     Streamed: a batch's last point is the tick's target, due at the stream
     anchor plus its stamp; the anchor is the first batch's receive time (exact
-    without jitter). Setpoint: due one period after the arm received it.
+    without jitter, in both write modes). Setpoint: due one period after the arm received it.
     Joint columns only.
     """
     arm = session.arm
@@ -386,6 +385,7 @@ def residual(session: Session, *, after: float) -> tuple[np.ndarray, np.ndarray]
 
 def residual_accel(session: Session, *, after: float) -> float:
     """Max |second difference| of the residual: acceleration the merge added on
-    top of the reference's own. A hard seam puts the whole disagreement here."""
+    top of the reference's own. A hard seam puts the whole disagreement here.
+    Meaningless across a hold: the second difference spans the gap in time."""
     _, res = residual(session, after=after)
     return float(np.abs(np.diff(res, n=2, axis=0)).max())
