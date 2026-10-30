@@ -173,6 +173,10 @@ class VLAController(Generic, EasyResource):
         # recent 50; None where an older policy module does not report it.
         self._timings: deque[tuple[float, float | None, float | None]] = deque(maxlen=50)
         self._seq = 0
+        # The last 3000 joint-space ticks (~100 s at 30 fps): (nominal_t, commanded,
+        # measured, clamped). Every value is already in hand in _command_joints, so
+        # recording costs no RPC. Dumped by the `trace` DoCommand (tools/dump_trace.py).
+        self._trace: deque[tuple[float, list[float], list[float], bool]] = deque(maxlen=3000)
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._schedule: TickSchedule | None = None
@@ -223,6 +227,7 @@ class VLAController(Generic, EasyResource):
         self._latencies.clear()
         self._timings.clear()
         self._seq = 0
+        self._trace.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._schedule = None
@@ -294,6 +299,8 @@ class VLAController(Generic, EasyResource):
             return {"ok": True}
         if name == "status":
             return self._status()
+        if name == "trace":
+            return self._trace_dump()
         raise ValueError(f"unknown command {name!r}")
 
     def _timing_status(self) -> dict[str, float | None]:
@@ -309,6 +316,16 @@ class VLAController(Generic, EasyResource):
             "server_s": mean(s for _, s, _ in self._timings),
             "compute_s": mean(c for _, _, c in self._timings),
             "transport_s": mean(r - s for r, s, _ in self._timings if s is not None),
+        }
+
+    def _trace_dump(self) -> dict[str, Any]:
+        rows = list(self._trace)
+        return {
+            "fps": self._cfg.fps if self._cfg else 0.0,
+            "nominal_t": [r[0] for r in rows],
+            "commanded": [r[1] for r in rows],
+            "measured": [r[2] for r in rows],
+            "clamped": [r[3] for r in rows],
         }
 
     def _status(self) -> dict[str, Any]:
@@ -367,6 +384,7 @@ class VLAController(Generic, EasyResource):
         self._latencies.clear()
         self._timings.clear()
         self._seq = 0
+        self._trace.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._schedule = None
@@ -938,7 +956,9 @@ class VLAController(Generic, EasyResource):
             # no tick to "skip" before the very first command.
             self._safety.check_start(degrees, current)
 
+        clamps_before = sum(self._safety.clamp_counts.values())
         safe = self._safety.apply(degrees, current)
+        clamped = sum(self._safety.clamp_counts.values()) != clamps_before
 
         # Positional writes silently mis-map: `move_to_joint_positions`
         # has no notion of "only these joints", so a dense list built
@@ -967,11 +987,14 @@ class VLAController(Generic, EasyResource):
             # Asked for here, after the reads above and right before the send: a
             # tick more than a period late re-anchors in this call, which keeps
             # the first stamp (nominal + lead + step) at least `step` in the future.
-            await self._stream.send(target, nominal())
+            nominal_t = nominal()
+            await self._stream.send(target, nominal_t)
         else:
+            nominal_t = self._clock()
             await arm.move_to_joint_positions(
                 JointPositions(values=target), extra=dict(cfg.arm_move_extra)
             )
+        self._trace.append((nominal_t, target, measured, clamped))
         if gripper.has_normalized_tail:
             await gripper.write(float(safe[-1]))
 

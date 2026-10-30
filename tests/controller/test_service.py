@@ -2774,3 +2774,21 @@ async def test_status_timing_is_unknown_for_an_older_policy():
     await svc.do_command({"command": "stop"})
     assert svc._status()["timing"]["transport_s"] is None
 
+
+async def test_trace_records_commanded_measured_and_clamps_per_tick():
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(action_value=50.0)  # far from 0: the delta clamp engages
+    svc = _svc(
+        config=_config(safety={"max_start_delta_degs": 1000.0, "max_joint_delta_degs": 1.0}),
+        deps=_deps(policy=policy, arm=arm),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(svc._trace) >= 3, "three ticks")
+    await svc.do_command({"command": "stop"})
+    trace = await svc.do_command({"command": "trace"})
+    n = len(trace["nominal_t"])
+    assert n >= 3
+    assert len(trace["commanded"]) == len(trace["measured"]) == len(trace["clamped"]) == n
+    assert len(trace["commanded"][0]) == 6
+    assert trace["clamped"][0] is True
+    assert trace["nominal_t"] == sorted(trace["nominal_t"])
