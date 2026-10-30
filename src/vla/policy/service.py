@@ -338,6 +338,8 @@ class VLAPolicy(Generic, EasyResource):
             "raw_actions": encode_matrix(raw),
             # Durations only: the controller may run on another machine, so this
             # service's absolute clock must never be compared with the caller's.
+            # server_s deliberately includes lock wait and decode, so
+            # server_s - compute_s is queueing plus overhead.
             "compute_s": compute,
         }
         if "seq" in command:

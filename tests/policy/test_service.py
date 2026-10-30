@@ -997,6 +997,7 @@ def _infer_cmd(**extra):
 
 async def test_infer_reports_compute_and_server_time_and_echoes_seq(tmp_path):
     svc = await _ready_service(tmp_path, action_dim=6, n_action_steps=50)
+    # t_obs is sent on purpose: the service must tolerate it, not use it.
     out = await svc.do_command(_infer_cmd(seq=7, t_obs=123.0))
     assert out["seq"] == 7
     assert 0 <= out["compute_s"] <= out["server_s"]
