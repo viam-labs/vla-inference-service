@@ -2,8 +2,8 @@
 
 Two action spaces share this loop. They differ in four places -- the
 observation's state half, the safety layer, the arm call, and the unit
-conversion -- and in nothing else: the scheduler, action queue, pacing,
-starvation bounds, status reporting, and the two `mode`s are common.
+conversion -- and in nothing else: the reference buffer, the inference loop,
+pacing, starvation bounds, and status reporting are common.
 
 ``action_space="joints"`` (the default) commands the arm via ``await
 arm.move_to_joint_positions(JointPositions(values=...))`` -- a single
@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import deque
 from typing import Any, Callable, ClassVar, Mapping, Self, Sequence
@@ -80,10 +81,11 @@ from viam.utils import struct_to_dict
 from ..wire import decode_matrix, encode_vector
 from .config import DELTA_EE, DELTA_EE_ACTION_DIM, DELTA_EE_STATE_DIM, ControllerConfig
 from .gripper import GripperAdapter, make_gripper_adapter
+from .inference_loop import InferenceLoop
 from .observation import ObservationBuilder, pose_state_from_proto
 from .pose import orientation_vector, state_compose, state_rotation
+from .reference_buffer import ReferenceBuffer
 from .safety import CartesianSafetyLayer, SafetyLayer
-from .scheduler import AsyncScheduler, ChunkScheduler, SequentialScheduler
 from .trajectory import ArmStream
 from .units import to_degrees, to_working
 
@@ -93,10 +95,9 @@ LOGGER = logging.getLogger(__name__)
 class TickSchedule:
     """Absolute tick deadlines: tick k starts at `anchor + k * period`.
 
-    The anchor is taken lazily, by `nominal()` just before tick one's stream
-    send, or otherwise by tick one's `advance()` -- in the loop, after the
-    first, blocking `next_action()`, so the first inference is not a late
-    tick. A tick that ends up to one period late
+    The anchor is taken lazily, by the first `nominal()` -- in the loop, at the
+    top of a tick, and again after the wait for the first chunk (`restart()`),
+    so the first inference is not a late tick. A tick that ends up to one period late
     shortens the next one and the loop catches up on the grid. A tick more
     than a period late, at its end or by the time it asks for its nominal
     start, re-anchors at now: replaying missed ticks would stamp them in the
@@ -171,33 +172,34 @@ class VLAController(Generic, EasyResource):
         self._active_task_text = ""
         self._safety: SafetyLayer | None = None
         self._specs: dict[str, Any] | None = None
-        # Bounded to the most recent 50: ``avg_latency_s`` must reflect
-        # recent performance, not a lifetime average a long run dilutes.
-        self._latencies: deque[float] = deque(maxlen=50)
         # (round_trip_s, server_s | None, compute_s | None) per inference, most
         # recent 50; None where an older policy module does not report it.
         self._timings: deque[tuple[float, float | None, float | None]] = deque(maxlen=50)
         self._seq = 0
-        # The last 3000 ticks (100 s at 30 fps, 30 s at 100 fps): (nominal_t, commanded,
-        # measured, clamped). nominal_t is the tick's scheduled time when streaming and
-        # the clock just before the move in setpoint mode. `measured` is read before
+        # The last 3000 ticks (100 s at 30 fps, 30 s at 100 fps): (nominal_t, sample_t,
+        # commanded, measured, clamped). nominal_t is the tick's scheduled start;
+        # sample_t is the buffer time its target was sampled at, the instant it is
+        # due at the arm (nominal_t + 2/fps streamed, + 1/fps setpoint, unless the
+        # tick re-anchored between the two reads). `measured` is read before
         # `commanded` is sent, so line up measured[i+1] against commanded[i]. Joint
         # space only: delta-ee records nothing. Every value is already in hand in
         # _command_joints, so recording costs no RPC. Dumped by the `trace` DoCommand
         # (tools/dump_trace.py).
-        self._trace: deque[tuple[float, list[float], list[float], bool]] = deque(maxlen=3000)
+        self._trace: deque[tuple[float, float, list[float], list[float], bool]] = deque(
+            maxlen=3000
+        )
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._schedule: TickSchedule | None = None
-        self._scheduler: ChunkScheduler | None = None
-        self._mode: str | None = None
+        self._buffer: ReferenceBuffer | None = None
+        self._inference: InferenceLoop | None = None
         self._stop_task: asyncio.Task | None = None
         self._stream: ArmStream | None = None
         self._stream_points_sent = 0
         # Every pacing and scheduling decision reads this, so the smoothness
         # harness can run the real loop on a virtual clock (tests/smoothness.py).
-        # Set it before start: AsyncScheduler captures it when built; the tick
-        # schedule reads it each loop.
+        # Set it before start: the buffer, the inference loop and the tick
+        # schedule all read it.
         self._clock = time.perf_counter
 
     @classmethod
@@ -228,12 +230,11 @@ class VLAController(Generic, EasyResource):
         self._cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
         self._deps = {self._key(k): v for k, v in dependencies.items()}
         self._specs = None
-        self._mode = None
-        self._scheduler = None
+        self._buffer = None
+        self._inference = None
         self._stream = None
         self._stream_points_sent = 0
         self._safety = None
-        self._latencies.clear()
         self._timings.clear()
         self._seq = 0
         self._trace.clear()
@@ -332,38 +333,43 @@ class VLAController(Generic, EasyResource):
         return {
             "fps": self._cfg.fps if self._cfg else 0.0,
             "nominal_t": [r[0] for r in rows],
-            "commanded": [r[1] for r in rows],
-            "measured": [r[2] for r in rows],
-            "clamped": [r[3] for r in rows],
+            "sample_t": [r[1] for r in rows],
+            "commanded": [r[2] for r in rows],
+            "measured": [r[3] for r in rows],
+            "clamped": [r[4] for r in rows],
         }
 
     def _status(self) -> dict[str, Any]:
-        avg = float(np.mean(self._latencies)) if self._latencies else 0.0
-        is_async = isinstance(self._scheduler, AsyncScheduler)
+        inf, buf = self._inference, self._buffer
+        now = self._clock()
+        horizon = buf.horizon() if buf else -math.inf
         return {
             "state": self._state,
-            "mode": self._mode or (self._cfg.mode if self._cfg else ""),
-            "queue_size": self._scheduler.qsize() if self._scheduler else 0,
-            "avg_latency_s": avg,
+            # Observation-to-landing, recent mean: what the trigger plans around.
+            "avg_latency_s": float(np.mean(inf.latencies)) if inf and inf.latencies else 0.0,
+            "expected_latency_s": inf.expected_latency if inf else 0.0,
+            # "overlap" fires on buffer time; "sequential" waits for the plan to run
+            # out and observes at rest, because latency is too close to the chunk.
+            "regime": inf.regime if inf else "",
+            "buffer_horizon_s": horizon - now if math.isfinite(horizon) else 0.0,
+            # Age of the observation behind the sample just commanded.
+            "staleness_s": (
+                now - buf.sampled_obs_t if buf and buf.sampled_obs_t is not None else 0.0
+            ),
+            # Blend window actually used at the last landing; 0 on a rebase.
+            "overlap_s": buf.overlap_s if buf else 0.0,
+            "rebases": buf.rebases if buf else 0,
+            "skipped_rows": buf.skipped_rows if buf else 0,
             "timing": self._timing_status(),
             "measured_fps": self._measured_fps,
             "clamp_counts": dict(self._safety.clamp_counts) if self._safety else {},
-            # Cumulative count of ticks the loop held position because the
-            # queue was empty and a background inference was still in
-            # flight (only possible under mode="async") -- distinct from
-            # the *consecutive*-run bound that escalates to a halt at
-            # starvation_grace_ticks: this is a running total across the
-            # whole session, the same shape as clamp_counts, so an operator
-            # can see the loop is quietly stalling without reading logs.
+            # Ticks lost waiting for a chunk to land after the plan ran out (the
+            # very first fill is not counted). Cumulative, like clamp_counts, so
+            # an operator can see the loop quietly stalling without reading logs.
             "starved_ticks": self._starved_ticks,
-            # Cumulative re-anchors of the tick schedule: ticks that ran more
-            # than a full period late, after which the loop resumed from now
-            # instead of replaying them. Expected at every chunk boundary under
-            # mode="sequential" (each one blocks for a whole inference).
+            # Ticks that ran more than a period late and re-anchored the schedule,
+            # resuming from now instead of replaying them as a burst.
             "reanchors": self._schedule.reanchors if self._schedule else 0,
-            # AsyncScheduler only; None/0 under sequential or before a scheduler exists.
-            "queue_threshold": self._scheduler.queue_threshold if is_async else None,
-            "dropped_stale_rows": self._scheduler.dropped_stale_rows if is_async else 0,
             "arm_write": self._cfg.arm_write if self._cfg else "",
             # Live while the stream is open; the final total after it closes.
             "stream_points_sent": (
@@ -385,12 +391,11 @@ class VLAController(Generic, EasyResource):
         # avg_latency_s/clamp_counts as if they belonged to a run that
         # hasn't produced a single tick yet.
         self._specs = None
-        self._mode = None
-        self._scheduler = None
+        self._buffer = None
+        self._inference = None
         self._stream = None
         self._stream_points_sent = 0
         self._safety = None
-        self._latencies.clear()
         self._timings.clear()
         self._seq = 0
         self._trace.clear()
@@ -422,17 +427,15 @@ class VLAController(Generic, EasyResource):
                 # (transitioning to state="error"); this is defense in depth
                 # so _stop() itself never raises.
                 LOGGER.exception("loop task raised while stopping")
-        if self._scheduler is not None:
-            # Cancelling the loop task above does not guarantee an
-            # AsyncScheduler's background inference task gets cancelled too
-            # -- that only cascades automatically when the loop task
-            # happened to be suspended *directly* on it (the blocking
-            # first-call path). The non-blocking "return None while starved"
-            # path leaves the background task running independently, so
-            # without this it would keep running orphaned past the point
-            # the controller reports stopped. SequentialScheduler's close()
-            # is an inherited no-op, so this is a no-op for it.
-            await self._scheduler.close()
+        if self._inference is not None:
+            # Cancelling the loop task above does not guarantee the inference
+            # loop's in-flight request gets cancelled too -- that only cascades
+            # when the loop task happened to be suspended *directly* on it (in
+            # `wait()`). A request fired by `poll()` runs independently, so
+            # without this it would keep running orphaned past the point the
+            # controller reports stopped. Only after the loop task is done:
+            # close() must never race a `wait()` still blocked on that request.
+            await self._inference.close()
         if self._stream is not None:
             # Half-close so the driver waits for motion to stop; cancelling the
             # loop task alone does not tear the stream down.
@@ -479,26 +482,8 @@ class VLAController(Generic, EasyResource):
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, 5.0)
 
-    def _build_scheduler(
-        self, mode: str, builder: ObservationBuilder, blend_dims: int
-    ) -> ChunkScheduler:
-        limit = self._cfg.actions_per_chunk
-        if mode == "async":
-            threshold = self._resolve_queue_threshold()
-            return AsyncScheduler(
-                lambda: self._infer(builder),
-                threshold,
-                self._cfg.fps,
-                limit,
-                merge=self._cfg.merge,
-                blend_ticks=self._cfg.blend_ticks,
-                blend_dims=blend_dims,
-                clock=self._clock,
-            )
-        return SequentialScheduler(lambda: self._infer(builder), limit)
-
     def _blend_dims(self, specs: dict[str, Any], gripper: GripperAdapter) -> int:
-        """How many leading action columns `blend_ticks` may crossfade.
+        """How many leading action columns the buffer interpolates and crossfades.
 
         The gripper channel, when there is one, is always the last action
         column -- `_command_joints` appends it after the driven joints and
@@ -508,53 +493,6 @@ class VLAController(Generic, EasyResource):
         if self._cfg.action_space == DELTA_EE:
             return DELTA_EE_ACTION_DIM
         return int(specs["action_dim"]) - (1 if gripper.in_state else 0)
-
-    def _effective_chunk_len(self) -> int:
-        """How many actions a merged chunk actually contributes to the queue.
-
-        `actions_per_chunk` truncates the chunk (see `_validate_and_merge`),
-        so it -- not the checkpoint's `n_action_steps` -- is what every
-        queue-depth decision has to be measured against. Clamped by
-        `n_action_steps` so an operator who budgets more actions than the
-        policy emits does not get a threshold the queue can never reach.
-        """
-        n_action_steps = int(self._specs["n_action_steps"])
-        limit = self._cfg.actions_per_chunk
-        return n_action_steps if limit is None else min(limit, n_action_steps)
-
-    def _resolve_queue_threshold(self) -> int:
-        """`queue_threshold=None` (the config default) means "derive it" --
-        config parsing has no access to `specs`, so it cannot pick a value
-        itself. `effective_chunk - 1` fires the background refill as early
-        as possible (maximizing overlap runway), which is unambiguously
-        right in the latency-bound regime this scheduler exists for, and
-        harmless in the fast-inference regime, where the queue never drains
-        far enough for the threshold to bind.
-
-        Under `merge="append"` (the default) this is a *staleness* ceiling as
-        much as a starvation floor: `ActionQueue` merges every landing chunk
-        onto the tail, so with threshold T the action executing at any
-        instant was inferred between T and T + chunk_len ticks ago. Deriving
-        from the truncated length is what keeps that window narrow: at
-        `actions_per_chunk=12` it is 11-23 ticks, where the untruncated
-        50-step chunk gives 49-98. Under `merge="aligned"` that staleness
-        window collapses to zero by construction (stale head rows are
-        dropped, not queued), so there the threshold is a starvation floor
-        only.
-        """
-        configured = self._cfg.queue_threshold
-        if configured is not None:
-            return configured
-        effective = self._effective_chunk_len()
-        derived = max(0, effective - 1)
-        LOGGER.info(
-            "queue_threshold not configured; deriving %d from an effective chunk "
-            "length of %d (fires the background refill as early as possible, "
-            "maximizing overlap runway)",
-            derived,
-            effective,
-        )
-        return derived
 
     def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer | CartesianSafetyLayer:
         s = self._cfg.safety
@@ -717,7 +655,6 @@ class VLAController(Generic, EasyResource):
         cfg = self._cfg
         try:
             specs = await self._await_policy()
-            mode = self._mode = cfg.mode
             self._specs = dict(specs)
 
             gripper = make_gripper_adapter(cfg.gripper, self._deps)
@@ -770,10 +707,24 @@ class VLAController(Generic, EasyResource):
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
             )
             self._safety = self._build_safety(gripper)
-            self._scheduler = self._build_scheduler(mode, builder, self._blend_dims(specs, gripper))
+            self._buffer = ReferenceBuffer(
+                cfg.fps,
+                blend_s=cfg.blend_s,
+                interp_cols=self._blend_dims(specs, gripper),
+                consume=cfg.action_space == DELTA_EE,
+            )
+            self._inference = InferenceLoop(
+                lambda: self._infer(builder),
+                self._buffer,
+                chunk_s=int(specs["n_action_steps"]) / cfg.fps,
+                blend_s=cfg.blend_s,
+                margin_s=cfg.margin_s,
+                timeout_s=cfg.inference_timeout_s,
+                clock=self._clock,
+            )
 
             self._state = "running"
-            await self._loop(self._scheduler, gripper)
+            await self._loop(self._inference, self._buffer, gripper)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -786,8 +737,8 @@ class VLAController(Generic, EasyResource):
                 self._stream = None
             await self._safe_stop_arm()
 
-    async def _infer(self, builder: ObservationBuilder) -> np.ndarray:
-        """One observation in, one postprocessed action chunk out.
+    async def _infer(self, builder: ObservationBuilder) -> tuple[np.ndarray, float]:
+        """One observation in, one postprocessed chunk and its t_obs out.
 
         The policy also returns `raw_actions` (its own action space, for RTC
         callers); this controller does not run RTC and ignores them.
@@ -804,10 +755,8 @@ class VLAController(Generic, EasyResource):
         }
         started = self._clock()
         out = await self._resource(self._cfg.policy_service).do_command(payload)
-        round_trip = self._clock() - started
-        self._latencies.append(round_trip)
-        self._timings.append((round_trip, out.get("server_s"), out.get("compute_s")))
-        return decode_matrix(out["actions"])
+        self._timings.append((self._clock() - started, out.get("server_s"), out.get("compute_s")))
+        return decode_matrix(out["actions"]), obs.t_obs
 
     def _record_tick(self, last_tick: float) -> float:
         now = self._clock()
@@ -821,27 +770,51 @@ class VLAController(Generic, EasyResource):
         if delay > 0:
             await asyncio.sleep(delay)
 
-    async def _loop(self, scheduler: ChunkScheduler, gripper: GripperAdapter) -> None:
+    async def _loop(
+        self, inference: InferenceLoop, buffer: ReferenceBuffer, gripper: GripperAdapter
+    ) -> None:
         cfg = self._cfg
         arm = self._resource(cfg.arm)
         schedule = self._schedule = TickSchedule(
             1.0 / cfg.fps, self._clock, catch_up=cfg.arm_write == "stream"
         )
+        # A target is sampled at the instant it is due at the arm: ArmStream
+        # stamps a tick's final point nominal + lead + n*step = nominal + 2/fps,
+        # and a setpoint is reached within the tick.
+        lead = (2.0 if self._stream is not None else 1.0) / cfg.fps
+        delta_ee = cfg.action_space == DELTA_EE
         first = True
         last_tick = self._clock()
         consecutive_failures = 0
-        consecutive_starved_ticks = 0
         consecutive_rejected_moves = 0
 
         while True:
+            # The sample time is fixed at the top of the tick. The stream stamp
+            # asks schedule.nominal() again right before the send (see
+            # _command_joints): same value unless reads made the tick re-anchor.
+            t = schedule.nominal() + lead
             try:
-                action = await scheduler.next_action()
+                # Before sampling: a raise here must not use up this tick's sample.
+                # Reads the previous tick's last_sampled, which is fine.
+                inference.poll()
+                if buffer.exhausted(t):
+                    # Nothing to command until a chunk lands. Wait for it, then
+                    # restart the tick: the sample and the stamp must use a time
+                    # after the wait, or the stamp goes out past due as a burst.
+                    waited_from = self._clock()
+                    await inference.wait()
+                    if buffer.last_sampled > -math.inf:  # not the first fill
+                        self._starved_ticks += round((self._clock() - waited_from) * cfg.fps)
+                    schedule.restart()
+                    continue
+                action = buffer.take(t) if delta_ee else buffer.sample(t)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                # Camera reads, observation assembly, and the policy call
-                # itself all surface here (SequentialScheduler.next_action
-                # calls straight through to _infer). Gated by stop_on_error:
+                # Camera reads, observation assembly, the policy call itself,
+                # and an inference that did not land within inference_timeout_s
+                # all surface here (InferenceLoop re-raises a background
+                # failure from poll()/wait()). Gated by stop_on_error:
                 # by default this is fatal (stop the arm, halt); an operator
                 # who opts out gets the tick skipped and the loop kept alive
                 # for the next one -- never a retry counter or a backoff, just
@@ -873,32 +846,12 @@ class VLAController(Generic, EasyResource):
             consecutive_failures = 0
 
             if action is None:
-                # Only AsyncScheduler ever returns this: the queue is empty
-                # and a background inference is already working on the next
-                # chunk. Hold position -- there is no new action to
-                # safety-clamp against, and re-sending the last command
-                # would be indistinguishable from "an action" to anyone
-                # reading clamp_counts. Bounded the same way tick failures
-                # are, by starvation_grace_ticks, but unconditionally (not
-                # gated by stop_on_error): an empty tick is not a failure to
-                # skip, it is an absence of anything to do, so a deployment
-                # cannot spin forever reporting "running" while every tick
-                # silently starves either.
-                self._starved_ticks += 1
-                consecutive_starved_ticks += 1
-                if consecutive_starved_ticks > cfg.starvation_grace_ticks:
-                    raise RuntimeError(
-                        f"{consecutive_starved_ticks} consecutive ticks starved (queue "
-                        "empty, inference still in flight) exceeded starvation_grace_ticks="
-                        f"{cfg.starvation_grace_ticks}; stopping"
-                    )
+                # delta-ee only: the next row is not due yet. Hold; not starved.
                 last_tick = self._record_tick(last_tick)
                 await self._pace(schedule)
                 continue
 
-            consecutive_starved_ticks = 0
-
-            if cfg.action_space == DELTA_EE:
+            if delta_ee:
                 if await self._command_pose(arm, action):
                     consecutive_rejected_moves = 0
                 else:
@@ -911,7 +864,7 @@ class VLAController(Generic, EasyResource):
                         )
             else:
                 await self._command_joints(
-                    arm, gripper, action, check_start=first, nominal=schedule.nominal
+                    arm, gripper, action, check_start=first, nominal=schedule.nominal, sample_t=t
                 )
                 first = False
 
@@ -926,6 +879,7 @@ class VLAController(Generic, EasyResource):
         *,
         check_start: bool,
         nominal: Callable[[], float],
+        sample_t: float,
     ) -> None:
         """One tick of `action_space="joints"`: clamp, then write joint angles."""
         cfg = self._cfg
@@ -1001,11 +955,11 @@ class VLAController(Generic, EasyResource):
             nominal_t = nominal()
             await self._stream.send(target, nominal_t)
         else:
-            nominal_t = self._clock()
+            nominal_t = nominal()
             await arm.move_to_joint_positions(
                 JointPositions(values=target), extra=dict(cfg.arm_move_extra)
             )
-        self._trace.append((nominal_t, target, measured, clamped))
+        self._trace.append((nominal_t, sample_t, target, measured, clamped))
         if gripper.has_normalized_tail:
             await gripper.write(float(safe[-1]))
 

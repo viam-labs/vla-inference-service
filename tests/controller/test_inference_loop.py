@@ -178,3 +178,23 @@ async def test_close_cancels_the_inflight_request():
     assert loop._inflight is None
     with pytest.raises(asyncio.CancelledError):
         await waiter
+
+
+# The latency window caps at the most recent 50 entries, so avg_latency_s
+# never becomes a lifetime average (moved from the controller's own deque).
+
+
+async def test_latency_window_keeps_only_the_most_recent_50():
+    loop = _loop(None, ReferenceBuffer(10.0), Clock())
+    for i in range(60):
+        loop.latencies.append(float(i))
+    assert len(loop.latencies) == 50
+    assert loop.latencies[0] == 10.0  # the first 10 (0..9) were pushed out
+    assert loop.latencies[-1] == 59.0
+
+
+async def test_latency_window_does_not_trim_under_50():
+    loop = _loop(None, ReferenceBuffer(10.0), Clock())
+    for i in range(10):
+        loop.latencies.append(float(i))
+    assert list(loop.latencies) == [float(i) for i in range(10)]
