@@ -219,13 +219,16 @@ class VLAController(Generic, EasyResource):
         # Capture the arm currently in motion before rebinding _cfg/_deps below,
         # or the scheduled stop would target the *new* arm.
         old_arm = self._deps.get(self._cfg.arm) if (was_running and self._cfg) else None
+        # Likewise the open stream: cancelling the loop does not close it, and
+        # the reset below drops the last reference to it.
+        old_stream = self._stream if was_running else None
         self._stop_loop_sync()
         if old_arm is not None:
             # reconfigure is sync, so the stop is scheduled rather than awaited.
             # Cancelling the loop alone leaves the arm executing its last
             # command. Keep a reference: CPython may otherwise garbage-collect
             # a bare task handle before it ever runs.
-            self._stop_task = asyncio.create_task(self._stop_arm(old_arm))
+            self._stop_task = asyncio.create_task(self._halt(old_arm, old_stream))
 
         self._cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
         self._deps = {self._key(k): v for k, v in dependencies.items()}
@@ -459,6 +462,14 @@ class VLAController(Generic, EasyResource):
             await arm.stop()
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("failed to stop arm: %s", exc)
+
+    @classmethod
+    async def _halt(cls, arm: Any, stream: ArmStream | None) -> None:
+        # Half-close first, as _stop does, so the driver ends the trajectory
+        # before the arm is told to stop.
+        if stream is not None:
+            await stream.close()
+        await cls._stop_arm(arm)
 
     async def _safe_stop_arm(self) -> None:
         if not self._cfg:

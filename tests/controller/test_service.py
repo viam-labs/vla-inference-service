@@ -2307,6 +2307,28 @@ async def test_stream_mode_stop_closes_the_stream_and_stops_the_arm():
     assert (await svc.do_command({"command": "status"}))["stream_points_sent"] > 1
 
 
+async def test_stream_mode_reconfigure_closes_the_stream_before_stopping_the_arm():
+    # Cancelling the loop does not tear the stream down, and reconfigure drops
+    # the only reference to it: without an explicit close the driver RPC stays
+    # open for the life of the process.
+    class _OrderedArm(FakeArm):
+        async def stop(self, **kwargs):
+            self.closed_at_stop = self.stream_closed
+            await super().stop(**kwargs)
+
+    arm = _OrderedArm(positions=[0.0] * 6)
+    deps = _deps(policy=FakePolicyClient(action_value=1.0, n=4), arm=arm)
+    svc = _svc(config=_stream_config(), deps=deps)
+
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.stream_points) > 1, "at least one streamed tick")
+    svc.reconfigure(_stream_config(), deps)
+    await _wait_until(lambda: arm.stopped >= 1, "the old arm stopped")
+
+    assert arm.stream_closed is True
+    assert arm.closed_at_stop is True
+
+
 async def test_stream_mode_unstreamable_arm_refuses_before_motion():
     """The RPC is rejected before `check()` ever gets to `send()`: no rest
     point, no motion point, nothing reaches the arm."""
