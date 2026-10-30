@@ -18,7 +18,9 @@ from tests.smoothness import VirtualLoop, run_virtual
 from tests.smoothness import (
     PERIOD,
     STAMP_TOL,
+    STREAM_HZ,
     TAG,
+    _gaps,
     gap_jitter,
     knot_accel,
     landing_obs_age,
@@ -85,6 +87,9 @@ def _assert_healthy(session):
     assert session.status["last_error"] == "", session.status
     # Knots are only recorded when streaming; setpoints only in setpoint mode.
     assert len(session.arm.knots) + len(session.arm.setpoints) > 50
+    # Every hold in these scenarios is a deliberate wait, never a missed
+    # deadline; this also catches a loop that stops restarting the schedule.
+    assert session.status["reanchors"] == 0, session.status
 
 
 def test_steady():
@@ -129,10 +134,20 @@ def test_slow_inference_lands_fresh_rows():
 
 def test_starvation_holds_are_accounted_for():
     s = run_session(latency_s=5.5, duration_s=30.0)
-    _assert_healthy(s)
-    held = s.status["starved_ticks"] + s.status["reanchors"]
-    assert long_gaps(s.arm.stream_points) <= held
-    # (FakeArm itself asserts every stamp is strictly increasing.)
+    _assert_healthy(s)  # includes reanchors == 0: every hold is a deliberate wait
+    gaps = _gaps(s.arm.stream_points)
+    holds = gaps[gaps > PERIOD]
+    # One hold per landing after the blocking fill.
+    assert len(holds) == s.status["rebases"] - 1, (len(holds), s.status)
+    # starved_ticks agrees with the stamped hold time, to within a tick per hold.
+    # ArmStream emits n = round(STREAM_HZ / fps) points per tick, `step` =
+    # 1/(n*fps) apart, the last on the tick's due stamp. Holding k ticks moves
+    # the next batch's first point to prev_last + (k+1)*PERIOD - (n-1)*step =
+    # prev_last + k*PERIOD + step, so k = (gap - step) / PERIOD. Here n*fps is
+    # exactly STREAM_HZ, so step = 1/STREAM_HZ.
+    step = PERIOD / round(STREAM_HZ * PERIOD)
+    held_ticks = (holds - step).sum() / PERIOD
+    assert abs(held_ticks - s.status["starved_ticks"]) <= len(holds), (held_ticks, s.status)
 
 
 def test_seam_blend_softens_the_switch():
@@ -152,13 +167,12 @@ def test_targets_land_on_the_reference_at_their_due_time():
         _assert_healthy(s)
         assert s.status["rebases"] == 1, s.status
         _, res = residual(s, after=s.policy.reply_times[1] + 3 * PERIOD)
-        # Observations fall on the tick grid here, so samples land on rows and the
-        # measured residual is ~2e-7. The bound is the worst case off-grid:
-        # linear interpolation of the 4 s, 5-degree sinusoid errs by at most
-        # h^2/8 * max|f''| = 0.1^2/8 * 5*(2*pi/4)^2 ~ 0.0154 deg. A target a tick
-        # early or late is ~0.8 deg off.
+        # Observations fall on the tick grid, so samples land exactly on rows and
+        # the residual is float noise plus microsecond stamp rounding (1 us x the
+        # reference's peak 7.85 deg/s ~ 8e-6; measured ~2.4e-7). 1e-4 is about
+        # 13 us of timing error; a target a tick early or late is ~0.8 deg off.
         assert len(res) > 100
-        assert np.abs(res).max() <= 0.016, (arm_write, np.abs(res).max())
+        assert np.abs(res).max() <= 1e-4, (arm_write, np.abs(res).max())
 
 
 def test_crossfade_adds_less_acceleration_than_the_motion_itself_has():
