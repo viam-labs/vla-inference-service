@@ -170,3 +170,23 @@ def test_land_rejects_a_column_count_change():
     b.land(ramp(3, cols=2), 0.0)
     with pytest.raises(ReferenceBufferError, match="columns"):
         b.land(ramp(3, cols=3), 0.0)
+
+
+def test_take_runs_each_row_once_holds_until_due_and_skips_rows_left_behind():
+    b = ReferenceBuffer(FPS, consume=True)
+    b.land(ramp(5, cols=1), 0.0)
+    np.testing.assert_array_equal(b.take(8 * P), [0])  # pins rows at 8P, 9P, ...
+    assert b.take(8.5 * P) is None  # row 1 not due: hold, not starved
+    np.testing.assert_array_equal(b.take(9 * P), [1])
+    np.testing.assert_array_equal(b.take(11.5 * P), [3])  # row 2 (10P) skipped
+    assert b.skipped_rows == 1
+    np.testing.assert_array_equal(b.take(12 * P), [4])
+    assert b.exhausted(13 * P)
+
+
+def test_consume_mode_ignores_blend_and_replaces_unrun_rows():
+    b = ReferenceBuffer(FPS, blend_s=1.0, consume=True)
+    b.land(ramp(10, cols=1), 0.0)
+    b.take(P)
+    b.land(ramp(10, start=100.0, cols=1), t_obs=P)  # rows at 2P, ...
+    np.testing.assert_array_equal(b.take(2 * P), [100])
