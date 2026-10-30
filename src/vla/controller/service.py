@@ -169,6 +169,10 @@ class VLAController(Generic, EasyResource):
         # Bounded to the most recent 50: ``avg_latency_s`` must reflect
         # recent performance, not a lifetime average a long run dilutes.
         self._latencies: deque[float] = deque(maxlen=50)
+        # (round_trip_s, server_s | None, compute_s | None) per inference, most
+        # recent 50; None where an older policy module does not report it.
+        self._timings: deque[tuple[float, float | None, float | None]] = deque(maxlen=50)
+        self._seq = 0
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._schedule: TickSchedule | None = None
@@ -217,6 +221,8 @@ class VLAController(Generic, EasyResource):
         self._stream_points_sent = 0
         self._safety = None
         self._latencies.clear()
+        self._timings.clear()
+        self._seq = 0
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._schedule = None
@@ -290,6 +296,21 @@ class VLAController(Generic, EasyResource):
             return self._status()
         raise ValueError(f"unknown command {name!r}")
 
+    def _timing_status(self) -> dict[str, float | None]:
+        """Means over recent inferences. Transport is the round trip minus the
+        policy's own time; unknown (None) for a policy that does not report it."""
+
+        def mean(values) -> float | None:
+            values = [v for v in values if v is not None]
+            return float(np.mean(values)) if values else None
+
+        return {
+            "round_trip_s": mean(r for r, _, _ in self._timings),
+            "server_s": mean(s for _, s, _ in self._timings),
+            "compute_s": mean(c for _, _, c in self._timings),
+            "transport_s": mean(r - s for r, s, _ in self._timings if s is not None),
+        }
+
     def _status(self) -> dict[str, Any]:
         avg = float(np.mean(self._latencies)) if self._latencies else 0.0
         is_async = isinstance(self._scheduler, AsyncScheduler)
@@ -298,6 +319,7 @@ class VLAController(Generic, EasyResource):
             "mode": self._mode or (self._cfg.mode if self._cfg else ""),
             "queue_size": self._scheduler.qsize() if self._scheduler else 0,
             "avg_latency_s": avg,
+            "timing": self._timing_status(),
             "measured_fps": self._measured_fps,
             "clamp_counts": dict(self._safety.clamp_counts) if self._safety else {},
             # Cumulative count of ticks the loop held position because the
@@ -343,6 +365,8 @@ class VLAController(Generic, EasyResource):
         self._stream_points_sent = 0
         self._safety = None
         self._latencies.clear()
+        self._timings.clear()
+        self._seq = 0
         self._measured_fps = 0.0
         self._starved_ticks = 0
         self._schedule = None
@@ -704,6 +728,7 @@ class VLAController(Generic, EasyResource):
             # would fail trying to resize/encode it for a resolution nothing
             # declared, for a feed the policy never asked to see.
             builder = ObservationBuilder(
+                clock=self._clock,
                 cameras={key: self._resource(cfg.cameras[key]) for key in image_sizes},
                 arm=arm,
                 gripper=gripper,
@@ -741,15 +766,20 @@ class VLAController(Generic, EasyResource):
         callers); this controller does not run RTC and ignores them.
         """
         obs = await builder.build()
+        self._seq += 1
         payload: dict[str, Any] = {
             "command": "infer",
             "images": obs.images,
             "state": encode_vector(obs.state),
             "task": self._active_task_text,
+            "seq": self._seq,
+            "t_obs": obs.t_obs,
         }
-        started = time.perf_counter()
+        started = self._clock()
         out = await self._resource(self._cfg.policy_service).do_command(payload)
-        self._latencies.append(time.perf_counter() - started)
+        round_trip = self._clock() - started
+        self._latencies.append(round_trip)
+        self._timings.append((round_trip, out.get("server_s"), out.get("compute_s")))
         return decode_matrix(out["actions"])
 
     def _record_tick(self, last_tick: float) -> float:

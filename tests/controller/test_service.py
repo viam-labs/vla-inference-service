@@ -1353,6 +1353,7 @@ async def test_status_reports_every_documented_field():
         "state",
         "mode",
         "queue_size",
+        "timing",
         "avg_latency_s",
         "measured_fps",
         "clamp_counts",
@@ -2733,3 +2734,43 @@ async def test_blend_settings_reach_the_scheduler_and_skip_the_gripper_column():
     await svc.do_command({"command": "stop"})
     assert scheduler._blend_ticks == 3
     assert scheduler._blend_dims == 5  # 6 action dims minus the trailing gripper channel
+
+
+async def test_infer_request_carries_seq_and_t_obs():
+    policy = FakePolicyClient()
+    svc = _svc(deps=_deps(policy=policy))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: policy.infer_calls >= 2, "two inferences")
+    await svc.do_command({"command": "stop"})
+    assert policy.last_infer["seq"] >= 2
+    assert isinstance(policy.last_infer["t_obs"], float)
+
+
+async def test_status_reports_transport_from_server_time():
+    class TimedPolicy(FakePolicyClient):
+        async def do_command(self, command, **kwargs):
+            out = await super().do_command(command, **kwargs)
+            if command.get("command") == "infer":
+                out = {**out, "server_s": 0.0, "compute_s": 0.0}
+            return out
+
+    svc = _svc(deps=_deps(policy=TimedPolicy()))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    status = await _wait_until(
+        lambda: svc._status()["timing"]["transport_s"] is not None and svc._status(),
+        "a timed inference",
+    )
+    await svc.do_command({"command": "stop"})
+    timing = status["timing"]
+    assert timing["server_s"] == 0.0
+    assert timing["transport_s"] == pytest.approx(timing["round_trip_s"])
+
+
+async def test_status_timing_is_unknown_for_an_older_policy():
+    svc = _svc()  # FakePolicyClient sends no server_s
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: svc._status()["timing"]["round_trip_s"] is not None, "an inference")
+    await svc.do_command({"command": "stop"})
+    assert svc._status()["timing"]["transport_s"] is None
+
