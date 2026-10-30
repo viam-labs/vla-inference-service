@@ -152,6 +152,11 @@ class TickSchedule:
         self._anchor, self._k = now, 0
         self.reanchors += 1
 
+    def restart(self) -> None:
+        """Forget the grid after a deliberate wait (a chunk landing); the next
+        tick anchors at now. Not an overrun, so not counted in `reanchors`."""
+        self._anchor, self._k = None, 0
+
 
 class VLAController(Generic, EasyResource):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "vla"), "controller")

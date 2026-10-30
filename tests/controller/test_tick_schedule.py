@@ -108,3 +108,14 @@ def test_schedule_nominal_reanchor_then_advance_in_the_same_tick():
     clock.now = 2.03
     assert s.advance() == pytest.approx(0.07)
     assert s.reanchors == 1
+
+
+def test_restart_anchors_the_next_nominal_at_now_without_counting_an_overrun():
+    now = [0.0]
+    s = TickSchedule(0.1, lambda: now[0])
+    s.nominal()
+    s.advance()
+    now[0] = 5.0
+    s.restart()
+    assert s.nominal() == 5.0
+    assert s.reanchors == 0
