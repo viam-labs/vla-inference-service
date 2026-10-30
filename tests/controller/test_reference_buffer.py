@@ -220,3 +220,14 @@ def test_land_does_not_alias_the_callers_array_or_the_returned_sample():
     out[:] = 99.0
     chunk[:] = 77.0
     np.testing.assert_array_equal(b.sample(1.0 + P), [1.0, 1.0])
+
+
+def test_gripper_takes_the_new_value_from_the_seam_even_on_old_rows_in_the_gap():
+    b = ReferenceBuffer(FPS, blend_s=4 * P, interp_cols=1)
+    old = np.zeros((20, 2))
+    old[1:, 1] = 1.0  # rows at P*(i+1): row 0 (P) is 0, row 1 (2P) on is 1
+    b.land(old, 0.0)
+    b.sample(P)
+    b.land(np.zeros((20, 2)), t_obs=1.25 * P)  # rows at 2.25P..; old 2P row sits in the gap
+    for t in (1.5 * P, 2 * P, 2.25 * P, 2.5 * P):
+        assert b.sample(t)[1] == 0.0, t
