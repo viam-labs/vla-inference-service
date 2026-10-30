@@ -952,3 +952,9 @@ def test_delta_ee_defaults_blend_to_zero_and_refuses_a_blend():
     assert ControllerConfig.parse(base).blend_s == 0.0
     with pytest.raises(ConfigError, match="blend_s"):
         ControllerConfig.parse({**base, "blend_s": 0.1})
+
+
+@pytest.mark.parametrize("key,value", [("margin_s", -0.1), ("inference_timeout_s", 0)])
+def test_rejects_a_negative_margin_and_a_zero_inference_timeout(key, value):
+    with pytest.raises(ConfigError, match=key):
+        ControllerConfig.parse({**BASE, key: value})

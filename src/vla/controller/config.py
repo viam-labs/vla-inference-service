@@ -84,13 +84,6 @@ ENCODINGS = ("jpeg", "png", "raw")
 # points over move_through_joint_positions_streamed (README, Smooth servo streaming).
 ARM_WRITES = ("setpoint", "stream")
 
-# The two action spaces. `joints` is the original and the default: absolute
-# joint angles in degrees, written with `move_to_joint_positions`. `delta-ee`
-# carries a per-tick end-effector pose delta, composed onto the measured
-# `EndPosition` and written with `move_to_position`. They differ in the
-# observation they build, the arm call they make, the safety layer that
-# clamps them, and the shape of their unit config -- and in nothing else:
-# the reference buffer and the inference loop are shared.
 # Keys removed with the time-indexed buffer. A config that still sets one fails
 # with its replacement, rather than being silently ignored by raw.get().
 REMOVED_KEYS = {
@@ -102,6 +95,13 @@ REMOVED_KEYS = {
     "actions_per_chunk": "every row keeps its own time, so there is nothing to truncate",
 }
 
+# The two action spaces. `joints` is the original and the default: absolute
+# joint angles in degrees, written with `move_to_joint_positions`. `delta-ee`
+# carries a per-tick end-effector pose delta, composed onto the measured
+# `EndPosition` and written with `move_to_position`. They differ in the
+# observation they build, the arm call they make, the safety layer that
+# clamps them, and the shape of their unit config -- and in nothing else:
+# the reference buffer and the inference loop are shared.
 JOINTS = "joints"
 DELTA_EE = "delta-ee"
 ACTION_SPACES = (JOINTS, DELTA_EE)

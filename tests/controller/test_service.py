@@ -1600,18 +1600,18 @@ async def test_dependency_keys_with_name_attribute_are_resolved():
 
 async def test_overlap_regime_end_to_end_commands_the_arm():
     # n=50 at 50 fps is a 1 s chunk: a millisecond fake inference is far
-    # inside the overlap bound, so poll() fires while the plan still runs.
+    # inside the overlap bound, and margin_s=0.5 makes poll() fire the second
+    # request about halfway through it, while the plan still runs.
     arm = FakeArm(positions=[0.0] * 6)
     policy = FakePolicyClient(n=50)
-    svc = _svc(config=_config(fps=50.0), deps=_deps(policy=policy, arm=arm))
+    svc = _svc(config=_config(fps=50.0, margin_s=0.5), deps=_deps(policy=policy, arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_state(svc, "running")
-    await asyncio.sleep(0.2)
+    await _wait_until(lambda: policy.infer_calls >= 2, "a second inference", timeout=1.5)
     status = await svc.do_command({"command": "status"})
-    assert status["regime"] == "overlap"
     await svc.do_command({"command": "stop"})
+    assert status["regime"] == "overlap"
+    assert status["starved_ticks"] == 0  # fired on buffer time, landed before the plan ran out
     assert len(arm.moves) >= 1
-    assert policy.infer_calls >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -2490,3 +2490,73 @@ async def test_buffer_gets_blend_and_holds_the_gripper_column():
     await svc.do_command({"command": "stop"})
     assert buf._blend_s == 0.3
     assert buf._interp_cols == 5  # 6 action dims minus the trailing gripper channel
+
+
+async def test_a_failing_run_cancels_the_inference_poll_fired():
+    # The arm faults while a request poll() fired is still hung. _run must
+    # close the inference loop itself: _stop is never called on this path,
+    # and the request is not on the loop task's call stack.
+    class HangingPolicy(FakePolicyClient):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.second_call_started = asyncio.Event()
+            self.cancelled = False
+
+        async def do_command(self, command, **kwargs):
+            if command.get("command") == "infer" and self.infer_calls >= 1:
+                self.infer_calls += 1
+                self.second_call_started.set()
+                try:
+                    await asyncio.Event().wait()  # never set
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+            return await super().do_command(command, **kwargs)
+
+    policy = HangingPolicy(n=100)
+
+    class FaultingArm(FakeArm):
+        async def move_to_joint_positions(self, *a, **kw):
+            if policy.second_call_started.is_set():
+                raise RuntimeError("arm fault")
+            return await super().move_to_joint_positions(*a, **kw)
+
+    # A 1 s chunk and margin_s=0.5: the second request fires mid-plan.
+    svc = _svc(
+        config=_config(fps=100.0, margin_s=0.5),
+        deps=_deps(policy=policy, arm=FaultingArm(positions=[0.0] * 6)),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "arm fault" in status["last_error"]
+    await _wait_until(lambda: policy.cancelled, "the hung request to be cancelled", timeout=0.5)
+
+
+async def test_the_first_fill_is_not_counted_as_starvation():
+    # Every run starts with an empty buffer and waits out one inference; only
+    # a plan that ran out after commanding something is starved. A 1 s chunk
+    # against 200 ms inference overlaps, so no later wait starves either.
+    arm = FakeArm(positions=[0.0] * 6)
+    policy = FakePolicyClient(n=50)
+    policy.infer_delay_s = 0.2
+    svc = _svc(config=_config(fps=50.0), deps=_deps(policy=policy, arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.moves) >= 5, "five moves")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["starved_ticks"] == 0
+
+
+async def test_status_buffer_horizon_is_the_plan_left():
+    # Deterministic: fps=2 and n=7 is a 3.5 s chunk, and the second tick is
+    # not due for 0.5 s, so shortly after the first move the plan left is
+    # positive and at most the whole chunk.
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(config=_config(fps=2.0), deps=_deps(policy=FakePolicyClient(n=7), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await asyncio.sleep(0.05)
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert 0 < status["buffer_horizon_s"] <= 3.5
+    assert status["staleness_s"] > 0
