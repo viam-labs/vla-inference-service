@@ -173,9 +173,13 @@ class VLAController(Generic, EasyResource):
         # recent 50; None where an older policy module does not report it.
         self._timings: deque[tuple[float, float | None, float | None]] = deque(maxlen=50)
         self._seq = 0
-        # The last 3000 joint-space ticks (~100 s at 30 fps): (nominal_t, commanded,
-        # measured, clamped). Every value is already in hand in _command_joints, so
-        # recording costs no RPC. Dumped by the `trace` DoCommand (tools/dump_trace.py).
+        # The last 3000 ticks (100 s at 30 fps, 30 s at 100 fps): (nominal_t, commanded,
+        # measured, clamped). nominal_t is the tick's scheduled time when streaming and
+        # the clock just before the move in setpoint mode. `measured` is read before
+        # `commanded` is sent, so line up measured[i+1] against commanded[i]. Joint
+        # space only: delta-ee records nothing. Every value is already in hand in
+        # _command_joints, so recording costs no RPC. Dumped by the `trace` DoCommand
+        # (tools/dump_trace.py).
         self._trace: deque[tuple[float, list[float], list[float], bool]] = deque(maxlen=3000)
         self._measured_fps = 0.0
         self._starved_ticks = 0
@@ -956,9 +960,11 @@ class VLAController(Generic, EasyResource):
             # no tick to "skip" before the very first command.
             self._safety.check_start(degrees, current)
 
-        clamps_before = sum(self._safety.clamp_counts.values())
+        # Joint clamps only: the gripper clamp is not in `commanded`.
+        counts = self._safety.clamp_counts
+        clamps_before = counts.get("delta", 0) + counts.get("limit", 0)
         safe = self._safety.apply(degrees, current)
-        clamped = sum(self._safety.clamp_counts.values()) != clamps_before
+        clamped = counts.get("delta", 0) + counts.get("limit", 0) != clamps_before
 
         # Positional writes silently mis-map: `move_to_joint_positions`
         # has no notion of "only these joints", so a dense list built

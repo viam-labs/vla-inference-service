@@ -2751,7 +2751,7 @@ async def test_status_reports_transport_from_server_time():
         async def do_command(self, command, **kwargs):
             out = await super().do_command(command, **kwargs)
             if command.get("command") == "infer":
-                out = {**out, "server_s": 0.0, "compute_s": 0.0}
+                out = {**out, "server_s": 0.01, "compute_s": 0.005}
             return out
 
     svc = _svc(deps=_deps(policy=TimedPolicy()))
@@ -2763,8 +2763,9 @@ async def test_status_reports_transport_from_server_time():
     )
     await svc.do_command({"command": "stop"})
     timing = status["timing"]
-    assert timing["server_s"] == 0.0
-    assert timing["transport_s"] == pytest.approx(timing["round_trip_s"])
+    assert timing["server_s"] == pytest.approx(0.01)
+    assert timing["compute_s"] == pytest.approx(0.005)
+    assert timing["transport_s"] == pytest.approx(timing["round_trip_s"] - 0.01)
 
 
 async def test_status_timing_is_unknown_for_an_older_policy():
@@ -2792,3 +2793,17 @@ async def test_trace_records_commanded_measured_and_clamps_per_tick():
     assert len(trace["commanded"][0]) == 6
     assert trace["clamped"][0] is True
     assert trace["nominal_t"] == sorted(trace["nominal_t"])
+    assert trace["measured"][0] == [0.0] * 6
+    # Each row is what the arm actually received, in order.
+    for i in range(n):
+        assert trace["commanded"][i] == list(arm.moves[i].values)
+
+
+async def test_trace_marks_no_clamp_when_the_action_is_within_limits():
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(deps=_deps(policy=FakePolicyClient(action_value=0.0), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(svc._trace) >= 3, "three ticks")
+    await svc.do_command({"command": "stop"})
+    trace = await svc.do_command({"command": "trace"})
+    assert trace["clamped"] and not any(trace["clamped"])
