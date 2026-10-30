@@ -351,9 +351,10 @@ class VLAController(Generic, EasyResource):
             # "overlap" fires on buffer time; "sequential" waits for the plan to run
             # out and observes at rest, because latency is too close to the chunk.
             "regime": inf.regime if inf else "",
-            # Plan left past now; 0 before any chunk, and 0 while a fresh chunk
-            # awaits its first sample (a rebase has no times until it is pinned).
-            "buffer_horizon_s": horizon - now if math.isfinite(horizon) else 0.0,
+            # Plan left past now; 0 before any chunk, once the plan has run out,
+            # and while a fresh chunk awaits its first sample (a rebase has no
+            # times until it is pinned).
+            "buffer_horizon_s": max(0.0, horizon - now) if math.isfinite(horizon) else 0.0,
             # Age of the observation behind the sample just commanded.
             "staleness_s": (
                 now - buf.sampled_obs_t if buf and buf.sampled_obs_t is not None else 0.0
