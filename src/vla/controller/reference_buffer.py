@@ -24,6 +24,7 @@ Single-task asyncio access only: no lock.
 
 from __future__ import annotations
 
+import functools
 import math
 
 import numpy as np
@@ -40,6 +41,28 @@ def _smoothstep(x: np.ndarray) -> np.ndarray:
     return x * x * (3.0 - 2.0 * x)
 
 
+@functools.cache
+def savgol_weights(n: int, window: int) -> np.ndarray:
+    """(n, n) matrix applying a quadratic Savitzky-Golay filter to n rows.
+
+    Each output row is a least-squares quadratic over `window` rows centred on
+    it, evaluated there. At the ends the window shifts inward rather than
+    padding (scipy's mode="interp"), so the first and last rows come from a
+    fit over real rows. A chunk shorter than the window fits all of it.
+    Quadratics, lines included, pass through unchanged.
+    """
+    window = min(window, n)
+    order = min(2, window - 1)
+    w = np.zeros((n, n))
+    for i in range(n):
+        start = min(max(i - window // 2, 0), n - window)
+        x = np.arange(start, start + window) - i
+        # Row 0 of the pseudo-inverse is the fit's value at x = 0, i.e. row i.
+        w[i, start : start + window] = np.linalg.pinv(np.vander(x, order + 1, increasing=True))[0]
+    w.flags.writeable = False
+    return w
+
+
 class ReferenceBuffer:
     """Rows on a time axis.
 
@@ -47,7 +70,9 @@ class ReferenceBuffer:
     (the gripper) are zero-order held and switch outright at the seam. None
     means every column interpolates. `consume=True` is delta-EE: rows are
     per-tick deltas, so `take()` runs each at most once and nothing is
-    interpolated or blended.
+    interpolated or blended. `smooth_rows` > 1 filters the interpolated
+    columns of each chunk once, on landing (see `savgol_weights`); the whole
+    chunk is known, so the filter adds no lag. Never applied under `consume`.
     """
 
     def __init__(
@@ -57,8 +82,10 @@ class ReferenceBuffer:
         blend_s: float = 0.0,
         interp_cols: int | None = None,
         consume: bool = False,
+        smooth_rows: int = 0,
     ) -> None:
         self._period = 1.0 / fps
+        self._smooth_rows = 0 if consume else smooth_rows
         # Row times and tick times are the same instants computed two ways;
         # compare with slack so rounding noise never decides a row.
         self._tol = self._period * 1e-6
@@ -125,6 +152,12 @@ class ReferenceBuffer:
             )
         times = t_obs + (np.arange(chunk.shape[0]) + 1) * self._period
         rows = chunk.astype(np.float64)  # a copy: the caller's array is never aliased
+        n = self._n_interp(rows)
+        if self._smooth_rows > 1 and n:
+            w = savgol_weights(rows.shape[0], self._smooth_rows)
+            # einsum, not `@`: macOS Accelerate's BLAS matmul raises spurious
+            # "divide by zero" FP warnings on these small products.
+            rows[:, :n] = np.einsum("ij,jk->ik", w, rows[:, :n])
         obs = np.full(chunk.shape[0], float(t_obs))
         if (
             self._ran_out

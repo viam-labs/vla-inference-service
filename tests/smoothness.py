@@ -105,9 +105,17 @@ class ScriptedPolicy:
     """
 
     def __init__(
-        self, latency_s: float, offsets=(0.0,), cold_extra_s: float = 0.05, fps: float = FPS
+        self,
+        latency_s: float,
+        offsets=(0.0,),
+        cold_extra_s: float = 0.05,
+        fps: float = FPS,
+        row_noise: float = 0.0,
     ):
         self.latency_s = latency_s
+        # Added to row i as row_noise * (-1)**i: the tick-to-tick zig-zag a
+        # real policy's chunks carry, which smooth_rows exists to remove.
+        self.row_noise = row_noise
         self.period = 1.0 / fps
         self.offsets = tuple(offsets)
         self.cold_extra_s = cold_extra_s
@@ -147,7 +155,9 @@ class ScriptedPolicy:
             offset = self.offsets[chunk_id % len(self.offsets)]
             rows = np.empty((CHUNK, DIM), dtype=np.float32)
             for i in range(CHUNK):
-                rows[i, :TAG] = reference(obs_t + (i + 1) * self.period) + offset
+                rows[i, :TAG] = (
+                    reference(obs_t + (i + 1) * self.period) + offset + self.row_noise * (-1) ** i
+                )
                 rows[i, TAG] = chunk_id * 1000 + i
             self.reply_times.append(loop.time())
             return {
@@ -246,14 +256,14 @@ class Session:
 
 
 def run_session(
-    *, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), fps=FPS, **config
+    *, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), fps=FPS, row_noise=0.0, **config
 ) -> Session:
     """Run the real controller for `duration_s` virtual seconds and return what it did."""
 
     async def main() -> Session:
         loop = asyncio.get_running_loop()
         arm = TrackingArm(jitter=jitter)
-        policy = ScriptedPolicy(latency_s, offsets, fps=fps)
+        policy = ScriptedPolicy(latency_s, offsets, fps=fps, row_noise=row_noise)
         svc = VLAController("c")
         svc._clock = loop.time
         svc.reconfigure(_config(fps=fps, **config), {"p": policy, "a": arm, "cam": FakeCamera()})

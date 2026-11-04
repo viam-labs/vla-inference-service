@@ -163,7 +163,8 @@ def test_seam_blend_softens_the_switch():
 
 def test_targets_land_on_the_reference_at_their_due_time():
     for arm_write in ("stream", "setpoint"):
-        s = run_session(latency_s=0.33, blend_s=0.0, arm_write=arm_write)
+        # Smoothing off: this gates timing, and the filter reshapes the curve.
+        s = run_session(latency_s=0.33, blend_s=0.0, smooth_rows=0, arm_write=arm_write)
         _assert_healthy(s)
         assert s.status["rebases"] == 1, s.status
         _, res = residual(s, after=s.policy.reply_times[1] + 3 * PERIOD)
@@ -238,3 +239,17 @@ def test_a_hung_policy_fails_after_inference_timeout_s():
     s = run_session(latency_s=1e6, duration_s=10.0, inference_timeout_s=5.0)
     assert s.status["state"] == "error"
     assert "did not land" in s.status["last_error"]
+
+
+def test_default_smoothing_removes_most_of_a_zigzagging_policys_jitter():
+    # Rows alternate +/-0.3 deg about the reference, the worst case for any
+    # filter: a 7-row quadratic fit passes 5/21 of a pure alternation.
+    rough = run_session(latency_s=0.33, blend_s=0.0, smooth_rows=0, row_noise=0.3)
+    smooth = run_session(latency_s=0.33, blend_s=0.0, row_noise=0.3)
+    for s in (rough, smooth):
+        _assert_healthy(s)
+    after = rough.policy.reply_times[1] + 3 * PERIOD
+    _, r = residual(rough, after=after)
+    _, m = residual(smooth, after=after)
+    assert np.sqrt((m**2).mean()) <= 0.3 * np.sqrt((r**2).mean())
+    assert residual_accel(smooth, after=after) <= 0.3 * residual_accel(rough, after=after)

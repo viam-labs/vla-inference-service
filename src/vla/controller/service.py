@@ -724,6 +724,7 @@ class VLAController(Generic, EasyResource):
                 blend_s=cfg.blend_s,
                 interp_cols=self._blend_dims(specs, gripper),
                 consume=cfg.action_space == DELTA_EE,
+                smooth_rows=cfg.smooth_rows,
             )
             inference = self._inference = InferenceLoop(
                 lambda: self._infer(builder),

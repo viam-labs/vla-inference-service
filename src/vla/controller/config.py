@@ -34,7 +34,10 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 replaces, in seconds on the buffer's time axis (0 replaces outright); it
 defaults to two ticks, and to 0 under `"delta-ee"`, whose rows are per-tick
 deltas that cannot be blended. `margin_s` is the extra lead the inference
-trigger keeps beyond the expected latency and the blend. `inference_timeout_s`
+trigger keeps beyond the expected latency and the blend. `smooth_rows` (default
+7, 0 under `"delta-ee"`) filters each landing chunk with a zero-phase quadratic
+fit over that many rows, removing tick-to-tick jitter in the policy's output
+without lag. `inference_timeout_s`
 bounds a wait for a chunk once the plan has run out, so a hung policy fails the
 tick (and the run, under the default `stop_on_error`) instead of hanging it. See `reference_buffer.py` and `inference_loop.py`.
 The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
@@ -501,6 +504,9 @@ class ControllerConfig:
     blend_s: float = 0.2
     # Extra lead on the inference trigger beyond the expected latency and blend.
     margin_s: float = 0.2
+    # Rows in the zero-phase quadratic filter applied to each chunk on landing
+    # (0 or 1: off); parse() defaults it to 7, or 0 under delta-ee.
+    smooth_rows: int = 7
     # A wait for a chunk longer than this fails the tick; _infer passes no
     # DoCommand timeout, so without it a hung policy hangs the controller.
     inference_timeout_s: float = 30.0
@@ -601,6 +607,17 @@ class ControllerConfig:
                 "are per-tick deltas, and blending two would apply part of each. Remove it."
             )
         margin_s = as_float(raw.get("margin_s", 2.0 / fps), "margin_s", minimum=0.0)
+        smooth_rows = as_int(raw.get("smooth_rows", 0 if delta_ee else 7), "smooth_rows", minimum=0)
+        if smooth_rows and smooth_rows % 2 == 0:
+            raise ConfigError(
+                f"smooth_rows={smooth_rows} must be odd (a window centred on each row) or 0 for off"
+            )
+        if delta_ee and smooth_rows:
+            raise ConfigError(
+                f"smooth_rows={smooth_rows} is not supported under action_space={DELTA_EE!r}: its "
+                "rows are per-tick deltas, and smoothing them would change how far the arm moves. "
+                "Remove it."
+            )
         inference_timeout_s = as_float(
             raw.get("inference_timeout_s", 30.0), "inference_timeout_s", minimum=0.001
         )
@@ -629,6 +646,7 @@ class ControllerConfig:
             fps=fps,
             blend_s=blend_s,
             margin_s=margin_s,
+            smooth_rows=smooth_rows,
             inference_timeout_s=inference_timeout_s,
             starvation_grace_ticks=as_int(
                 raw.get("starvation_grace_ticks", 3), "starvation_grace_ticks", minimum=0

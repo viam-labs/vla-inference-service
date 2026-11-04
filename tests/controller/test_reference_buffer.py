@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from vla.controller.reference_buffer import ReferenceBuffer, ReferenceBufferError
+from vla.controller.reference_buffer import ReferenceBuffer, ReferenceBufferError, savgol_weights
 
 FPS = 8.0
 P = 1.0 / FPS  # 0.125: dyadic, so every time below is exact
@@ -231,3 +231,51 @@ def test_gripper_takes_the_new_value_from_the_seam_even_on_old_rows_in_the_gap()
     b.land(np.zeros((20, 2)), t_obs=1.25 * P)  # rows at 2.25P..; old 2P row sits in the gap
     for t in (1.5 * P, 2 * P, 2.25 * P, 2.5 * P):
         assert b.sample(t)[1] == 0.0, t
+
+
+# ---------------------------------------------------------------------------
+# smooth_rows: each chunk is filtered once, on landing
+# ---------------------------------------------------------------------------
+
+
+def _reversals(x):
+    v = np.diff(x)
+    return int((np.sign(v[:-1]) != np.sign(v[1:])).sum())
+
+
+def test_savgol_weights_preserve_a_parabola_exactly_including_the_ends():
+    t = np.arange(30, dtype=np.float64)
+    x = 0.3 * t**2 - 2.0 * t + 5.0
+    for n in (30, 7, 4, 1):
+        w = savgol_weights(n, 7)
+        np.testing.assert_allclose(w @ x[:n], x[:n], atol=1e-9)
+
+
+def test_savgol_weights_remove_alternating_noise():
+    t = np.arange(30, dtype=np.float64)
+    trend = 1.0 * t  # slope below the noise step: velocity reverses every row
+    noisy = trend + 0.8 * (-1.0) ** t
+    out = savgol_weights(30, 7) @ noisy
+    assert _reversals(noisy) > 20
+    assert _reversals(out) == 0
+    assert np.abs(out - trend)[3:-3].max() < 0.2
+
+
+def test_land_smooths_interpolated_columns_and_leaves_held_columns_alone():
+    t = np.arange(12, dtype=np.float64)
+    chunk = np.column_stack([t + 0.5 * (-1.0) ** t, (-1.0) ** t])
+    b = ReferenceBuffer(FPS, interp_cols=1, smooth_rows=5)
+    b.land(chunk, t_obs=0.0)
+    assert _reversals(b.rows[:, 0]) == 0
+    np.testing.assert_array_equal(b.rows[:, 1], chunk[:, 1])
+
+
+def test_smooth_rows_zero_or_one_and_consume_mode_land_rows_unchanged():
+    chunk = np.column_stack([np.arange(6.0) + 0.5 * (-1.0) ** np.arange(6)])
+    for b in (
+        ReferenceBuffer(FPS, smooth_rows=0),
+        ReferenceBuffer(FPS, smooth_rows=1),
+        ReferenceBuffer(FPS, smooth_rows=5, consume=True),
+    ):
+        b.land(chunk, t_obs=0.0)
+        np.testing.assert_array_equal(b.rows[-5:], chunk[-5:])

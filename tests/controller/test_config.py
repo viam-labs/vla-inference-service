@@ -958,3 +958,20 @@ def test_delta_ee_defaults_blend_to_zero_and_refuses_a_blend():
 def test_rejects_a_negative_margin_and_a_zero_inference_timeout(key, value):
     with pytest.raises(ConfigError, match=key):
         ControllerConfig.parse({**BASE, key: value})
+
+
+def test_smooth_rows_defaults_to_seven_and_zero_turns_it_off():
+    assert ControllerConfig.parse(BASE).smooth_rows == 7
+    assert ControllerConfig.parse({**BASE, "smooth_rows": 0}).smooth_rows == 0
+
+
+@pytest.mark.parametrize("value", [-1, 4, 2.5])
+def test_smooth_rows_must_be_odd_and_non_negative(value):
+    with pytest.raises(ConfigError, match="smooth_rows"):
+        ControllerConfig.parse({**BASE, "smooth_rows": value})
+
+
+def test_delta_ee_defaults_smoothing_off_and_refuses_it():
+    assert ControllerConfig.parse(DELTA_EE_BASE).smooth_rows == 0
+    with pytest.raises(ConfigError, match="smooth_rows"):
+        ControllerConfig.parse({**DELTA_EE_BASE, "smooth_rows": 5})

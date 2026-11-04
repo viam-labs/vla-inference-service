@@ -323,6 +323,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `fps` | number | `10.0` | Control loop rate. |
 | `blend_s` | number | `2 / fps`, `0` under `delta-ee` | How long a landing chunk takes to crossfade in from the plan it supersedes. `0` switches outright. See [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s). |
 | `margin_s` | number | `2 / fps` | Extra lead the inference trigger keeps beyond the expected latency and the blend. |
+| `smooth_rows` | odd integer, or 0 | `7`, `0` under `delta-ee` | Rows in the zero-phase quadratic (Savitzky–Golay) filter applied to each chunk as it lands. Removes tick-to-tick jitter in the policy's output without adding lag. `0` turns it off. See [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s). |
 | `inference_timeout_s` | number | `30` | A wait for a chunk longer than this fails the tick (and the run, under the default `stop_on_error`). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts consecutive tick *failures* (when `stop_on_error` is `false`) and, under `delta-ee`, consecutive `move_to_position` refusals. Waiting for a chunk is never fatal and never counted here; see `starved_ticks`. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
@@ -969,6 +970,14 @@ has passed are never executed, so there is nothing stale to drop or to tune.
   duration until the first one exists.
 - `inference_timeout_s` (default 30): a wait for a chunk longer than this fails
   the tick (and the run, under the default `stop_on_error`).
+- `smooth_rows` (default 7; `0` under `delta-ee`): each landing chunk's joint
+  columns are smoothed once with a quadratic least-squares fit over that many
+  rows. The whole chunk is known in advance, so the filter looks both ways and
+  adds no lag; at the chunk's ends the window shifts inward instead of padding.
+  Measured on an SO-101 with `smolvla-so101-mug`, the raw commands reversed
+  direction on 45–71% of moving ticks, against 0–4% in the teleop recordings
+  the model was trained on; 7 rows brings that to 2–6% and moves the path by
+  under 0.7° RMS. The gripper column is held, not interpolated, and is left alone.
 
 With one inference in flight, chunks land at most one per latency, and each
 is observed only when the previous one lands. So once
