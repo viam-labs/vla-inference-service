@@ -2480,6 +2480,24 @@ async def test_status_reports_the_time_axis():
     assert status["regime"] in ("overlap", "sequential")
 
 
+async def test_a_failed_warm_up_is_logged_and_the_run_starts_anyway(caplog):
+    class FailsFirst(FakePolicyClient):
+        async def do_command(self, command, **kwargs):
+            if command.get("command") == "infer" and self.infer_calls == 0:
+                self.infer_calls += 1
+                raise RuntimeError("cold start blew up")
+            return await super().do_command(command, **kwargs)
+
+    arm = FakeArm(positions=[0.0] * 6)
+    svc = _svc(deps=_deps(policy=FailsFirst(), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: len(arm.moves) >= 2, "two ticks after the warm-up")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["state"] == "running" and status["last_error"] == ""
+    assert "warm-up inference failed: cold start blew up" in caplog.text
+
+
 async def test_a_hung_policy_fails_the_run_after_inference_timeout_s():
     policy = FakePolicyClient()
     policy.infer_delay_s = 60.0
@@ -2525,7 +2543,8 @@ async def test_a_failing_run_cancels_the_inference_poll_fired():
             self.cancelled = False
 
         async def do_command(self, command, **kwargs):
-            if command.get("command") == "infer" and self.infer_calls >= 1:
+            # Call 0 is the controller's warm-up, call 1 the first fill.
+            if command.get("command") == "infer" and self.infer_calls >= 2:
                 self.infer_calls += 1
                 self.second_call_started.set()
                 try:

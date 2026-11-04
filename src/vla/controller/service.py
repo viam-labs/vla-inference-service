@@ -736,6 +736,26 @@ class VLAController(Generic, EasyResource):
                 clock=self._clock,
             )
 
+            # One full round trip before motion, its chunk discarded. The policy's
+            # own warm-up feeds synthetic input straight to the model, so the
+            # first real request still pays first camera frames, image encoding,
+            # decode and resize, and the real task's tokenization. Landed, that
+            # outlier would be the only latency sample, and it alone picks the
+            # regime: a slow one runs the whole session sequential. Best effort:
+            # a failure here is the first real request's to report, under the
+            # loop's own stop_on_error handling.
+            try:
+                await asyncio.wait_for(self._infer(builder), cfg.inference_timeout_s)
+            except asyncio.TimeoutError:
+                LOGGER.warning(
+                    "warm-up inference did not return within inference_timeout_s=%s; "
+                    "starting anyway",
+                    cfg.inference_timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("warm-up inference failed: %s; starting anyway", exc)
+            self._timings.clear()
+
             try:
                 self._state = "running"
                 await self._loop(inference, self._buffer, gripper)

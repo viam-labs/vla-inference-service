@@ -253,3 +253,15 @@ def test_default_smoothing_removes_most_of_a_zigzagging_policys_jitter():
     _, m = residual(smooth, after=after)
     assert np.sqrt((m**2).mean()) <= 0.3 * np.sqrt((r**2).mean())
     assert residual_accel(smooth, after=after) <= 0.3 * residual_accel(rough, after=after)
+
+
+def test_a_slow_warm_up_neither_picks_the_regime_nor_skews_timing():
+    # The cold first request (3 s against a 0.3 s steady state) is the
+    # controller's warm-up. Landed instead, it would be the only latency
+    # sample, and 2 * 3.3 + blend + margin > the 5 s chunk: sequential.
+    s = run_session(latency_s=0.3, warmup_s=3.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "overlap", s.status
+    assert s.status["rebases"] == 1, s.status
+    assert s.status["expected_latency_s"] < 1.0, s.status
+    assert s.status["timing"]["round_trip_s"] < 1.0, s.status

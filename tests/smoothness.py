@@ -99,8 +99,9 @@ class ScriptedPolicy:
     chunk's offset, so consecutive chunks disagree by a known amount at every
     seam. The first inference takes
     `cold_extra_s` longer: the schedule anchors after it, and without the
-    offset every later reply would land exactly on a tick boundary. It must
-    answer `ready`: `_await_policy` polls on a real `time.monotonic()` deadline
+    offset every later reply would land exactly on a tick boundary. The
+    controller's warm-up request comes first; it takes `warmup_s` and is not
+    recorded or counted as a chunk. It must answer `ready`: `_await_policy` polls on a real `time.monotonic()` deadline
     and would spin hot in virtual time otherwise.
     """
 
@@ -111,8 +112,11 @@ class ScriptedPolicy:
         cold_extra_s: float = 0.05,
         fps: float = FPS,
         row_noise: float = 0.0,
+        warmup_s: float = 0.0,
     ):
         self.latency_s = latency_s
+        self.warmup_s = warmup_s
+        self.warmed_up = False
         # Added to row i as row_noise * (-1)**i: the tick-to-tick zig-zag a
         # real policy's chunks carry, which smooth_rows exists to remove.
         self.row_noise = row_noise
@@ -144,6 +148,11 @@ class ScriptedPolicy:
                 "relative_actions": False,
                 "device": "cpu",
             }
+        if name == "infer" and not self.warmed_up:
+            self.warmed_up = True
+            await asyncio.sleep(self.warmup_s)
+            rows = np.zeros((CHUNK, DIM), dtype=np.float32)
+            return {"actions": encode_matrix(rows), "raw_actions": encode_matrix(rows)}
         if name == "infer":
             loop = asyncio.get_running_loop()
             chunk_id = len(self.obs_times)
@@ -256,14 +265,17 @@ class Session:
 
 
 def run_session(
-    *, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), fps=FPS, row_noise=0.0, **config
+    *, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), fps=FPS, row_noise=0.0, warmup_s=0.0,
+    **config,
 ) -> Session:
     """Run the real controller for `duration_s` virtual seconds and return what it did."""
 
     async def main() -> Session:
         loop = asyncio.get_running_loop()
         arm = TrackingArm(jitter=jitter)
-        policy = ScriptedPolicy(latency_s, offsets, fps=fps, row_noise=row_noise)
+        policy = ScriptedPolicy(
+            latency_s, offsets, fps=fps, row_noise=row_noise, warmup_s=warmup_s
+        )
         svc = VLAController("c")
         svc._clock = loop.time
         svc.reconfigure(_config(fps=fps, **config), {"p": policy, "a": arm, "cam": FakeCamera()})

@@ -979,6 +979,13 @@ has passed are never executed, so there is nothing stale to drop or to tune.
   the model was trained on; 7 rows brings that to 2–6% and moves the path by
   under 0.7° RMS. The gripper column is held, not interpolated, and is left alone.
 
+`start` first runs one full round trip (observation, request, reply) and
+discards the chunk. The policy's `warmup_inferences` feed synthetic input
+straight to the model, so the first real request still pays the cameras' first
+frames, image encoding and resizing, and the real task's tokenization. Measured,
+that outlier would be the first latency sample, and it alone picks the regime
+below. A failed or timed-out warm-up is logged and the run starts anyway.
+
 With one inference in flight, chunks land at most one per latency, and each
 is observed only when the previous one lands. So once
 `2 * expected_latency + blend_s + margin_s` reaches the chunk duration,
