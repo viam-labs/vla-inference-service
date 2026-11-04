@@ -11,17 +11,24 @@ from __future__ import annotations
 import asyncio
 import time
 
+import numpy as np
 import pytest
 
 from tests.smoothness import VirtualLoop, run_virtual
 from tests.smoothness import (
     PERIOD,
     STAMP_TOL,
+    STREAM_HZ,
+    TAG,
+    _gaps,
     gap_jitter,
     knot_accel,
     landing_obs_age,
     lead_error,
     long_gaps,
+    reference,
+    residual,
+    residual_accel,
     run_session,
     seam_jump,
     seeded_jitter,
@@ -79,7 +86,11 @@ def test_wait_for_times_out_in_virtual_time():
 def _assert_healthy(session):
     assert session.status["state"] == "running", session.status
     assert session.status["last_error"] == "", session.status
-    assert len(session.arm.knots) > 50
+    # Knots are only recorded when streaming; setpoints only in setpoint mode.
+    assert len(session.arm.knots) + len(session.arm.setpoints) > 50
+    # Every hold in these scenarios is a deliberate wait, never a missed
+    # deadline; this also catches a loop that stops restarting the schedule.
+    assert session.status["reanchors"] == 0, session.status
 
 
 def test_steady():
@@ -116,37 +127,158 @@ def test_jittery_ticks():
 
 def test_slow_inference_lands_fresh_rows():
     latency = 1.23
-    s = run_session(latency_s=latency)
+    # Unblended rows: the TAG decode in landing_obs_age needs them.
+    s = run_session(latency_s=latency, blend_s=0.0)
     _assert_healthy(s)
     assert landing_obs_age(s) <= latency + 2 * PERIOD
 
 
 def test_starvation_holds_are_accounted_for():
     s = run_session(latency_s=5.5, duration_s=30.0)
-    _assert_healthy(s)
-    held = s.status["starved_ticks"] + s.status["reanchors"]
-    assert long_gaps(s.arm.stream_points) <= held
-    # (FakeArm itself asserts every stamp is strictly increasing.)
+    _assert_healthy(s)  # includes reanchors == 0: every hold is a deliberate wait
+    gaps = _gaps(s.arm.stream_points)
+    holds = gaps[gaps > PERIOD]
+    # One hold per landing after the blocking fill.
+    assert len(holds) == s.status["rebases"] - 1, (len(holds), s.status)
+    # starved_ticks agrees with the stamped hold time, to within a tick per hold.
+    # ArmStream emits n = round(STREAM_HZ / fps) points per tick, `step` =
+    # 1/(n*fps) apart, the last on the tick's due stamp. Holding k ticks moves
+    # the next batch's first point to prev_last + (k+1)*PERIOD - (n-1)*step =
+    # prev_last + k*PERIOD + step, so k = (gap - step) / PERIOD. Here n*fps is
+    # exactly STREAM_HZ, so step = 1/STREAM_HZ.
+    step = PERIOD / round(STREAM_HZ * PERIOD)
+    held_ticks = (holds - step).sum() / PERIOD
+    assert abs(held_ticks - s.status["starved_ticks"]) <= len(holds), (held_ticks, s.status)
 
 
 def test_seam_blend_softens_the_switch():
-    hard = run_session(latency_s=1.23, offsets=(1.0, -1.0))
-    blended = run_session(latency_s=1.23, offsets=(1.0, -1.0), blend_ticks=3)
+    hard = run_session(latency_s=1.23, offsets=(1.0, -1.0), blend_s=0.0)
+    blended = run_session(latency_s=1.23, offsets=(1.0, -1.0), blend_s=0.3)
     _assert_healthy(hard)
     _assert_healthy(blended)
     # Consecutive chunks disagree by 2 deg; a hard switch puts that into one
-    # second difference, and a 3-tick linear crossfade spreads it over 4 steps
-    # (~0.25x). Measured while planning: 10.1 vs 2.58, before the first landing
-    # was excluded from seam_jump.
+    # second difference, and a 3-tick smoothstep spreads the 2-degree step over
+    # 3 increments of 0.26/0.48/0.26 of it.
     assert seam_jump(blended) <= 0.5 * seam_jump(hard), (seam_jump(blended), seam_jump(hard))
 
 
-def test_aligned_starves_past_half_the_chunk():
-    # Each landing leaves CHUNK - L fresh rows and the next lands L ticks
-    # later, so aligned keeps up only while L <= CHUNK / 2 (25 ticks here).
-    under = run_session(latency_s=1.97, duration_s=20.0, starvation_grace_ticks=3)
-    _assert_healthy(under)
-    assert under.status["starved_ticks"] == 0
-    over = run_session(latency_s=3.03, duration_s=20.0, starvation_grace_ticks=3)
-    assert over.status["state"] == "error", over.status
-    assert "starved" in over.status["last_error"]
+def test_targets_land_on_the_reference_at_their_due_time():
+    for arm_write in ("stream", "setpoint"):
+        # Smoothing off: this gates timing, and the filter reshapes the curve.
+        s = run_session(latency_s=0.33, blend_s=0.0, smooth_rows=0, arm_write=arm_write)
+        _assert_healthy(s)
+        assert s.status["rebases"] == 1, s.status
+        _, res = residual(s, after=s.policy.reply_times[1] + 3 * PERIOD)
+        # Observations fall on the tick grid, so samples land exactly on rows and
+        # the residual is float noise plus microsecond stamp rounding (1 us x the
+        # reference's peak 7.85 deg/s ~ 8e-6; measured ~2.4e-7). 1e-4 is about
+        # 13 us of timing error; a target a tick early or late is ~0.8 deg off.
+        assert len(res) > 100
+        assert np.abs(res).max() <= 1e-4, (arm_write, np.abs(res).max())
+
+
+def test_crossfade_adds_less_acceleration_than_the_motion_itself_has():
+    fps, d = 30.0, 0.2
+    # A B-tick smoothstep peaks at 6*d/B^2 deg/tick^2: 0.0053 at B = 15. The
+    # reference's own peak is 5*(2*pi/4)^2 / fps^2 ~ 0.0137 at 30 fps.
+    blend_s = 15 / fps
+    kwargs = dict(fps=fps, latency_s=0.3, offsets=(d / 2, -d / 2), duration_s=20.0)
+    soft = run_session(blend_s=blend_s, **kwargs)
+    hard = run_session(blend_s=0.0, **kwargs)
+    _assert_healthy(soft)
+    _assert_healthy(hard)
+    assert soft.status["regime"] == "overlap", soft.status
+    # Past the rebased first chunk and the blend that supersedes it.
+    after = soft.policy.reply_times[1] + blend_s + 3 / fps
+    assert residual_accel(soft, after=after) <= 0.01
+    assert residual_accel(hard, after=hard.policy.reply_times[1] + 3 / fps) >= 0.15
+
+
+def test_overlap_keeps_up_below_the_regime_threshold():
+    # One request in flight: landings 2L apart. 2*2.2 + 0.2 + 0.2 = 4.8 < 5.0.
+    s = run_session(latency_s=2.2, duration_s=30.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "overlap"
+    assert s.status["starved_ticks"] == 0
+
+
+def test_past_half_the_chunk_switches_to_sequential():
+    # 2*3.03 + 0.4 >= 5.0: overlap would starve every chunk here (measured: 49
+    # starved ticks under the old single-L threshold), so it runs whole chunks.
+    s = run_session(latency_s=3.03, duration_s=30.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "sequential"
+
+
+def test_latency_above_the_chunk_runs_whole_chunks_from_their_start():
+    s = run_session(latency_s=5.5, duration_s=40.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "sequential"
+    # The fill's own latency sample already says sequential, so every chunk
+    # after it is observed at rest and rebased whole.
+    assert s.status["rebases"] >= 3
+    # Each rebased chunk runs to its end: about CHUNK ticks each, minus the
+    # couple of rows already behind the freeze point.
+    assert len(s.arm.knots) >= 45 * (s.status["rebases"] - 1)
+    # The TAG column names each knot's row. Every hold follows a chunk's last
+    # row, and the next chunk resumes at its first rows: observed at rest, its
+    # freeze point is row 0. (A position-continuity check across a hold needs a
+    # policy that reacts to the observed state; ScriptedPolicy is open-loop in
+    # time, so that property is pinned by the ReferenceBuffer unit tests.)
+    tags = np.array([p[TAG] for _, p in s.arm.knots])
+    stamps = np.array([stamp for _, stamp in s.arm.batch_stamps])
+    holds = np.flatnonzero(np.diff(stamps) > 2 * PERIOD)
+    assert len(holds) >= 2
+    for i in holds:
+        assert tags[i] % 1000 >= 47, (i, tags[i])
+        assert tags[i + 1] % 1000 <= 2, (i, tags[i + 1])
+
+
+def test_a_hung_policy_fails_after_inference_timeout_s():
+    s = run_session(latency_s=1e6, duration_s=10.0, inference_timeout_s=5.0)
+    assert s.status["state"] == "error"
+    assert "did not land" in s.status["last_error"]
+
+
+def test_default_smoothing_removes_most_of_a_zigzagging_policys_jitter():
+    # Rows alternate +/-0.3 deg about the reference, the worst case for any
+    # filter: a 7-row quadratic fit passes 5/21 of a pure alternation.
+    rough = run_session(latency_s=0.33, blend_s=0.0, smooth_rows=0, row_noise=0.3)
+    smooth = run_session(latency_s=0.33, blend_s=0.0, row_noise=0.3)
+    for s in (rough, smooth):
+        _assert_healthy(s)
+    after = rough.policy.reply_times[1] + 3 * PERIOD
+    _, r = residual(rough, after=after)
+    _, m = residual(smooth, after=after)
+    assert np.sqrt((m**2).mean()) <= 0.3 * np.sqrt((r**2).mean())
+    assert residual_accel(smooth, after=after) <= 0.3 * residual_accel(rough, after=after)
+
+
+def test_a_slow_warm_up_neither_picks_the_regime_nor_skews_timing():
+    # The cold first request (3 s against a 0.3 s steady state) is the
+    # controller's warm-up. Landed instead, it would be the only latency
+    # sample, and 2 * 3.3 + blend + margin > the 5 s chunk: sequential.
+    s = run_session(latency_s=0.3, warmup_s=3.0)
+    _assert_healthy(s)
+    assert s.status["regime"] == "overlap", s.status
+    assert s.status["rebases"] == 1, s.status
+    assert s.status["expected_latency_s"] < 1.0, s.status
+    assert s.status["timing"]["round_trip_s"] < 1.0, s.status
+
+
+def test_stream_lead_s_writes_each_point_from_that_far_ahead_on_the_plan():
+    # A driver writes each point at its stamp, so a servo that takes time to
+    # respond arrives late. stream_lead_s samples the plan that far past the
+    # stamp: the executed point is the reference at stamp + lead. A whole row
+    # (PERIOD) keeps samples on rows; between rows, linear interpolation of the
+    # sinusoid alone is off by up to h^2/8 * |f''| ~ 0.015 deg.
+    lead = PERIOD
+    s = run_session(
+        latency_s=0.33, blend_s=0.0, smooth_rows=0, arm_write="stream", stream_lead_s=lead
+    )
+    _assert_healthy(s)
+    t, res = residual(s, after=s.policy.reply_times[1] + 3 * PERIOD)
+    expected = np.array([reference(ti + lead) - reference(ti) for ti in t])
+    assert len(t) > 100
+    assert np.abs(res - expected).max() <= 1e-4
+    assert np.abs(expected).max() > 0.1  # the lead is visible, not lost in noise

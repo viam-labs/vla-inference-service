@@ -266,9 +266,16 @@ class LeRobotBackend:
         return self._specs
 
     def predict_chunk(self, images, state, task, rtc_kwargs):
-        """Return `(processed_actions, raw_actions)`, both `[n_action_steps, action_dim]`.
+        """Return `(processed_actions, raw_actions)`.
 
-        `processed_actions` are postprocessed and ready for the robot.
+        `processed_actions` are postprocessed and ready for the robot, cut to
+        `[n_action_steps, action_dim]`: `predict_action_chunk` returns the
+        model's whole `chunk_size` horizon, and lerobot's own `select_action`
+        executes only the first `n_action_steps` of it. The rows past that are
+        the least reliable predictions, and a sequential controller would run
+        them all. `raw_actions` keep the full `[chunk_size, action_dim]`: an
+        RTC caller feeds back the unexecuted remainder, which can reach past
+        `n_action_steps`.
         `raw_actions` are in the policy's own action space and are what an RTC
         caller must feed back as `prev_chunk_left_over`. They are deliberately
         distinct return values because confusing them is the likeliest RTC bug.
@@ -307,7 +314,7 @@ class LeRobotBackend:
             processed = self._postprocessor(actions).squeeze(0)
 
         return (
-            processed.float().cpu().numpy().astype(np.float32),
+            processed[: self._specs.n_action_steps].float().cpu().numpy().astype(np.float32),
             raw.float().cpu().numpy().astype(np.float32),
         )
 

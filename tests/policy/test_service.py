@@ -114,7 +114,7 @@ async def test_infer_returns_both_action_arrays(tmp_path):
     assert actions.shape == (50, 6)
     assert raw.shape == (50, 6)
     assert not np.array_equal(actions, raw)
-    assert out["latency_s"] >= 0
+    assert out["compute_s"] >= 0
 
 
 async def test_infer_passes_rtc_kwargs_to_backend(tmp_path):
@@ -982,3 +982,54 @@ async def test_infer_accepts_missing_task_defaults_to_empty_string(tmp_path):
         "state": encode_vector(np.zeros(4, dtype=np.float32)),
     })
     assert out is not None
+
+
+def _infer_cmd(**extra):
+    img = np.zeros((224, 224, 3), dtype=np.uint8)
+    return {
+        "command": "infer",
+        "images": {"observation.images.top": encode_image(img)},
+        "state": encode_vector(np.zeros(6, dtype=np.float32)),
+        "task": "t",
+        **extra,
+    }
+
+
+async def test_infer_reports_compute_and_server_time_and_echoes_seq(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=6, n_action_steps=50)
+    # t_obs is sent on purpose: the service must tolerate it, not use it.
+    out = await svc.do_command(_infer_cmd(seq=7, t_obs=123.0))
+    assert out["seq"] == 7
+    assert 0 <= out["compute_s"] <= out["server_s"]
+    assert "latency_s" not in out
+
+
+async def test_infer_without_seq_still_answers(tmp_path):
+    svc = await _ready_service(tmp_path, action_dim=6, n_action_steps=50)
+    out = await svc.do_command(_infer_cmd())
+    assert "seq" not in out
+
+
+async def test_concurrent_infers_never_overlap_in_predict_chunk(tmp_path):
+    active = 0
+    peak = 0
+    guard = threading.Lock()
+
+    class OverlapBackend(FakePolicyBackend):
+        def predict_chunk(self, *a, **k):
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with guard:
+                active -= 1
+            return super().predict_chunk(*a, **k)
+
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    svc._backend_factory = lambda: OverlapBackend(action_dim=6, n_action_steps=50)
+    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
+    await svc.await_ready()
+    await asyncio.gather(*(svc.do_command(_infer_cmd()) for _ in range(3)))
+    assert peak == 1

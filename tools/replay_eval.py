@@ -859,7 +859,7 @@ async def run(args) -> int:
             chunk = np.asarray(result["actions"]["rows"], dtype=np.float32)
             preds.append(chunk[:horizon])
             print(
-                f"  [{n}/{len(draws)}] frame {t}  latency {result['latency_s']:.2f}s  "
+                f"  [{n}/{len(draws)}] frame {t}  latency {result['compute_s']:.2f}s  "
                 f"L2(k=0) {np.linalg.norm(chunk[0] - recorded[t]):.4f}",
                 flush=True,
             )

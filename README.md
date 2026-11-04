@@ -13,7 +13,7 @@ The module ships two `rdk:service:generic` resources that communicate over `DoCo
   robot knowledge: one request carries images + joint state + a task string, the
   response carries an entire action chunk.
 - **`viam-labs:vla:controller`** — the observation → inference → actuation loop. Owns
-  the cameras, the arm, the gripper adapter, the action queue, and all safety clamping.
+  the cameras, the arm, the gripper adapter, the reference buffer, and all safety clamping.
   Pure numpy; never imports torch.
 
 Splitting them this way means the policy can be tested with no robot attached, and the
@@ -219,13 +219,21 @@ One observation in, one whole action chunk out. `images` must contain exactly th
 {
   "actions": { "rows": [[-7.1, -10.3, -47.9, 1.7, 56.5, -30.3]] },
   "raw_actions": { "rows": [[0.06, 0.09, -0.12, -0.11, 0.03, 0.05]] },
-  "latency_s": 0.32
+  "compute_s": 0.31,
+  "server_s": 0.32
 }
 ```
 
 `actions` has one row per step (`n_action_steps` of them) and is postprocessed, in the
-checkpoint's own units, ready for the robot. `raw_actions` is the same chunk in
-policy space — only an RTC caller needs it, to feed back as `prev_chunk_left_over`.
+checkpoint's own units, ready for the robot. The model predicts its whole `chunk_size`
+horizon; like lerobot's own `select_action`, only the first `n_action_steps` rows are
+returned, since the rest are its least reliable predictions. `raw_actions` is the
+chunk in policy space at the full `chunk_size` length — only an RTC caller needs it,
+to feed back the unexecuted remainder as `prev_chunk_left_over`.
+`compute_s` is the time inside `predict_chunk`; `server_s` is the whole request, including
+waiting for the policy's lock and decoding the images, so `server_s - compute_s` is queueing
+plus overhead. A `seq` in the request is echoed back, so a caller can match replies to
+requests.
 `encoding` may be `jpeg`, `png`, or `raw`; see `src/vla/wire.py`.
 
 RTC callers add an optional `rtc` object:
@@ -316,12 +324,8 @@ backoff for up to `policy_ready_timeout_s`.
 | `gripper` | object | `{"type": "none"}` | Discriminated union — three variants, see below. |
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
-| `mode` | `sequential` \| `async` | `"sequential"` | Switch to `async` when inference is slower than the motion a chunk buys — see [Performance](#performance). |
-| `queue_threshold` | integer | derived (effective chunk length − 1) | `mode: "async"` only: refill fires once the queue has this many actions left. Derived from `actions_per_chunk` when set, else from the checkpoint's `n_action_steps`. Leave unset — see [Performance](#performance). |
-| `merge` | `append` \| `aligned` | `"append"` | `mode: "async"` only: how a landing chunk is merged into the queue. `aligned` replaces the queued rows with the landing chunk, minus rows for ticks already served — see [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then). |
-| `blend_ticks` | integer | `0` | `merge: "aligned"` only: crossfade the first N rows of each landing chunk from the rows they supersede, arm joints only (the gripper always switches outright). `0` is a hard switch. |
-| `actions_per_chunk` | integer | — (execute the whole chunk) | Execute only the first N actions of every chunk and re-observe. Meaningful under `mode: "async"` only; floor is `ceil(avg_latency_s × fps)`. See [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk). Under `merge: "aligned"`, N counts from the first row not already stale when the chunk lands. |
-| `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts tick *failures* (when `stop_on_error` is `false`) and, under `mode: "async"`, *empty* ticks with inference still in flight. |
+| `smooth_rows` | odd integer, or 0 | `7`, `0` under `delta-ee` | Rows in the zero-phase quadratic (Savitzky–Golay) filter applied to each chunk as it lands. Removes tick-to-tick jitter in the policy's output without adding lag. `0` turns it off. See [Execution timing](#execution-timing). |
+| `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts consecutive tick *failures* (when `stop_on_error` is `false`) and, under `delta-ee`, consecutive `move_to_position` refusals. Waiting for a chunk is never fatal and never counted here; see `starved_ticks`. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
 | `state_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). Under `delta-ee` this is per-segment; see [Units](#units). |
 | `action_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit the policy's action is expressed in. Per-segment under `delta-ee`. |
@@ -331,6 +335,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `arm_move_extra` | object | `{"wait": false, "waitAtEnd": false, "interpolate": false}` | The `extra` struct sent with every `move_to_joint_positions`. Replaces the default wholesale; `{}` sends nothing. See [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle). |
 | `arm_write` | `setpoint` \| `stream` | `"setpoint"` | `joints` only. `"stream"` feeds the arm's servo mode at `stream_hz` instead of one setpoint per tick — see [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
 | `stream_hz` | number | `100.0` | `arm_write: "stream"` only. Must be ≥ `fps` — interpolation needs at least one point per tick. Rounded to a whole number of points per tick, so the actual rate is that count × `fps`, not `stream_hz` itself — `100` at `fps: 30` runs at 90 Hz. |
+| `stream_lead_s` | number, 0–1 | `0` | `arm_write: "stream"` only. How far ahead of its stamp each streamed point is sampled, to cover the servo's response time. See [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
 | `safety.max_joint_delta_degs` | number | `8.0` | `joints` only. Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
@@ -360,8 +365,9 @@ by config:
 
 Each tick: read `get_end_position()`, build the 9-vector, infer, convert the 6-vector
 into millimetres and radians, clamp its magnitude, compose it onto the *measured* pose,
-and call `arm.move_to_position`. Everything else — the scheduler, `mode`, chunk pacing,
-`starvation_grace_ticks`, `status` — behaves exactly as it does for `joints`.
+and call `arm.move_to_position`. Everything else — the reference buffer, chunk pacing,
+`starvation_grace_ticks`, `status` — behaves as it does for `joints`, except that
+chunks switch outright at a seam (rows are deltas, which cannot be blended).
 
 ```json
 {
@@ -516,14 +522,16 @@ The one command to watch while a loop runs.
 ```json
 {
   "state": "running",
-  "mode": "sequential",
-  "queue_size": 43,
   "avg_latency_s": 0.32,
+  "expected_latency_s": 0.34,
+  "regime": "overlap",
+  "rebases": 0,
+  "skipped_rows": 0,
+  "timing": { "round_trip_s": 0.32, "server_s": 0.3, "compute_s": 0.28, "transport_s": 0.02 },
   "measured_fps": 9.94,
   "clamp_counts": { "delta": 0, "limit": 0, "gripper": 0 },
   "starved_ticks": 0,
-  "queue_threshold": null,
-  "dropped_stale_rows": 0,
+  "reanchors": 0,
   "arm_write": "setpoint",
   "stream_points_sent": 0,
   "last_error": ""
@@ -536,30 +544,33 @@ What to read it for:
 - `clamp_counts` — **the field to check first.** Counts should stay near zero. A steadily
   climbing `delta` or `limit` almost always means wrong units or wrong joint order, not a
   safety margin doing its job. See [Safety](#safety).
-- `measured_fps` — should track configured `fps`. Well below it means inference is not
-  keeping up; see [Performance](#performance).
-- `starved_ticks` — ticks the loop held position with an empty queue. Only possible under
-  `mode: "async"`, and a persistently rising value means `queue_threshold` is too low.
-- `queue_size` — under `mode: "async"` it hovers between `queue_threshold` and
-  `queue_threshold + chunk length`, and every action in it is that many ticks stale. 40–90
-  with a 50-step chunk at 10 fps means the arm is executing observations 4–9 s old; see
-  [`actions_per_chunk`](#actions_per_chunk--execute-the-head-of-each-chunk).
-- `queue_threshold` — the scheduler's actual refill threshold under `mode: "async"`; `null`
-  under `sequential`, where the concept does not apply.
-- `dropped_stale_rows` — cumulative head rows of landing chunks skipped by `merge: "aligned"`
-  because their ticks had already been served when the chunk landed; always `0` under
-  `append`. Rows the landing chunk supersedes are not counted. Ticks are counted in loop
-  iterations, not wall time, so an overrun drops no rows. Latency over half the chunk shows
-  up as rising `starved_ticks`; a value rising by a whole chunk at a time means latency is
-  over the whole chunk — see
-  [`merge: "aligned"`](#merge-aligned--execute-rows-for-now-not-rows-for-then).
+- `measured_fps` — should track configured `fps`. Well below it means the tick itself is
+  overrunning (observation assembly, the arm write); see [Performance](#performance).
+- `avg_latency_s` — observation-to-landing, recent mean: the number the trigger plans around.
+- `expected_latency_s` — what the trigger and the regime switch actually use: the max of the
+  last five observation-to-landing intervals, or the chunk duration until the first one.
+- `regime` — `overlap` fires on the buffer's remaining time. `sequential` waits for the plan
+  to run out and observes at rest, because `2 * expected_latency_s` plus four ticks has
+  reached the chunk duration. See [Execution timing](#execution-timing).
+- `rebases` — chunks that landed after the plan had run out, so the new plan was pinned to the
+  moment the arm resumed rather than blended. Expected at every chunk under `sequential`;
+  under `overlap`, a rising value means latency is spiking past what the trigger planned for.
+- `skipped_rows` — delta-ee only: due rows skipped because a later row was also due, never
+  run late. Always `0` under `joints`.
+- `timing` — means over recent inferences, in seconds. `round_trip_s` is the controller's
+  whole `infer` call; `server_s` and `compute_s` are the policy's own `server_s` and
+  `compute_s` (see [`infer`](#infer)); `transport_s` is `round_trip_s - server_s`. A field is
+  `null` when the policy does not report it.
+- `starved_ticks` — ticks lost waiting for a chunk to land after the plan ran out, not
+  counting the first fill. Cumulative, like `clamp_counts`; waiting is never fatal, so this
+  is the only place a quietly stalling loop shows up. Under `sequential` it rises by roughly
+  one latency's worth of ticks per chunk; under `overlap` it should stay near zero.
 - `reanchors` — cumulative ticks that ran more than a full period late, after which the loop
   resumed its schedule from now instead of replaying the missed ticks. Under
   `arm_write: "stream"`, a tick up to one period late is caught up silently on the fixed grid.
   Other modes start the next tick immediately instead, so arm commands are never packed
-  closer than a tick's own work. Under other `arm_write` modes, an overrun shorter than a
-  period restarts the schedule silently and is not counted. Expected at every chunk boundary
-  under `mode: "sequential"`, where each refill blocks for a whole inference.
+  closer than a tick's own work, and an overrun shorter than a period is not counted. A wait
+  for a chunk is not counted; see `starved_ticks`.
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
 - `arm_write` — `"setpoint"` or `"stream"`, echoing the configured value.
@@ -568,6 +579,21 @@ What to read it for:
   together, so this jumps straight from `0` to `1 + n` — a value stuck at `0` while `state`
   is `"running"` means the stream opened but no tick has sent a batch yet — see
   [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream).
+
+#### `trace`
+
+The per-tick record of the last run: `fps`, then parallel arrays `nominal_t`, `sample_t`
+(the reference time each target was sampled at), `commanded`, `measured`, `clamped` and
+`send_t` (when the target was handed to the arm; under `arm_write: "stream"`, the first
+row's `send_t - nominal_t` is how late the driver's clock starts against the stamps).
+It answers "was that jerk the policy, the seam, or the clamp?" after the fact. Fetch it
+right after a run, before the next `start`, which clears it. `tools/dump_trace.py` turns
+it into CSV:
+
+```bash
+VIAM_API_KEY=... VIAM_API_KEY_ID=... \
+  tools/dump_trace.py --address $FQDN --service vla-controller > run.csv
+```
 
 ### Gripper variants
 
@@ -702,11 +728,23 @@ before the arm has moved. `arm_move_extra` goes once, as the stream's `extra`. `
 and any run-ending error half-close the stream, and the driver waits for the arm to
 stop before the RPC ends.
 
+Servo response: the driver writes each point at its stamp, and the stamp is the
+moment the point is due, so the servo only starts toward it then and arrives late
+by its response time. A setpoint has no such gap: it is sent a tick before it is
+due. `stream_lead_s` samples each point that many seconds further ahead on the plan;
+the stamps do not move. Measured on an SO-101, streamed points arrived 38–56 ms late
+on most joints against 16–36 ms for setpoints, with no late points reported by the
+driver and the clock anchored within 3 ms; 0.05 is the starting value there.
+
 Requirements and fallback: `viam-sdk` >= 0.82.0, which this module already
 depends on, and an xArm module at or after `d83b4d9` (2026-09-15). `"setpoint"` stays
-the default and the fallback. The per-tick safety clamp applies identically on both
-paths: every interpolated point lies between two already-clamped targets, so streaming
-changes how often a target is sent, not how far it may move.
+the default and the fallback. The safety clamp enforces the same `max_vel_degs_per_sec`
+on both paths: every interpolated point lies between two already-clamped targets, so
+streaming changes how often a target is sent, not how fast it may move. The clamp
+measures a target against the arm's position now, and a streamed target is sampled
+`2/fps + stream_lead_s` ahead rather than `1/fps`, so its per-tick allowance is scaled
+by that many ticks (logged at configure time). Unscaled, 120 °/s on an SO-101 clamped
+motion at roughly 40–55 °/s.
 
 ### Full worked example
 
@@ -720,7 +758,6 @@ changes how often a target is sent, not how far it may move.
   },
   "task": "pick up the red block",
   "fps": 10.0,
-  "mode": "sequential",
   "state_joint_indices": [0, 1, 2, 3, 4],
   "state_units": "degrees",
   "action_units": "degrees",
@@ -914,174 +951,83 @@ Measured on Apple Silicon (MPS), `lerobot/smolvla_base`:
 | `n_action_steps` | 50 |
 | Motion a chunk buys at `fps: 10` | 5.0 s |
 
-**Inference is slower than the motion it produces on Apple Silicon.** `mode: "sequential"`
-stalls the arm for ~5.3 s between chunks — it moves roughly half the wall-clock time, in
-5-second freezes.
+**Inference is slower than the motion it produces on Apple Silicon.** At ~5.3 s against a
+5.0 s chunk the controller runs in the `sequential` regime (below): the arm moves roughly
+half the wall-clock time, in 5-second freezes. RTC cannot do this job instead — RTC needs
+`delay < chunk_length` to function at all, and here `delay` (~53 steps) exceeds
+`chunk_length` (50 steps). Levers that move you toward the `overlap` regime: lower `fps`
+(a chunk buys more wall-clock time per inference), a smaller/faster checkpoint, or fewer
+denoising steps. **For anything resembling a live demo, the x86+CUDA target remains the
+practical answer** — the numbers above are Mac-specific.
 
-**`mode: "async"` is the recommended mode whenever inference latency approaches or
-exceeds chunk duration**, exactly the case measured here. It overlaps execution with
-inference instead of stalling: the current chunk keeps running while the next one infers
-in the background, merged in append mode once it lands. Duty cycle goes from ~50% (in
-multi-second freezes) to ~94% (in ~0.3 s hitches at each chunk boundary) at these
-measured numbers. RTC cannot do this job instead — RTC needs `delay < chunk_length` to
-function at all, and here `delay` (~53 steps) exceeds `chunk_length` (50 steps), so RTC
-would discard the entire chunk on every merge (permanent starvation). See
-`AsyncScheduler`'s docstring in `src/vla/controller/scheduler.py` for the full
-concurrency contract and the discontinuity-at-chunk-boundary tradeoff it accepts in
-exchange.
+### Execution timing
 
-That tradeoff is why `async` is explicit opt-in rather than a default: it is unambiguously
-better than `sequential` whenever this latency relationship holds, but a deployment
-running comfortably inside its chunk budget has no reason to accept a seam it does not
-need. Other levers still apply if you want to avoid the stall/hitch tradeoff entirely:
-lower `fps` (a chunk buys more wall-clock time per inference), a smaller/faster
-checkpoint, or fewer denoising steps. **For anything resembling a live demo, the x86+CUDA
-target remains the practical answer** — the numbers above are Mac-specific, and `async`
-narrows the gap without pretending to close it as well as faster hardware would.
+Every chunk is placed on a time axis. Row i of a chunk inferred from an
+observation at `t_obs` means "be here at `t_obs + (i+1)/fps`", and each tick
+commands the reference at the instant its target is due at the arm (two ticks
+ahead under `arm_write: "stream"`, one under `"setpoint"`). Rows whose moment
+has passed are never executed, so there is nothing stale to drop or to tune.
 
-### `merge: "aligned"` — execute rows for now, not rows for then
+- When a chunk lands while the previous plan still has rows ahead, the new
+  plan crossfades in over two ticks (smoothstep). Under `delta-ee` it switches
+  outright.
+- Inference fires when the plan has less than `expected_latency` plus four
+  ticks left (two for the crossfade, two of margin). `expected_latency` is
+  measured: the max of the last five observation-to-landing intervals, and the
+  chunk duration until the first one exists.
+- A wait for a chunk longer than 30 s fails the tick (and the run, under the
+  default `stop_on_error`).
+- `smooth_rows` (default 7; `0` under `delta-ee`): each landing chunk's joint
+  columns are smoothed once with a quadratic least-squares fit over that many
+  rows. The whole chunk is known in advance, so the filter looks both ways and
+  adds no lag; at the chunk's ends the window shifts inward instead of padding.
+  Measured on an SO-101 with `smolvla-so101-mug`, the raw commands reversed
+  direction on 45–71% of moving ticks, against 0–4% in the teleop recordings
+  the model was trained on; 7 rows brings that to 2–6% and moves the path by
+  under 0.7° RMS. The gripper column is held, not interpolated, and is left alone.
 
-`mode: "async"`'s default, `merge: "append"`, queues every landing chunk behind whatever is
-still queued. A chunk predicted from an observation taken at time t0 has row i meaning "the
-pose the arm should be at at t0 + (i+1)/fps" — but by the time row 0 of the new chunk
-actually executes, however many ticks were still queued when it landed have already passed,
-so it describes a pose from the past. The arm follows the outgoing chunk's drifting tail,
-then the incoming chunk's head pulls it back to where the policy thought it should have been
-a moment earlier: a visible yank at every chunk boundary. Measured on the xArm: a delta-clamp
-burst every 1.72 s, exactly one per 50-row chunk at 29 fps.
+`start` first runs one full round trip (observation, request, reply) and
+discards the chunk. The policy's `warmup_inferences` feed synthetic input
+straight to the model, so the first real request still pays the cameras' first
+frames, image encoding and resizing, and the real task's tokenization. Measured,
+that outlier would be the first latency sample, and it alone picks the regime
+below. A failed or timed-out warm-up is logged and the run starts anyway.
 
-`merge: "aligned"` fixes this by having every landing chunk *replace* what is still queued,
-minus its head rows for ticks already served since the request fired. Those are counted in
-control-loop iterations, so the skip is exact whatever the tick jitter. The queue only ever
-holds rows for now or later, and they are always the freshest prediction available. Skipped
-head rows are tracked in `status.dropped_stale_rows`. `blend_ticks: N` crossfades the first
-N rows from the rows they supersede, which softens the switch at the cost of N ticks of mixed
-predictions. Start at `0` and raise it only if the seam is audible.
+With one inference in flight, chunks land at most one per latency, and each
+is observed only when the previous one lands. So once
+`2 * expected_latency` plus four ticks reaches the chunk duration,
+overlapping would starve between landings, or observe mid-chunk and land rows
+the arm has already passed. The controller then switches to the `sequential`
+regime: it waits for the plan to run out, observes at rest, and runs the whole
+next chunk. `status.regime` says which is active.
 
-With the default derived `queue_threshold`, inference runs back to back and each chunk
-supersedes the last: the most closed-loop setting the latency allows. With `N` the policy's
-raw chunk and `L` the latency in ticks, it starves when the rows a landing leaves,
-`min(actions_per_chunk, N − L)`, are fewer than the `L` ticks until the next landing:
-roughly latency over half the policy's raw chunk without `actions_per_chunk`. Every landing
-is entirely stale once latency reaches the whole chunk. Measured on
-`smolvla-box-bot-subtasks` (chunk 50 at 30 fps = 1.67 s), `num_steps: 4` (0.58 s = 18 ticks,
-under 25) fits; `num_steps: 10` (1.07 s = 34 ticks) starves. `merge` still defaults to
-`"append"` until an on-robot run confirms the replace semantics.
+`mode`, `merge`, `blend_ticks`, `queue_threshold` and `actions_per_chunk` were
+removed; a config that still sets one fails validation with its replacement.
+The crossfade, the trigger margin and the timeout are fixed: tuning them never
+changed a result on the robot.
 
 ### Cutting inference latency: `num_steps`
 
-Latency decides whether `merge: "aligned"` above is usable at all: it needs inference to
-finish within half the policy's raw chunk duration, and the shorter the latency the
-fresher every executed row. smolvla's `num_steps` (10 by default) is the flow-matching
-step count and the dominant tunable term in that latency. Measured on the
-Jetson Orin with `smolvla-box-bot-subtasks`: 1.07 s at 10 steps, 0.66 s at 5, 0.58 s at 4,
-roughly 0.25 s fixed plus 0.08 s per step. Set `num_steps` on the `#policy` service to trade
-some action quality for speed, and measure both: `avg_latency_s` in the controller's `status`
-for the speed, `tools/replay_eval.py` for the quality. The `#policy` `specs` report the value
-in force.
-
-
-### Tuning `queue_threshold` — the single most actionable knob in `mode: "async"`
-
-`queue_threshold` decides *when* the background refill fires (once the queue has this
-many or fewer actions left), which decides how much runway the refill gets before the
-queue actually drains. A threshold picked too low silently forfeits most of the overlap
-benefit — the loop still "works," it just spends a third of its time holding position,
-and without a diagnostic it looks indistinguishable from "the policy is slow." Measured
-throughput delivering 150 actions at latency ≈ chunk duration × 1.06 (`n_action_steps:
-50`):
-
-| `queue_threshold` | wall time | actions/s | vs. `sequential` |
-|---|---|---|---|
-| — (`sequential`) | 3.20 s | 46.9 | baseline |
-| 10 | 2.99 s | 50.2 | +7% |
-| 30 (the old fixed default) | 2.55 s | 58.7 | +25% |
-| 49 (`n_action_steps - 1`) | 2.16 s | 69.4 | +48% |
-
-The runway a threshold buys is `queue_threshold` ticks; the runway inference *needs* is
-`ceil(observed_latency × fps)` ticks. Because the queue can only ever hold at most
-`chunk length - 1` actions before a refill must have already been requested, the highest
-`queue_threshold` can ever usefully be is `chunk length - 1` — which is why the derived
-default is `effective chunk length - 1` (the config table above) rather than a fixed
-number: a fixed default is right for at most one checkpoint's chunk length and measurably
-wrong for every other one. "Effective" means `actions_per_chunk` when that is set, else
-`n_action_steps`.
-
-**The threshold is a staleness ceiling as much as a starvation floor.** `ActionQueue`
-merges in append mode, so with threshold `T` the action executing at any instant was
-inferred between `T` and `T + chunk length` ticks ago. Deriving `T = 49` from an
-untruncated 50-step chunk maximizes runway and, in doing so, maximizes staleness: measured
-by driving `AsyncScheduler` at 1.05 s latency and 10 fps, the executing action was 4.75–10.5 s
-old, against 1.07–6.9 s for `sequential`. Async was also inferring no more often than
-sequential — one refill per chunk consumed either way — so that default bought only the
-removal of a ~1 s stall and paid 2.2× the staleness for it. Lowering `queue_threshold`
-alone (to 14, say) recovers most of the staleness without a rebuild; `actions_per_chunk`
-is the proper fix.
-
-### `actions_per_chunk` — execute the head of each chunk
-
-A checkpoint that emits `chunk_size: 50` at `fps: 10` is five seconds of open loop, and
-nothing in this module shortened it: `predict_chunk` calls lerobot's `predict_action_chunk`,
-and only `select_action` — which this module never calls — slices by `n_action_steps`.
-Replay against the deployed policy shows why that matters (230 samples, mean L2 per
-horizon offset):
-
-| offset | mean L2 |
-|---|---|
-| k=0 | 3.49 |
-| k=1 | 5.31 |
-| k=9 | 12.97 |
-| k=24 | 15.07 |
-| k=49 | 17.52 |
-
-73% of the degradation happens in the first 9 of 50 steps. `actions_per_chunk: 12`
-truncates every chunk to its first 12 actions *before* it is merged (so `queue_size` never
-counts rows that will not execute), cuts the executed mean from 14.21 to 9.73, and derives
-`queue_threshold = 11` automatically. Measured on the same scheduler drive:
-
-| config | staleness | queue depth | inference cadence |
-|---|---|---|---|
-| `sequential` | 1.07–6.91 s | 0–50 | every 5.0 s + stall |
-| derived `T = 49` | 4.75–10.54 s | 40–90 | every 5.0 s |
-| `queue_threshold: 14` | 1.43–6.59 s | 5–55 | every 5.0 s |
-| `actions_per_chunk: 12` | 1.12–3.05 s | 2–16 | every 1.4 s |
-
-Rules for setting it:
-
-- **Requires `mode: "async"`.** Under `sequential`, truncating to 12 re-infers every 12
-  ticks with a ~10-tick blocking stall — a 47% duty cycle of frozen arm.
-- **Floor is `ceil(avg_latency_s × fps)`.** Below it the queue cannot refill in time; the
-  scheduler's starvation-risk `WARNING` fires, since the derived threshold is one less than
-  `actions_per_chunk`. At 1.05 s and 10 fps that floor is 11, so 12 is the shortest safe
-  setting.
-- Unset means "execute the whole chunk": no deployment's chunk is shortened silently.
-- A value above the checkpoint's `n_action_steps` is not an error; the threshold derivation
-  clamps to `n_action_steps` so it can never be stranded above what the queue can hold.
-
-**Two diagnostics exist so a bad threshold is never silent:**
-
-- `AsyncScheduler` tracks its own recent inference latencies and, once it has a stable
-  reading, logs a `WARNING` **once** (never every tick) if `queue_threshold <
-  ceil(observed_latency × fps)` — naming the observed latency, the configured and
-  required thresholds, and the consequence ("the arm will hold position for ~N tick(s)
-  per chunk"), with the concrete remedy (raise `queue_threshold`, lower `fps`, or reduce
-  the policy's `num_steps`).
-- `status.starved_ticks` is a running total (the same shape as `clamp_counts`) of ticks
-  the loop has held position because the queue was empty and a background inference was
-  still in flight — distinct from the *consecutive*-run bound that escalates to a halt at
-  `starvation_grace_ticks`. A deployment that never escalates can still have a
-  persistently nonzero `starved_ticks`, which is exactly the silent-degradation case this
-  counter exists to surface.
+Latency decides the regime: `overlap` needs `2 * expected_latency` plus four ticks to
+stay under the chunk duration, and the shorter the latency the fresher every executed row.
+smolvla's `num_steps` (10 by default) is the flow-matching step count and the dominant
+tunable term in that latency. Measured on the Jetson Orin with `smolvla-box-bot-subtasks`:
+1.07 s at 10 steps, 0.66 s at 5, 0.58 s at 4, roughly 0.25 s fixed plus 0.08 s per step.
+At 30 fps the 50-step chunk is 1.67 s and four ticks are 0.13 s, so overlap needs latency under about 0.77 s: 4 or 5 steps fit, 10 runs `sequential`.
+Set `num_steps` on the `#policy` service to trade some action quality for speed, and
+measure both: `avg_latency_s` and `regime` in the controller's `status` for the speed,
+`tools/replay_eval.py` for the quality. The `#policy` `specs` report the value in force.
 
 ## Limitations
 
 - **The controller does not run RTC.** The `#policy` service accepts an `rtc` block on
   `infer` and returns `raw_actions` for a caller that runs real-time chunking itself, but
-  the controller has no `RTCScheduler` and its `ActionQueue` is append-only. Deferred
+  the controller has no RTC scheduler. Deferred
   until CUDA latency is measured: RTC needs `delay < chunk_length` to function at all,
-  and on the measured Apple Silicon numbers `delay > chunk_length`. `mode: "async"` (see
-  Performance) is the shipped answer to slow inference; it is a plain overlap and does
-  not smooth the seam at each chunk boundary the way RTC eventually would.
+  and on the measured Apple Silicon numbers `delay > chunk_length`. The reference buffer
+  (see [Execution timing](#execution-timing)) is the
+  shipped answer to slow inference; it crossfades each seam on the time axis but does not
+  condition the new chunk on the old one the way RTC would.
 - **`state_units`/`action_units: "normalized"` is unsupported.** It needs a source of
   per-joint min/max (dataset stats vs. explicit config) that is an open design question.
   Only `degrees` and `radians` are accepted under `action_space: "joints"`.
@@ -1097,7 +1043,7 @@ Rules for setting it:
 - **Relative-action checkpoints are refused under RTC**, not silently mishandled — RTC's
   prefix would need re-anchoring against the cached raw state that this module does not
   yet implement, and applying guidance in the wrong coordinate frame would produce
-  plausible-looking but wrong motion. Sequential mode is unaffected.
+  plausible-looking but wrong motion. The controller, which does not run RTC, is unaffected.
 - **No driver-side velocity/acceleration ceilings.** The calls that would carry one —
   `move_through_joint_positions` (via `MoveOptions`) and `move_through_joint_positions_streamed`
   (via each `TrajectoryPoint`'s `KinematicConstraints`) — are reachable on `viam-sdk`
