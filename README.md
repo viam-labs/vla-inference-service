@@ -225,8 +225,11 @@ One observation in, one whole action chunk out. `images` must contain exactly th
 ```
 
 `actions` has one row per step (`n_action_steps` of them) and is postprocessed, in the
-checkpoint's own units, ready for the robot. `raw_actions` is the same chunk in
-policy space — only an RTC caller needs it, to feed back as `prev_chunk_left_over`.
+checkpoint's own units, ready for the robot. The model predicts its whole `chunk_size`
+horizon; like lerobot's own `select_action`, only the first `n_action_steps` rows are
+returned, since the rest are its least reliable predictions. `raw_actions` is the
+chunk in policy space at the full `chunk_size` length — only an RTC caller needs it,
+to feed back the unexecuted remainder as `prev_chunk_left_over`.
 `compute_s` is the time inside `predict_chunk`; `server_s` is the whole request, including
 waiting for the policy's lock and decoding the images, so `server_s - compute_s` is queueing
 plus overhead. A `seq` in the request is echoed back, so a caller can match replies to

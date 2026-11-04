@@ -7,6 +7,8 @@ torch/lerobot (the `lerobot` extra).
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -155,9 +157,22 @@ def test_predict_chunk_returns_finite_chunk(backend):
     actions, raw = backend.predict_chunk(images, state, "pick up the red block", None)
 
     assert actions.shape == (s.n_action_steps, s.action_dim)
-    assert raw.shape == (s.n_action_steps, s.action_dim)
+    assert raw.shape == (backend._policy.config.chunk_size, s.action_dim)
     assert np.all(np.isfinite(actions))
     assert np.all(np.isfinite(raw))
+
+
+def test_predict_chunk_cuts_actions_to_n_action_steps_and_keeps_the_raw_horizon(
+    backend, monkeypatch
+):
+    # smolvla_base has n_action_steps == chunk_size == 50, which hid the
+    # backend returning the whole horizon. Fine-tuned checkpoints commonly
+    # execute fewer (smolvla-so101-mug: 30 of 50).
+    s = dataclasses.replace(backend.specs, n_action_steps=30)
+    monkeypatch.setattr(backend, "_specs", s)
+    actions, raw = backend.predict_chunk(_images_for(s), _state_for(s), "pick", None)
+    assert actions.shape == (30, s.action_dim)
+    assert raw.shape == (backend._policy.config.chunk_size, s.action_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +257,8 @@ def test_predict_chunk_contract_shared_by_fake_and_real(loaded_backend):
     actions, raw = loaded_backend.predict_chunk(images, state, "do the thing", None)
 
     assert actions.shape == (s.n_action_steps, s.action_dim)
-    assert raw.shape == (s.n_action_steps, s.action_dim)
+    # The real backend's raw chunk is the model's whole chunk_size horizon.
+    assert raw.shape[0] >= s.n_action_steps and raw.shape[1] == s.action_dim
     assert actions.dtype == np.float32
     assert raw.dtype == np.float32
     assert np.all(np.isfinite(actions))
