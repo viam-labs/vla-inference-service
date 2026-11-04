@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from asyncio import to_thread
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -180,9 +181,15 @@ class ObservationBuilder:
         if needs_gripper_read:
             self._raise_if_failed(gripper_value, "gripper read failed")
 
-        images = {
-            key: self._encode(key, arr) for key, (arr, _age) in zip(keys, frame_results)
-        }
+        # Off the event loop, one thread per camera: resize plus JPEG encode
+        # is tens of milliseconds of CPU per frame, and this coroutine runs on
+        # the loop that drives the control ticks. PIL and numpy release the
+        # GIL in their C paths, so the cameras encode in parallel. Called by
+        # the module-level name so tests/smoothness.py can run it inline.
+        encoded = await asyncio.gather(
+            *(to_thread(self._encode, key, arr) for key, (arr, _age) in zip(keys, frame_results))
+        )
+        images = dict(zip(keys, encoded))
         for key, (_arr, age) in zip(keys, frame_results):
             if age is not None and age > self._stale_frame_warn_s:
                 LOGGER.warning(
@@ -227,7 +234,10 @@ class ObservationBuilder:
         images, metadata = await cam.get_images()
         if not images:
             raise ObservationError(f"camera {key!r} returned zero images")
-        arr = self._to_array(images[0])
+        # Off the event loop for the same reason as the encode in `build()`:
+        # JPEG decode plus RGB convert. One task already runs per camera, so
+        # the cameras decode in parallel.
+        arr = await to_thread(self._to_array, images[0])
         age = self._frame_age_s(metadata)
         return arr, age
 

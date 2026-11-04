@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -615,3 +616,114 @@ async def test_t_obs_is_when_the_arm_read_returned_on_the_injected_clock():
     )
     obs = await builder.build()
     assert obs.t_obs == 10.25
+
+
+# ---------------------------------------------------------------------------
+# the event loop stays free while images are decoded and encoded
+# ---------------------------------------------------------------------------
+#
+# The controller and the policy share one event loop, and the inference loop
+# (inference_loop.py) runs `build()` as a task on the loop that drives the
+# control ticks, so any CPU-bound work left inline here stalls the arm. On an
+# Orin Nano it showed up as `measured_fps` 2.67 against a configured 10. The
+# stall scales with inference frequency. These tests pin the property rather
+# than asserting `to_thread` is called, so a rewrite that keeps the loop free
+# by other means still passes.
+
+
+async def _blocked_ticks_during_build(builder, budget_s: float = 0.4) -> int:
+    """Count heartbeats that land while `builder.build()` runs.
+
+    A heartbeat advances only when the event loop is free to schedule it. If
+    `build()` blocks the loop, the count stays near zero however long the
+    build takes.
+    """
+    ticks = 0
+    running = True
+
+    async def heartbeat():
+        nonlocal ticks
+        while running:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    beat = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0)  # let the heartbeat reach its first await
+    try:
+        await asyncio.wait_for(builder.build(), timeout=budget_s)
+    finally:
+        running = False
+        beat.cancel()
+        try:
+            await beat
+        except asyncio.CancelledError:
+            pass
+    return ticks
+
+
+async def test_image_decode_does_not_block_the_event_loop(monkeypatch):
+    # A blocking sleep stands in for a 1080p JPEG decode: `time.sleep`
+    # releases the GIL like PIL's C decode does, so a threaded decode lets
+    # the heartbeat run and an inline one does not.
+    def slow_to_array(frame):
+        time.sleep(0.05)
+        return np.zeros((224, 224, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(ObservationBuilder, "_to_array", staticmethod(slow_to_array))
+
+    ticks = await _blocked_ticks_during_build(_builder())
+
+    assert ticks > 5, (
+        f"only {ticks} heartbeats ran during a 50ms decode: the decode is "
+        "blocking the event loop, which stalls every control tick due during it"
+    )
+
+
+async def test_image_encode_does_not_block_the_event_loop(monkeypatch):
+    original = ObservationBuilder._encode
+
+    def slow_encode(self, key, arr):
+        time.sleep(0.05)
+        return original(self, key, arr)
+
+    monkeypatch.setattr(ObservationBuilder, "_encode", slow_encode)
+
+    ticks = await _blocked_ticks_during_build(_builder())
+
+    assert ticks > 5, (
+        f"only {ticks} heartbeats ran during a 50ms encode: the encode is "
+        "blocking the event loop"
+    )
+
+
+async def test_cameras_encode_concurrently_rather_than_in_series(monkeypatch):
+    # Two cameras at 100ms each: in series is >= 200ms, concurrent ~100ms. The
+    # threshold sits between, so this fails if the per-camera gather
+    # collapses back into a sequential comprehension.
+    original = ObservationBuilder._encode
+
+    def slow_encode(self, key, arr):
+        time.sleep(0.1)
+        return original(self, key, arr)
+
+    monkeypatch.setattr(ObservationBuilder, "_encode", slow_encode)
+    builder = _builder(
+        cameras={
+            "observation.images.top": FakeCamera(),
+            "observation.images.wrist": FakeCamera(),
+        },
+        image_sizes={
+            "observation.images.top": (224, 224),
+            "observation.images.wrist": (224, 224),
+        },
+    )
+
+    started = time.perf_counter()
+    obs = await builder.build()
+    elapsed = time.perf_counter() - started
+
+    assert set(obs.images) == {"observation.images.top", "observation.images.wrist"}
+    assert elapsed < 0.17, (
+        f"two 100ms encodes took {elapsed:.3f}s: they ran in series, not in "
+        "parallel threads"
+    )
