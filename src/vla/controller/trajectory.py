@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import timedelta
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 from grpclib.const import Status
 from grpclib.exceptions import GRPCError
@@ -57,7 +56,7 @@ class ArmStream:
     strictly increase across the whole stream; half-closing the batches
     iterator ends the trajectory after the arm stops. Which point the driver
     anchors its clock on is version-dependent, so the rest point ships in the
-    same batch as the first tick's motion points and `_t0` is taken there.
+    same batch as the first tick's motion points, and `_t0` is that tick's nominal time.
     """
 
     def __init__(
@@ -67,13 +66,11 @@ class ArmStream:
         fps: float,
         stream_hz: float,
         extra: dict[str, Any],
-        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._arm = arm
         self._fps = fps
         self._stream_hz = stream_hz
         self._extra = extra
-        self._clock = clock
         self._queue: asyncio.Queue | None = None
         self._task: asyncio.Task | None = None
         self._fault: Exception | None = None
@@ -106,7 +103,13 @@ class ArmStream:
 
         self._task = asyncio.create_task(consume())
 
-    async def send(self, target: Sequence[float]) -> None:
+    async def send(self, target: Sequence[float], nominal_t: float) -> None:
+        """Queue one tick's densified points, stamped from the tick's nominal time.
+
+        `nominal_t` is the controller's `TickSchedule.nominal()` for this tick.
+        Stamping from it, not from when this call happens to run, keeps every gap
+        exactly `step` however late within its lead the tick is.
+        """
         n = max(1, round(self._stream_hz / self._fps))
         # Tile the tick evenly: 1/stream_hz gives 10, 10, 13.3 ms gaps at 100/30.
         step = 1.0 / (n * self._fps)
@@ -115,17 +118,17 @@ class ArmStream:
         batch: list[Any] = []
         first_send = self._t0 is None
         if first_send:
-            self._t0 = self._clock()  # see the class docstring on anchoring
+            self._t0 = nominal_t  # see the class docstring on anchoring
             batch.append(Arm.TrajectoryPoint(time=timedelta(0), positions=list(self._measured)))
 
-        elapsed = self._clock() - self._t0
+        elapsed = nominal_t - self._t0
         prev = self._measured if first_send else self._last
 
         last_time = self._last_time
         for k, p in enumerate(interpolate(prev, target, n)):
             # Stamp one tick ahead (a past-due point is sent immediately, and a
             # stream of past-due points collapses into bursts at fps); the max()
-            # keeps times strictly increasing under a stalled or rewound clock.
+            # keeps times strictly increasing across a re-anchor or a rewind.
             t = max(elapsed + lead + (k + 1) * step, last_time + step)
             batch.append(Arm.TrajectoryPoint(time=timedelta(seconds=t), positions=p))
             last_time = t

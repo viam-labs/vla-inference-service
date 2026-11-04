@@ -4,7 +4,7 @@ Two strategies ship: `SequentialScheduler` (blocking refill) and
 `AsyncScheduler` (overlapped refill). Both merge onto one `ActionQueue`.
 `SequentialScheduler` always appends; `AsyncScheduler` does too under its
 default `merge="append"`, but its `merge="aligned"` drops stale head rows
-before merging instead -- see `AsyncScheduler`'s docstring.
+and replaces the queued rows instead -- see `AsyncScheduler`'s docstring.
 
 `ChunkScheduler.next_action` is typed to allow returning `None`.
 `SequentialScheduler` never actually does -- it raises `SchedulerError`
@@ -64,7 +64,14 @@ class SchedulerError(VLAError, RuntimeError):
 
 
 def _validate_and_merge(
-    queue: ActionQueue, processed: Any, actions_per_chunk: int | None = None, skip: int = 0
+    queue: ActionQueue,
+    processed: Any,
+    actions_per_chunk: int | None = None,
+    skip: int = 0,
+    *,
+    replace: bool = False,
+    blend_ticks: int = 0,
+    blend_dims: int | None = None,
 ) -> int:
     """Validate a freshly-inferred chunk and merge it into `queue`.
 
@@ -85,6 +92,10 @@ def _validate_and_merge(
     returns without merging or raising, and the caller counts the returned
     skip total instead. Truncation to `actions_per_chunk` applies to
     whatever remains after the skip, not before.
+
+    `replace` (aligned merge) supersedes the unconsumed rows instead of
+    appending, crossfading the first `blend_ticks` rows of the first
+    `blend_dims` columns; see `ActionQueue.replace`.
     """
     if not isinstance(processed, np.ndarray) or processed.ndim != 2:
         raise SchedulerError(
@@ -102,7 +113,10 @@ def _validate_and_merge(
     if actions_per_chunk is not None:
         processed = processed[:actions_per_chunk]
     try:
-        queue.merge(processed)
+        if replace:
+            queue.replace(processed, blend_ticks, blend_dims)
+        else:
+            queue.merge(processed)
     except ActionQueueError as exc:
         # ActionQueue raises its own type; a caller of the scheduler should
         # never have to also know about it.
@@ -181,7 +195,7 @@ class AsyncScheduler(ChunkScheduler):
     replacing it -- see the `merge="aligned"` paragraph below for the
     alternative.
 
-    The honest cost is a discontinuity at each chunk boundary -- the last
+    The honest cost (under `merge="append"`) is a discontinuity at each chunk boundary -- the last
     action of chunk *k* and the first of *k+1* come from observations
     however-many seconds apart the inference took, and can disagree. The
     safety layer's delta clamp bounds that to one tick's budget, so it
@@ -196,7 +210,8 @@ class AsyncScheduler(ChunkScheduler):
       - `next_action` never blocks except on the very first call (nothing
         queued, nothing in flight) and, symmetrically, whenever the queue
         has run dry before any background inference was requested (e.g.
-        `queue_threshold=0`).
+        `queue_threshold=0`), or after a background landing that was
+        entirely stale, or failed.
       - When the queue is empty and an inference is already in flight,
         `next_action` returns `None` immediately rather than blocking.
       - A background failure is never raised from inside the background
@@ -213,12 +228,17 @@ class AsyncScheduler(ChunkScheduler):
     tick) if `queue_threshold < ceil(observed_latency * fps)`.
 
     `merge="aligned"` fixes append mode's boundary yank (see `config.py`'s
-    docstring) by dropping the head rows of every landing chunk whose moment
-    has already passed: with `L` ticks of latency and `q` rows still queued
-    when the chunk lands, the first remaining row must be row `L + q - 1`.
-    It only works when latency is under half the chunk length -- past that,
-    each chunk yields fewer fresh rows than the next inference takes to
-    arrive, and the queue starves faster than it can be refilled.
+    docstring). A landing chunk *replaces* the queued rows instead of waiting
+    behind them, minus its head rows for ticks already served since the
+    request fired -- counted in `next_action` calls, so the skip is exact and
+    immune to tick jitter. `blend_ticks` crossfades the first rows of the
+    first `blend_dims` columns from old to new. With the derived threshold
+    (effective chunk - 1) inference runs back to back and each chunk
+    supersedes the last. It starves when the rows a landing leaves,
+    min(actions_per_chunk, N - L), are fewer than the L ticks until the next
+    landing (N the policy's raw chunk, L the latency in ticks): roughly
+    latency over half the policy's raw chunk without actions_per_chunk.
+    Every landing is entirely stale once latency reaches the whole chunk.
     """
 
     def __init__(
@@ -228,6 +248,8 @@ class AsyncScheduler(ChunkScheduler):
         fps: float = 10.0,
         actions_per_chunk: int | None = None,
         merge: str = "append",
+        blend_ticks: int = 0,
+        blend_dims: int | None = None,
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self._infer = infer
@@ -236,6 +258,13 @@ class AsyncScheduler(ChunkScheduler):
         self._actions_per_chunk = actions_per_chunk
         self._fps = fps
         self._merge = merge
+        if blend_dims is not None and blend_dims < 0:
+            raise ValueError(f"blend_dims must be >= 0, got {blend_dims}")
+        self._blend_ticks = blend_ticks
+        self._blend_dims = blend_dims
+        # Every next_action call, starved or not: the unit the aligned skip
+        # counts in. Incremented on its first line -- see _aligned_skip.
+        self._calls = 0
         self._clock = clock
         self._inflight: asyncio.Task[None] | None = None
         self._pending_error: Exception | None = None
@@ -244,6 +273,7 @@ class AsyncScheduler(ChunkScheduler):
         self.dropped_stale_rows = 0
 
     async def next_action(self) -> np.ndarray | None:
+        self._calls += 1
         self._raise_pending_error()
 
         action = self._queue.get()
@@ -265,12 +295,9 @@ class AsyncScheduler(ChunkScheduler):
         await self._inflight
         self._raise_pending_error()
 
-        # Ordinarily guarded by _validate_and_merge's empty-chunk check, but
-        # an aligned merge can validly skip an entire landing chunk as
-        # stale, leaving the queue exactly as empty as before -- not an
-        # invariant violation. None here reads exactly like the starved
-        # branch above: the next call has nothing queued and nothing in
-        # flight, so it blocks and infers again.
+        # A blocking fill lands with skip 0 (no call since the fire), so it
+        # always yields rows; a None here is the defensive case of an empty
+        # but validated chunk, read like the starved branch above.
         return self._queue.get()
 
     async def close(self) -> None:
@@ -294,33 +321,40 @@ class AsyncScheduler(ChunkScheduler):
             self._start_background_inference()
 
     def _start_background_inference(self) -> None:
-        # `fired_at` is the request time; the camera frame is grabbed slightly
-        # after it, so the aligned skip errs one row conservative, never short.
+        # `fired_at` feeds only the latency samples behind the starvation-risk
+        # warning; the aligned skip counts calls (`fired_tick`), not seconds.
         # Keeping the task on `self` is load-bearing: asyncio holds only a weak
         # reference, so a bare handle can be garbage-collected before it runs.
         fired_at = self._clock()
-        self._inflight = asyncio.create_task(self._infer_and_merge(fired_at))
+        fired_tick = self._calls
+        self._inflight = asyncio.create_task(self._infer_and_merge(fired_at, fired_tick))
 
-    def _aligned_skip(self, fired_at: float) -> int:
-        # Row i of a landing chunk serves tick T+1+i (T = the tick fired_at
-        # names); the merge lands before the loop pops for the tick the
-        # clock has just reached, so the q still-queued rows already cover
-        # ticks T+L .. T+L+q-1, and the first uncovered tick is T+L+q --
-        # row index L+q-1.
+    def _aligned_skip(self, fired_tick: int) -> int:
+        # Row i of a landing chunk serves the (i+1)-th call after the one that
+        # fired it -- or, on the blocking path, the firing call itself, which
+        # is still waiting for it (skip 0). A background chunk can only land
+        # between calls (the non-blocking path never awaits), so the calls made
+        # since the fire are exactly the rows whose ticks were already served.
+        # That holds only because `_calls` is incremented on next_action's
+        # first line, before either fire site; incrementing it later makes
+        # every background skip one row late.
         if self._merge != "aligned":
             return 0
-        # round(), not int(): elapsed time is real-valued and the row that
-        # should execute next is the nearest tick, not whichever one a
-        # floor happens to land on -- int() truncation biases the skip low
-        # by one row whenever elapsed time lands just under a tick boundary.
-        elapsed = round((self._clock() - fired_at) * self._fps)
-        return max(0, elapsed + self._queue.qsize() - 1)
+        return self._calls - fired_tick
 
-    async def _infer_and_merge(self, fired_at: float) -> None:
+    async def _infer_and_merge(self, fired_at: float, fired_tick: int) -> None:
         try:
             processed = await self._infer()
-            skip = self._aligned_skip(fired_at)
-            skipped = _validate_and_merge(self._queue, processed, self._actions_per_chunk, skip)
+            skip = self._aligned_skip(fired_tick)
+            skipped = _validate_and_merge(
+                self._queue,
+                processed,
+                self._actions_per_chunk,
+                skip,
+                replace=self._merge == "aligned",
+                blend_ticks=self._blend_ticks,
+                blend_dims=self._blend_dims,
+            )
             self.dropped_stale_rows += skipped
         except asyncio.CancelledError:
             raise

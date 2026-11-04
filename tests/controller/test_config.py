@@ -210,6 +210,26 @@ def test_rejects_aligned_merge_with_sequential_mode():
         ControllerConfig.parse({**BASE, "mode": "sequential", "merge": "aligned"})
 
 
+def test_blend_ticks_defaults_to_zero():
+    assert ControllerConfig.parse(dict(BASE)).blend_ticks == 0
+
+
+def test_blend_ticks_accepted_with_aligned():
+    cfg = ControllerConfig.parse({**BASE, "mode": "async", "merge": "aligned", "blend_ticks": 3})
+    assert cfg.blend_ticks == 3
+
+
+def test_rejects_blend_ticks_without_aligned():
+    with pytest.raises(ConfigError, match="blend_ticks"):
+        ControllerConfig.parse({**BASE, "mode": "async", "blend_ticks": 3})
+
+
+def test_rejects_negative_or_fractional_blend_ticks():
+    for bad in (-1, 2.5):
+        with pytest.raises(ConfigError, match="blend_ticks"):
+            ControllerConfig.parse({**BASE, "mode": "async", "merge": "aligned", "blend_ticks": bad})
+
+
 # ---------------------------------------------------------------------------
 # arm_write / stream_hz
 # ---------------------------------------------------------------------------
