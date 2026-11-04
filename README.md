@@ -749,9 +749,13 @@ driver and the clock anchored within 3 ms; 0.05 is the starting value there.
 
 Requirements and fallback: `viam-sdk` >= 0.82.0, which this module already
 depends on, and an xArm module at or after `d83b4d9` (2026-09-15). `"setpoint"` stays
-the default and the fallback. The per-tick safety clamp applies identically on both
-paths: every interpolated point lies between two already-clamped targets, so streaming
-changes how often a target is sent, not how far it may move.
+the default and the fallback. The safety clamp enforces the same `max_vel_degs_per_sec`
+on both paths: every interpolated point lies between two already-clamped targets, so
+streaming changes how often a target is sent, not how fast it may move. The clamp
+measures a target against the arm's position now, and a streamed target is sampled
+`2/fps + stream_lead_s` ahead rather than `1/fps`, so its per-tick allowance is scaled
+by that many ticks (logged at configure time). Unscaled, 120 °/s on an SO-101 clamped
+motion at roughly 40–55 °/s.
 
 ### Full worked example
 

@@ -62,6 +62,7 @@ config parsing has no access to the arm.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 import time
@@ -270,6 +271,15 @@ class VLAController(Generic, EasyResource):
                 "(no max_vel_degs_per_sec configured)",
                 s.max_joint_delta_degs,
                 self._cfg.fps,
+            )
+        ticks_ahead = self._sample_lead_s() * self._cfg.fps
+        if ticks_ahead != 1.0:
+            LOGGER.info(
+                "safety: targets are sampled %.3f ticks ahead under arm_write=%s, so the "
+                "delta clamp allows %.6f deg against the measured position",
+                ticks_ahead,
+                self._cfg.arm_write,
+                s.max_joint_delta_degs * ticks_ahead,
             )
 
     def _log_cartesian_budget(self) -> None:
@@ -510,10 +520,30 @@ class VLAController(Generic, EasyResource):
             return DELTA_EE_ACTION_DIM
         return int(specs["action_dim"]) - (1 if gripper.in_state else 0)
 
+    def _sample_lead_s(self) -> float:
+        """How far past a tick's nominal start its target is sampled.
+
+        It is the instant the target is due at the arm: a setpoint is reached
+        within the tick; ArmStream stamps a tick's final point nominal + lead +
+        n*step = nominal + 2/fps. A streamed point is written at its stamp, so
+        stream_lead_s samples further ahead for the servo to respond in; the
+        stamps are unchanged.
+        """
+        cfg = self._cfg
+        if cfg.arm_write == "stream":
+            return 2.0 / cfg.fps + cfg.stream_lead_s
+        return 1.0 / cfg.fps
+
     def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer | CartesianSafetyLayer:
         s = self._cfg.safety
         if self._cfg.action_space == DELTA_EE:
             return CartesianSafetyLayer(s)
+        # The delta clamp measures a target against where the arm is now, and
+        # the target is sampled _sample_lead_s() ahead. max_joint_delta_degs is
+        # a per-tick budget (max_vel / fps), so scale it by that many ticks, or
+        # under stream max_vel_degs_per_sec would cap motion at a third of itself.
+        ticks_ahead = self._sample_lead_s() * self._cfg.fps
+        s = dataclasses.replace(s, max_joint_delta_degs=s.max_joint_delta_degs * ticks_ahead)
         return SafetyLayer(s, gripper_in_degrees=not gripper.has_normalized_tail)
 
     def _check_action_dim(self, specs: dict[str, Any], gripper: GripperAdapter) -> None:
@@ -822,15 +852,7 @@ class VLAController(Generic, EasyResource):
         schedule = self._schedule = TickSchedule(
             1.0 / cfg.fps, self._clock, catch_up=cfg.arm_write == "stream"
         )
-        # A target is sampled at the instant it is due at the arm: ArmStream
-        # stamps a tick's final point nominal + lead + n*step = nominal + 2/fps,
-        # and a setpoint is reached within the tick. A streamed point is written
-        # at its stamp, so stream_lead_s samples further ahead for the servo to
-        # respond in; the stamps are unchanged.
-        if self._stream is not None:
-            lead = 2.0 / cfg.fps + cfg.stream_lead_s
-        else:
-            lead = 1.0 / cfg.fps
+        lead = self._sample_lead_s()
         delta_ee = cfg.action_space == DELTA_EE
         first = True
         last_tick = self._clock()

@@ -2625,3 +2625,30 @@ async def test_status_buffer_horizon_is_the_plan_left():
     await svc.do_command({"command": "stop"})
     assert 0 < status["buffer_horizon_s"] <= 3.5
     assert status["staleness_s"] > 0
+
+
+@pytest.mark.parametrize(
+    "write,lead,ticks_ahead",
+    [({}, 0.0, 1.0), ({"arm_write": "stream", "stream_hz": 100.0}, 0.0, 2.0),
+     ({"arm_write": "stream", "stream_hz": 100.0}, 0.05, 3.0)],
+)
+async def test_the_delta_clamp_allows_the_velocity_over_however_far_ahead_targets_are(
+    write, lead, ticks_ahead
+):
+    # The clamp measures a target against the arm's position now, and a
+    # streamed target is sampled 2/fps + stream_lead_s ahead, not 1/fps. A
+    # per-tick budget there caps real motion at a fraction of
+    # max_vel_degs_per_sec (SO-101: 120 deg/s clamped at ~40-55 deg/s).
+    arm = FakeArm(positions=[0.0] * 6)
+    config = _config(
+        fps=20.0,
+        safety={"max_start_delta_degs": 1000.0, "max_vel_degs_per_sec": 120.0},
+        **write,
+        **({"stream_lead_s": lead} if lead else {}),
+    )
+    svc = _svc(config=config, deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_state(svc, "running")
+    budget = svc._safety.limits.max_joint_delta_degs
+    await svc.do_command({"command": "stop"})
+    assert budget == pytest.approx(120.0 / 20.0 * ticks_ahead)
