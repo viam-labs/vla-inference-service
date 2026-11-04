@@ -593,7 +593,9 @@ What to read it for:
 #### `trace`
 
 The per-tick record of the last run: `fps`, then parallel arrays `nominal_t`, `sample_t`
-(the reference time each target was sampled at), `commanded`, `measured` and `clamped`.
+(the reference time each target was sampled at), `commanded`, `measured`, `clamped` and
+`send_t` (when the target was handed to the arm; under `arm_write: "stream"`, the first
+row's `send_t - nominal_t` is how late the driver's clock starts against the stamps).
 It answers "was that jerk the policy, the seam, or the clamp?" after the fact. Fetch it
 right after a run, before the next `start`, which clears it. `tools/dump_trace.py` turns
 it into CSV:

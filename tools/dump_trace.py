@@ -5,7 +5,7 @@
     tools/dump_trace.py --address $FQDN --service vla-controller > run.csv
 
 Run it right after a run, before the next `start` (which clears the trace).
-Columns: nominal_t, [sample_t], cmd0..cmdN, meas0..measN, clamped.
+Columns: nominal_t, [sample_t], cmd0..cmdN, meas0..measN, clamped, [send_t].
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ def write_csv(trace: dict, out) -> int:
     n = len(trace["nominal_t"])
     dof = len(trace["commanded"][0]) if n else 0
     has_sample = "sample_t" in trace
+    has_send = "send_t" in trace
     w = csv.writer(out)
     w.writerow(
         ["nominal_t"]
@@ -42,6 +43,7 @@ def write_csv(trace: dict, out) -> int:
         + [f"cmd{j}" for j in range(dof)]
         + [f"meas{j}" for j in range(dof)]
         + ["clamped"]
+        + (["send_t"] if has_send else [])
     )
     for i in range(n):
         w.writerow(
@@ -50,6 +52,7 @@ def write_csv(trace: dict, out) -> int:
             + list(trace["commanded"][i])
             + list(trace["measured"][i])
             + [int(bool(trace["clamped"][i]))]
+            + ([trace["send_t"][i]] if has_send else [])
         )
     return sum(bool(c) for c in trace["clamped"])
 

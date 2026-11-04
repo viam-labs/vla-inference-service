@@ -182,10 +182,13 @@ class VLAController(Generic, EasyResource):
         # due at the arm (nominal_t + 2/fps streamed, + 1/fps setpoint, unless the
         # tick re-anchored between the two reads). `measured` is read before
         # `commanded` is sent, so line up measured[i+1] against commanded[i]. Joint
-        # space only: delta-ee records nothing. Every value is already in hand in
-        # _command_joints, so recording costs no RPC. Dumped by the `trace` DoCommand
-        # (tools/dump_trace.py).
-        self._trace: deque[tuple[float, float, list[float], list[float], bool]] = deque(
+        # space only: delta-ee records nothing. send_t is the clock just before the
+        # target is handed to the arm (queued, under stream); send_t - nominal_t is
+        # the reads' share of the tick, and on a stream's first row, how late the
+        # driver's clock is anchored against the stamps. Every value is already in
+        # hand in _command_joints, so recording costs no RPC. Dumped by the `trace`
+        # DoCommand (tools/dump_trace.py).
+        self._trace: deque[tuple[float, float, list[float], list[float], bool, float]] = deque(
             maxlen=3000
         )
         self._measured_fps = 0.0
@@ -340,6 +343,7 @@ class VLAController(Generic, EasyResource):
             "commanded": [r[2] for r in rows],
             "measured": [r[3] for r in rows],
             "clamped": [r[4] for r in rows],
+            "send_t": [r[5] for r in rows],
         }
 
     def _status(self) -> dict[str, Any]:
@@ -995,13 +999,15 @@ class VLAController(Generic, EasyResource):
             # tick more than a period late re-anchors in this call, which keeps
             # the first stamp (nominal + lead + step) at least `step` in the future.
             nominal_t = nominal()
+            send_t = self._clock()
             await self._stream.send(target, nominal_t)
         else:
             nominal_t = nominal()
+            send_t = self._clock()
             await arm.move_to_joint_positions(
                 JointPositions(values=target), extra=dict(cfg.arm_move_extra)
             )
-        self._trace.append((nominal_t, sample_t, target, measured, clamped))
+        self._trace.append((nominal_t, sample_t, target, measured, clamped, send_t))
         if gripper.has_normalized_tail:
             await gripper.write(float(safe[-1]))
 

@@ -1606,7 +1606,9 @@ async def test_overlap_regime_end_to_end_commands_the_arm():
     policy = FakePolicyClient(n=50)
     svc = _svc(config=_config(fps=50.0, margin_s=0.5), deps=_deps(policy=policy, arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
-    await _wait_until(lambda: policy.infer_calls >= 2, "a second inference", timeout=1.5)
+    # Call 1 is the controller's warm-up and call 2 the first fill, so call 3
+    # is the one poll() fires mid-plan.
+    await _wait_until(lambda: policy.infer_calls >= 3, "a poll-fired inference", timeout=1.5)
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
     assert status["regime"] == "overlap"
@@ -2517,6 +2519,28 @@ async def test_trace_records_the_sample_time():
     # setpoint mode samples one tick ahead of the tick's nominal start
     for nominal, sample in zip(trace["nominal_t"], trace["sample_t"]):
         assert sample == pytest.approx(nominal + 1 / 50.0)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_trace_records_when_each_target_was_sent(stream):
+    # The send lags the tick's nominal start by the reads before it. Under
+    # stream, the first row's lag is how late the driver's clock is anchored.
+    class SlowReadArm(FakeArm):
+        async def get_joint_positions(self, **kwargs):
+            await asyncio.sleep(0.015)
+            return await super().get_joint_positions(**kwargs)
+
+    arm = SlowReadArm(positions=[0.0] * 6)
+    config = _stream_config() if stream else _config(fps=20.0)
+    svc = _svc(config=config, deps=_deps(policy=FakePolicyClient(n=8), arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    done = (lambda: len(arm.stream_points) > 10) if stream else (lambda: len(arm.moves) >= 3)
+    await _wait_until(done, "a few ticks")
+    await svc.do_command({"command": "stop"})
+    trace = await svc.do_command({"command": "trace"})
+    assert len(trace["send_t"]) == len(trace["nominal_t"]) >= 2
+    for nominal, sent in zip(trace["nominal_t"], trace["send_t"]):
+        assert sent - nominal >= 0.015
 
 
 async def test_buffer_gets_blend_and_holds_the_gripper_column():
