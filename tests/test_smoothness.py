@@ -26,6 +26,7 @@ from tests.smoothness import (
     landing_obs_age,
     lead_error,
     long_gaps,
+    reference,
     residual,
     residual_accel,
     run_session,
@@ -265,3 +266,21 @@ def test_a_slow_warm_up_neither_picks_the_regime_nor_skews_timing():
     assert s.status["rebases"] == 1, s.status
     assert s.status["expected_latency_s"] < 1.0, s.status
     assert s.status["timing"]["round_trip_s"] < 1.0, s.status
+
+
+def test_stream_lead_s_writes_each_point_from_that_far_ahead_on_the_plan():
+    # A driver writes each point at its stamp, so a servo that takes time to
+    # respond arrives late. stream_lead_s samples the plan that far past the
+    # stamp: the executed point is the reference at stamp + lead. A whole row
+    # (PERIOD) keeps samples on rows; between rows, linear interpolation of the
+    # sinusoid alone is off by up to h^2/8 * |f''| ~ 0.015 deg.
+    lead = PERIOD
+    s = run_session(
+        latency_s=0.33, blend_s=0.0, smooth_rows=0, arm_write="stream", stream_lead_s=lead
+    )
+    _assert_healthy(s)
+    t, res = residual(s, after=s.policy.reply_times[1] + 3 * PERIOD)
+    expected = np.array([reference(ti + lead) - reference(ti) for ti in t])
+    assert len(t) > 100
+    assert np.abs(res - expected).max() <= 1e-4
+    assert np.abs(expected).max() > 0.1  # the lead is visible, not lost in noise

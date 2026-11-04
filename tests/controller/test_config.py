@@ -975,3 +975,13 @@ def test_delta_ee_defaults_smoothing_off_and_refuses_it():
     assert ControllerConfig.parse(DELTA_EE_BASE).smooth_rows == 0
     with pytest.raises(ConfigError, match="smooth_rows"):
         ControllerConfig.parse({**DELTA_EE_BASE, "smooth_rows": 5})
+
+
+def test_stream_lead_s_defaults_to_zero_and_needs_stream():
+    stream = {**BASE, "arm_write": "stream", "fps": 20.0}
+    assert ControllerConfig.parse(stream).stream_lead_s == 0.0
+    assert ControllerConfig.parse({**stream, "stream_lead_s": 0.05}).stream_lead_s == 0.05
+    with pytest.raises(ConfigError, match="stream_lead_s"):
+        ControllerConfig.parse({**stream, "stream_lead_s": -0.01})
+    with pytest.raises(ConfigError, match="stream_lead_s"):
+        ControllerConfig.parse({**BASE, "stream_lead_s": 0.05})

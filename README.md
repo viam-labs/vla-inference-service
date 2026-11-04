@@ -338,6 +338,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `arm_move_extra` | object | `{"wait": false, "waitAtEnd": false, "interpolate": false}` | The `extra` struct sent with every `move_to_joint_positions`. Replaces the default wholesale; `{}` sends nothing. See [Arm writes do not wait for settle](#arm-writes-do-not-wait-for-settle). |
 | `arm_write` | `setpoint` \| `stream` | `"setpoint"` | `joints` only. `"stream"` feeds the arm's servo mode at `stream_hz` instead of one setpoint per tick — see [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
 | `stream_hz` | number | `100.0` | `arm_write: "stream"` only. Must be ≥ `fps` — interpolation needs at least one point per tick. Rounded to a whole number of points per tick, so the actual rate is that count × `fps`, not `stream_hz` itself — `100` at `fps: 30` runs at 90 Hz. |
+| `stream_lead_s` | number, 0–1 | `0` | `arm_write: "stream"` only. How far ahead of its stamp each streamed point is sampled, to cover the servo's response time. See [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
 | `safety.max_joint_delta_degs` | number | `8.0` | `joints` only. Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
@@ -737,6 +738,14 @@ Nothing is sent until the first tick, so a driver without the RPC is refused the
 before the arm has moved. `arm_move_extra` goes once, as the stream's `extra`. `stop`
 and any run-ending error half-close the stream, and the driver waits for the arm to
 stop before the RPC ends.
+
+Servo response: the driver writes each point at its stamp, and the stamp is the
+moment the point is due, so the servo only starts toward it then and arrives late
+by its response time. A setpoint has no such gap: it is sent a tick before it is
+due. `stream_lead_s` samples each point that many seconds further ahead on the plan;
+the stamps do not move. Measured on an SO-101, streamed points arrived 38–56 ms late
+on most joints against 16–36 ms for setpoints, with no late points reported by the
+driver and the clock anchored within 3 ms; 0.05 is the starting value there.
 
 Requirements and fallback: `viam-sdk` >= 0.82.0, which this module already
 depends on, and an xArm module at or after `d83b4d9` (2026-09-15). `"setpoint"` stays

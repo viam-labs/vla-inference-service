@@ -824,8 +824,13 @@ class VLAController(Generic, EasyResource):
         )
         # A target is sampled at the instant it is due at the arm: ArmStream
         # stamps a tick's final point nominal + lead + n*step = nominal + 2/fps,
-        # and a setpoint is reached within the tick.
-        lead = (2.0 if self._stream is not None else 1.0) / cfg.fps
+        # and a setpoint is reached within the tick. A streamed point is written
+        # at its stamp, so stream_lead_s samples further ahead for the servo to
+        # respond in; the stamps are unchanged.
+        if self._stream is not None:
+            lead = 2.0 / cfg.fps + cfg.stream_lead_s
+        else:
+            lead = 1.0 / cfg.fps
         delta_ee = cfg.action_space == DELTA_EE
         first = True
         last_tick = self._clock()

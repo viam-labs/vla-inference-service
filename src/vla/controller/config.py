@@ -47,6 +47,9 @@ The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
 servo setpoints over `move_through_joint_positions_streamed`; one setpoint per
 tick buzzes on the xArm. `"setpoint"` stays the default for drivers without the
 RPC. The real rate is `round(stream_hz / fps) * fps` (100 at 30 fps runs at 90 Hz).
+A driver writes each streamed point at its stamp, so a servo that takes time to
+respond arrives late; `stream_lead_s` (default 0, stream only) samples each
+point from that far ahead on the plan to give it that time.
 README: "Smooth servo streaming".
 """
 
@@ -526,6 +529,9 @@ class ControllerConfig:
     action_space: str = JOINTS
     arm_write: str = "setpoint"
     stream_hz: float = 100.0
+    # Seconds ahead of its stamp each streamed point is sampled: the servo's
+    # response time, which a point written at its stamp otherwise arrives late by.
+    stream_lead_s: float = 0.0
     # Operator-configurable rather than fixed module defaults: a checkpoint
     # run at 2 Hz and one at 10 Hz imply very different "this tick is late"
     # and "this frame is stale" thresholds. Defaults match observation.py's
@@ -624,6 +630,14 @@ class ControllerConfig:
 
         arm_write = as_choice(raw.get("arm_write", "setpoint"), "arm_write", ARM_WRITES)
         stream_hz = as_float(raw.get("stream_hz", 100.0), "stream_hz", minimum=1.0, maximum=1000.0)
+        stream_lead_s = as_float(
+            raw.get("stream_lead_s", 0.0), "stream_lead_s", minimum=0.0, maximum=1.0
+        )
+        if stream_lead_s and arm_write != "stream":
+            raise ConfigError(
+                f'stream_lead_s={stream_lead_s} only applies to arm_write="stream": a setpoint '
+                "is already sent a tick before it is due. Remove it."
+            )
         if arm_write == "stream":
             if stream_hz < fps:
                 raise ConfigError(
@@ -690,6 +704,7 @@ class ControllerConfig:
             action_space=action_space,
             arm_write=arm_write,
             stream_hz=stream_hz,
+            stream_lead_s=stream_lead_s,
             arm_move_extra=_parse_arm_move_extra(raw.get("arm_move_extra")),
             duration_warn_s=as_float(
                 raw.get("duration_warn_s", DEFAULT_DURATION_WARN_S), "duration_warn_s", minimum=0.0
