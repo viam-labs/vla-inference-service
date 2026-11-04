@@ -358,8 +358,6 @@ class VLAController(Generic, EasyResource):
 
     def _status(self) -> dict[str, Any]:
         inf, buf = self._inference, self._buffer
-        now = self._clock()
-        horizon = buf.horizon() if buf else -math.inf
         return {
             "state": self._state,
             # Observation-to-landing, recent mean: what the trigger plans around.
@@ -368,16 +366,6 @@ class VLAController(Generic, EasyResource):
             # "overlap" fires on buffer time; "sequential" waits for the plan to run
             # out and observes at rest, because latency is too close to the chunk.
             "regime": inf.regime if inf else "",
-            # Plan left past now; 0 before any chunk, once the plan has run out,
-            # and while a fresh chunk awaits its first sample (a rebase has no
-            # times until it is pinned).
-            "buffer_horizon_s": max(0.0, horizon - now) if math.isfinite(horizon) else 0.0,
-            # Age of the observation behind the sample just commanded.
-            "staleness_s": (
-                now - buf.sampled_obs_t if buf and buf.sampled_obs_t is not None else 0.0
-            ),
-            # Blend window actually used at the last landing; 0 on a rebase.
-            "overlap_s": buf.overlap_s if buf else 0.0,
             "rebases": buf.rebases if buf else 0,
             "skipped_rows": buf.skipped_rows if buf else 0,
             "timing": self._timing_status(),

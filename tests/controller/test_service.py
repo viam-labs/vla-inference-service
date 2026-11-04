@@ -19,6 +19,7 @@ has no enforcement path on this SDK.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import math
 
@@ -177,9 +178,12 @@ def _deps(policy=None, arm=None, camera=None, **extra):
     return deps
 
 
-def _svc(config=None, deps=None):
+def _svc(config=None, deps=None, **timing):
+    """`timing` overrides fixed ControllerConfig fields (margin_s, ...) after parse."""
     svc = VLAController("c")
     svc.reconfigure(config or _config(), deps or _deps())
+    if timing:
+        svc._cfg = dataclasses.replace(svc._cfg, **timing)
     return svc
 
 
@@ -1352,9 +1356,6 @@ async def test_status_reports_every_documented_field():
         "avg_latency_s",
         "expected_latency_s",
         "regime",
-        "buffer_horizon_s",
-        "staleness_s",
-        "overlap_s",
         "rebases",
         "skipped_rows",
         "measured_fps",
@@ -1604,7 +1605,7 @@ async def test_overlap_regime_end_to_end_commands_the_arm():
     # request about halfway through it, while the plan still runs.
     arm = FakeArm(positions=[0.0] * 6)
     policy = FakePolicyClient(n=50)
-    svc = _svc(config=_config(fps=50.0, margin_s=0.5), deps=_deps(policy=policy, arm=arm))
+    svc = _svc(config=_config(fps=50.0), margin_s=0.5, deps=_deps(policy=policy, arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
     # Call 1 is the controller's warm-up and call 2 the first fill, so call 3
     # is the one poll() fires mid-plan.
@@ -1721,7 +1722,8 @@ async def test_stop_cancels_a_background_inference_not_on_the_call_stack():
     # half the plan left, so the loop is still sampling, not in wait(), at stop.
     policy = ControllablePolicy(n=100)
     svc = _svc(
-        config=_config(fps=100.0, margin_s=0.5),
+        config=_config(fps=100.0),
+        margin_s=0.5,
         deps=_deps(policy=policy, arm=arm),
     )
     await svc.do_command({"command": "start", "task": "t"})
@@ -2475,8 +2477,7 @@ async def test_status_reports_the_time_axis():
     await _wait_for_first_move(svc._deps["a"])
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
-    for key in ("expected_latency_s", "regime", "buffer_horizon_s", "staleness_s",
-                "overlap_s", "rebases", "skipped_rows"):
+    for key in ("expected_latency_s", "regime", "rebases", "skipped_rows"):
         assert key in status, key
     assert status["rebases"] >= 1
     assert status["regime"] in ("overlap", "sequential")
@@ -2503,7 +2504,7 @@ async def test_a_failed_warm_up_is_logged_and_the_run_starts_anyway(caplog):
 async def test_a_hung_policy_fails_the_run_after_inference_timeout_s():
     policy = FakePolicyClient()
     policy.infer_delay_s = 60.0
-    svc = _svc(config=_config(inference_timeout_s=0.05), deps=_deps(policy=policy))
+    svc = _svc(config=_config(), inference_timeout_s=0.05, deps=_deps(policy=policy))
     await svc.do_command({"command": "start", "task": "t"})
     status = await _wait_for_state(svc, "error")
     assert "did not land" in status["last_error"]
@@ -2545,7 +2546,8 @@ async def test_trace_records_when_each_target_was_sent(stream):
 
 async def test_buffer_gets_blend_and_holds_the_gripper_column():
     svc = _svc(
-        config=_config(blend_s=0.3, gripper=_DO_COMMAND_GRIPPER),
+        config=_config(gripper=_DO_COMMAND_GRIPPER),
+        blend_s=0.3,
         deps=_deps(policy=FakePolicyClient(action_dim=6), g=FakeDoCommandGripper()),
     )
     await svc.do_command({"command": "start", "task": "t"})
@@ -2588,7 +2590,8 @@ async def test_a_failing_run_cancels_the_inference_poll_fired():
 
     # A 1 s chunk and margin_s=0.5: the second request fires mid-plan.
     svc = _svc(
-        config=_config(fps=100.0, margin_s=0.5),
+        config=_config(fps=100.0),
+        margin_s=0.5,
         deps=_deps(policy=policy, arm=FaultingArm(positions=[0.0] * 6)),
     )
     await svc.do_command({"command": "start", "task": "t"})
@@ -2610,21 +2613,6 @@ async def test_the_first_fill_is_not_counted_as_starvation():
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
     assert status["starved_ticks"] == 0
-
-
-async def test_status_buffer_horizon_is_the_plan_left():
-    # Deterministic: fps=2 and n=7 is a 3.5 s chunk, and the second tick is
-    # not due for 0.5 s, so shortly after the first move the plan left is
-    # positive and at most the whole chunk.
-    arm = FakeArm(positions=[0.0] * 6)
-    svc = _svc(config=_config(fps=2.0), deps=_deps(policy=FakePolicyClient(n=7), arm=arm))
-    await svc.do_command({"command": "start", "task": "t"})
-    await _wait_for_first_move(arm)
-    await asyncio.sleep(0.05)
-    status = await svc.do_command({"command": "status"})
-    await svc.do_command({"command": "stop"})
-    assert 0 < status["buffer_horizon_s"] <= 3.5
-    assert status["staleness_s"] > 0
 
 
 @pytest.mark.parametrize(

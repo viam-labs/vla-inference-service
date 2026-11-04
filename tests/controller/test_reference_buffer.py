@@ -57,7 +57,6 @@ def test_hard_switch_replaces_everything_after_the_last_sample():
     b.land(ramp(10, start=100.0), t_obs=1.5 * P)  # rows at 2.5P, 3.5P, ...
     np.testing.assert_array_equal(b.sample(2.5 * P), [100, 100])
     np.testing.assert_array_equal(b.sample(3.5 * P), [101, 101])
-    assert b.overlap_s == 0.0
     assert b.rebases == 1
 
 
@@ -68,7 +67,6 @@ def test_crossfade_ramps_old_to_new_with_smoothstep_from_the_last_sample():
     b.land(np.ones((20, 1)), t_obs=P)  # rows at 2P, 3P, ...; seam at P
     for t, x in [(2 * P, 0.25), (3 * P, 0.5), (4 * P, 0.75), (5 * P, 1.0), (9 * P, 1.0)]:
         np.testing.assert_allclose(b.sample(t), [smooth(x)], atol=1e-12)
-    assert b.overlap_s == 4 * P
 
 
 def test_an_old_plan_ending_inside_the_window_is_held_not_dropped():
@@ -79,7 +77,6 @@ def test_an_old_plan_ending_inside_the_window_is_held_not_dropped():
     # At 5P the old plan ended at 2P with value 2: blend against 2, not 0.
     w = smooth(0.5)
     np.testing.assert_allclose(b.sample(5 * P), [w * 10 + (1 - w) * 2], atol=1e-12)
-    assert b.overlap_s == P
 
 
 def test_held_columns_switch_at_the_seam_and_never_interpolate():
@@ -146,16 +143,6 @@ def test_land_twice_before_any_sample_keeps_the_newest_chunk():
     b.land(ramp(3, start=9.0, cols=1), 0.0)
     np.testing.assert_array_equal(b.sample(1.0), [9.0])
     assert b.rebases == 1
-
-
-def test_sampled_obs_t_names_the_observation_behind_the_sample():
-    b = ReferenceBuffer(FPS, blend_s=0.0)
-    b.land(ramp(10), 0.0)
-    b.sample(P)
-    assert b.sampled_obs_t == 0.0
-    b.land(ramp(10), t_obs=2 * P)
-    b.sample(4 * P)
-    assert b.sampled_obs_t == 2 * P
 
 
 @pytest.mark.parametrize(

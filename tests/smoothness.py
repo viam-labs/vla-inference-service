@@ -11,7 +11,7 @@ import asyncio
 import selectors
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 from google.protobuf.struct_pb2 import Struct
@@ -264,6 +264,9 @@ class Session:
     fps: float
 
 
+TIMING = ("blend_s", "margin_s", "inference_timeout_s")
+
+
 def run_session(
     *, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), fps=FPS, row_noise=0.0, warmup_s=0.0,
     **config,
@@ -278,7 +281,10 @@ def run_session(
         )
         svc = VLAController("c")
         svc._clock = loop.time
+        timing = {k: config.pop(k) for k in TIMING if k in config}
         svc.reconfigure(_config(fps=fps, **config), {"p": policy, "a": arm, "cam": FakeCamera()})
+        # Fixed by parse(), so set on the parsed config.
+        svc._cfg = replace(svc._cfg, **timing)
         await svc.do_command({"command": "start", "task": "t"})
         await asyncio.sleep(duration_s)
         status = await svc.do_command({"command": "status"})

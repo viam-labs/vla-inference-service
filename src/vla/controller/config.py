@@ -30,16 +30,11 @@ state layout is the kind of config an operator reasonably assumes is in
 force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `"joints"` for the same reason.
 
-`blend_s` is how long a landing chunk takes to crossfade in from the plan it
-replaces, in seconds on the buffer's time axis (0 replaces outright); it
-defaults to two ticks, and to 0 under `"delta-ee"`, whose rows are per-tick
-deltas that cannot be blended. `margin_s` is the extra lead the inference
-trigger keeps beyond the expected latency and the blend. `smooth_rows` (default
-7, 0 under `"delta-ee"`) filters each landing chunk with a zero-phase quadratic
-fit over that many rows, removing tick-to-tick jitter in the policy's output
-without lag. `inference_timeout_s`
-bounds a wait for a chunk once the plan has run out, so a hung policy fails the
-tick (and the run, under the default `stop_on_error`) instead of hanging it. See `reference_buffer.py` and `inference_loop.py`.
+`smooth_rows` (default 7, 0 under `"delta-ee"`) filters each landing chunk
+with a zero-phase quadratic fit over that many rows, removing tick-to-tick
+jitter in the policy's output without lag. The crossfade (`blend_s`), the
+trigger's lead (`margin_s`) and `inference_timeout_s` are fixed by parse(), not
+configured; see `reference_buffer.py` and `inference_loop.py`.
 The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
 `actions_per_chunk`) are refused with their replacement; see `REMOVED_KEYS`.
 
@@ -95,9 +90,9 @@ ARM_WRITES = ("setpoint", "stream")
 REMOVED_KEYS = {
     "mode": "inference overlaps execution, and runs whole chunks on its own when "
     "latency approaches the chunk duration",
-    "merge": "chunks merge on the time axis; set blend_s (0 replaces outright)",
-    "blend_ticks": "use blend_s, in seconds (blend_ticks / fps)",
-    "queue_threshold": "inference fires on the buffer's remaining time; tune margin_s",
+    "merge": "chunks merge on the time axis with a two-tick crossfade",
+    "blend_ticks": "the crossfade is fixed at two ticks",
+    "queue_threshold": "inference fires on the buffer's remaining time and measured latency",
     "actions_per_chunk": "every row keeps its own time, so there is nothing to truncate",
 }
 
@@ -176,7 +171,7 @@ def _parse_arm_move_extra(raw: Any) -> dict[str, Any]:
 
 
 # Sanity ceilings/floors, not physical limits: they turn an obvious typo (a
-# negative fps, a negative blend_s) into a config-time error.
+# negative fps, a negative stream_lead_s) into a config-time error.
 _MIN_FPS = 1e-6
 _MAX_FPS = 1000.0
 _MIN_POSITIVE_DEG = 1e-6
@@ -502,10 +497,11 @@ class ControllerConfig:
     gripper: dict[str, Any] = field(default_factory=lambda: {"type": "none"})
     task: str = ""
     fps: float = 10.0
-    # Seconds a landing chunk takes to crossfade in from the old plan (0 replaces
-    # outright); parse() defaults it to 2/fps, or 0 under delta-ee.
+    # Not configurable: parse() sets these three. Seconds a landing chunk takes
+    # to crossfade in from the old plan: 2/fps, or 0 under delta-ee (deltas
+    # cannot be blended).
     blend_s: float = 0.2
-    # Extra lead on the inference trigger beyond the expected latency and blend.
+    # Extra lead on the inference trigger beyond the expected latency and blend: 2/fps.
     margin_s: float = 0.2
     # Rows in the zero-phase quadratic filter applied to each chunk on landing
     # (0 or 1: off); parse() defaults it to 7, or 0 under delta-ee.
@@ -604,15 +600,6 @@ class ControllerConfig:
                     f"expected {expected} (one per action dimension in degrees)"
                 )
 
-        blend_s = as_float(
-            raw.get("blend_s", 0.0 if delta_ee else 2.0 / fps), "blend_s", minimum=0.0
-        )
-        if delta_ee and blend_s:
-            raise ConfigError(
-                f"blend_s={blend_s} is not supported under action_space={DELTA_EE!r}: its rows "
-                "are per-tick deltas, and blending two would apply part of each. Remove it."
-            )
-        margin_s = as_float(raw.get("margin_s", 2.0 / fps), "margin_s", minimum=0.0)
         smooth_rows = as_int(raw.get("smooth_rows", 0 if delta_ee else 7), "smooth_rows", minimum=0)
         if smooth_rows and smooth_rows % 2 == 0:
             raise ConfigError(
@@ -624,10 +611,6 @@ class ControllerConfig:
                 "rows are per-tick deltas, and smoothing them would change how far the arm moves. "
                 "Remove it."
             )
-        inference_timeout_s = as_float(
-            raw.get("inference_timeout_s", 30.0), "inference_timeout_s", minimum=0.001
-        )
-
         arm_write = as_choice(raw.get("arm_write", "setpoint"), "arm_write", ARM_WRITES)
         stream_hz = as_float(raw.get("stream_hz", 100.0), "stream_hz", minimum=1.0, maximum=1000.0)
         stream_lead_s = as_float(
@@ -658,10 +641,9 @@ class ControllerConfig:
             gripper=gripper,
             task=as_str(raw.get("task", ""), "task"),
             fps=fps,
-            blend_s=blend_s,
-            margin_s=margin_s,
+            blend_s=0.0 if delta_ee else 2.0 / fps,
+            margin_s=2.0 / fps,
             smooth_rows=smooth_rows,
-            inference_timeout_s=inference_timeout_s,
             starvation_grace_ticks=as_int(
                 raw.get("starvation_grace_ticks", 3), "starvation_grace_ticks", minimum=0
             ),

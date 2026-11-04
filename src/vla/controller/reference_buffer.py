@@ -3,8 +3,7 @@
 Row i of a chunk inferred from an observation at `t_obs` means "be here at
 `t_obs + (i + 1) / fps`". The controller samples the buffer at the instant a
 target is due at the arm instead of popping one row per tick, so skipping stale
-rows, blending a seam, and reporting staleness in seconds all fall out of the
-time axis instead of being reconstructed from tick counts.
+rows and blending a seam fall out of the time axis instead of being reconstructed from tick counts.
 
 Two landing paths:
 
@@ -94,15 +93,12 @@ class ReferenceBuffer:
         self._consume = consume
         self.times = np.empty(0)
         self.rows: np.ndarray | None = None
-        self.obs_t = np.empty(0)
         self.last_sampled = -math.inf
         # Set by a rebase: the time on the new chunk's axis that the next
         # sample pins to. None once pinned.
         self._pin: float | None = None
         self.rebases = 0
-        self.overlap_s = 0.0
         self.skipped_rows = 0
-        self.sampled_obs_t: float | None = None
         # Set when exhausted() reports the plan ran out, so the next landing
         # rebases even if the last sample fell a hair before the last row:
         # comparing times[-1] with last_sampled alone would send that landing
@@ -158,29 +154,28 @@ class ReferenceBuffer:
             # einsum, not `@`: macOS Accelerate's BLAS matmul raises spurious
             # "divide by zero" FP warnings on these small products.
             rows[:, :n] = np.einsum("ij,jk->ik", w, rows[:, :n])
-        obs = np.full(chunk.shape[0], float(t_obs))
         if (
             self._ran_out
             or self._pin is not None
             or not len(self.times)
             or self.times[-1] <= self.last_sampled
         ):
-            self._rebase(times, rows, obs, t_obs)
+            self._rebase(times, rows, t_obs)
         else:
-            self._crossfade(times, rows, obs)
+            self._crossfade(times, rows)
 
-    def _rebase(self, times, rows, obs, t_obs: float) -> None:
+    def _rebase(self, times, rows, t_obs: float) -> None:
         was_pinned = self._pin is not None
         self._ran_out = False
         freeze = max(self.last_sampled, t_obs + self._period)
         if freeze > times[-1]:
             # Every row is motion the arm already made along the old plan.
-            self._set(np.empty(0), None, np.empty(0))
+            self._set(np.empty(0), None)
             self._pin = None
             return
         if self._consume:
             keep = times >= freeze
-            times, rows, obs = times[keep], rows[keep], obs[keep]
+            times, rows = times[keep], rows[keep]
         else:
             # Start exactly at the freeze point, so the arm resumes from the
             # chunk's value there rather than a fraction of a row later.
@@ -188,21 +183,19 @@ class ReferenceBuffer:
             first = self._at(times, rows, freeze)
             times = np.concatenate([[freeze], times[keep]])
             rows = np.vstack([first, rows[keep]])
-            obs = np.concatenate([[obs[0]], obs[keep]])
-        self._set(times, rows, obs)
+        self._set(times, rows)
         self._pin = freeze
         if not was_pinned:
             self.rebases += 1
-        self.overlap_s = 0.0
 
-    def _crossfade(self, times, rows, obs) -> None:
+    def _crossfade(self, times, rows) -> None:
         seam = self.last_sampled
         new = times > seam
         if not new.any():
             # Entirely behind what is already commanded, while the old plan
             # still has rows ahead: nothing in it is usable.
             return
-        times, rows, obs = times[new], rows[new], obs[new]
+        times, rows = times[new], rows[new]
         n = self._n_interp(rows)
         if self._blend_s > 0 and n:
             w = _smoothstep((times - seam) / self._blend_s)[:, None]
@@ -211,7 +204,6 @@ class ReferenceBuffer:
                 [np.interp(times, self.times, self.rows[:, c]) for c in range(n)]
             )
             rows[:, :n] = w * rows[:, :n] + (1.0 - w) * old
-        self.overlap_s = min(self._blend_s, max(0.0, float(self.times[-1]) - seam))
         keep = self.times < times[0]
         old_rows = self.rows[keep]  # fancy index: a copy
         # Held columns (the gripper) take the new value from the seam, even on
@@ -220,7 +212,6 @@ class ReferenceBuffer:
         self._set(
             np.concatenate([self.times[keep], times]),
             np.vstack([old_rows, rows]),
-            np.concatenate([self.obs_t[keep], obs]),
         )
 
     # -- sampling --------------------------------------------------------------
@@ -232,9 +223,8 @@ class ReferenceBuffer:
         self._apply_pin(t)
         i = self._index(t)
         out = self._at(self.times, self.rows, t)
-        self.sampled_obs_t = float(self.obs_t[i])
         # No later sample can need anything before row i.
-        self._set(self.times[i:], self.rows[i:], self.obs_t[i:])
+        self._set(self.times[i:], self.rows[i:])
         self.last_sampled = t
         return out
 
@@ -254,8 +244,7 @@ class ReferenceBuffer:
             return None
         self.skipped_rows += due - 1
         row = self.rows[due - 1].copy()
-        self.sampled_obs_t = float(self.obs_t[due - 1])
-        self._set(self.times[due:], self.rows[due:], self.obs_t[due:])
+        self._set(self.times[due:], self.rows[due:])
         return row
 
     # -- helpers ---------------------------------------------------------------
@@ -279,8 +268,8 @@ class ReferenceBuffer:
             out[c] = np.interp(t, times, rows[:, c])
         return out
 
-    def _set(self, times, rows, obs) -> None:
-        self.times, self.obs_t = times, obs
+    def _set(self, times, rows) -> None:
+        self.times = times
         if rows is not None:
             self.rows = rows
         elif self.rows is not None:

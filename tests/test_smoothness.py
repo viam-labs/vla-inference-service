@@ -208,14 +208,12 @@ def test_past_half_the_chunk_switches_to_sequential():
     s = run_session(latency_s=3.03, duration_s=30.0)
     _assert_healthy(s)
     assert s.status["regime"] == "sequential"
-    assert s.status["overlap_s"] == 0.0
 
 
 def test_latency_above_the_chunk_runs_whole_chunks_from_their_start():
     s = run_session(latency_s=5.5, duration_s=40.0)
     _assert_healthy(s)
     assert s.status["regime"] == "sequential"
-    assert s.status["overlap_s"] == 0.0
     # The fill's own latency sample already says sequential, so every chunk
     # after it is observed at rest and rebased whole.
     assert s.status["rebases"] >= 3

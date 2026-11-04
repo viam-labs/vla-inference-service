@@ -324,10 +324,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `gripper` | object | `{"type": "none"}` | Discriminated union — three variants, see below. |
 | `task` | string | `""` | Default task instruction; overridable per `start` call. |
 | `fps` | number | `10.0` | Control loop rate. |
-| `blend_s` | number | `2 / fps`, `0` under `delta-ee` | How long a landing chunk takes to crossfade in from the plan it supersedes. `0` switches outright. See [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s). |
-| `margin_s` | number | `2 / fps` | Extra lead the inference trigger keeps beyond the expected latency and the blend. |
-| `smooth_rows` | odd integer, or 0 | `7`, `0` under `delta-ee` | Rows in the zero-phase quadratic (Savitzky–Golay) filter applied to each chunk as it lands. Removes tick-to-tick jitter in the policy's output without adding lag. `0` turns it off. See [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s). |
-| `inference_timeout_s` | number | `30` | A wait for a chunk longer than this fails the tick (and the run, under the default `stop_on_error`). |
+| `smooth_rows` | odd integer, or 0 | `7`, `0` under `delta-ee` | Rows in the zero-phase quadratic (Savitzky–Golay) filter applied to each chunk as it lands. Removes tick-to-tick jitter in the policy's output without adding lag. `0` turns it off. See [Execution timing](#execution-timing). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts consecutive tick *failures* (when `stop_on_error` is `false`) and, under `delta-ee`, consecutive `move_to_position` refusals. Waiting for a chunk is never fatal and never counted here; see `starved_ticks`. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
 | `state_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). Under `delta-ee` this is per-segment; see [Units](#units). |
@@ -370,7 +367,7 @@ Each tick: read `get_end_position()`, build the 9-vector, infer, convert the 6-v
 into millimetres and radians, clamp its magnitude, compose it onto the *measured* pose,
 and call `arm.move_to_position`. Everything else — the reference buffer, chunk pacing,
 `starvation_grace_ticks`, `status` — behaves as it does for `joints`, except that
-`blend_s` is `0` (rows are deltas, which cannot be blended) and a non-zero value is rejected.
+chunks switch outright at a seam (rows are deltas, which cannot be blended).
 
 ```json
 {
@@ -528,9 +525,6 @@ The one command to watch while a loop runs.
   "avg_latency_s": 0.32,
   "expected_latency_s": 0.34,
   "regime": "overlap",
-  "buffer_horizon_s": 0.41,
-  "staleness_s": 0.38,
-  "overlap_s": 0.2,
   "rebases": 0,
   "skipped_rows": 0,
   "timing": { "round_trip_s": 0.32, "server_s": 0.3, "compute_s": 0.28, "transport_s": 0.02 },
@@ -556,16 +550,11 @@ What to read it for:
 - `expected_latency_s` — what the trigger and the regime switch actually use: the max of the
   last five observation-to-landing intervals, or the chunk duration until the first one.
 - `regime` — `overlap` fires on the buffer's remaining time. `sequential` waits for the plan
-  to run out and observes at rest, because `2 * expected_latency_s + blend_s + margin_s` has
-  reached the chunk duration. See [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s).
-- `buffer_horizon_s` — plan left past now. `0` before any chunk, once the plan has run out,
-  and while a fresh chunk awaits its first sample.
-- `staleness_s` — age of the observation behind the sample just commanded. It drops to
-  about `expected_latency_s` at each landing and grows until the next one.
-- `overlap_s` — the blend window actually used at the last landing; `0` after a rebase.
+  to run out and observes at rest, because `2 * expected_latency_s` plus four ticks has
+  reached the chunk duration. See [Execution timing](#execution-timing).
 - `rebases` — chunks that landed after the plan had run out, so the new plan was pinned to the
   moment the arm resumed rather than blended. Expected at every chunk under `sequential`;
-  under `overlap`, a rising value means the trigger is firing too late (raise `margin_s`).
+  under `overlap`, a rising value means latency is spiking past what the trigger planned for.
 - `skipped_rows` — delta-ee only: due rows skipped because a later row was also due, never
   run late. Always `0` under `joints`.
 - `timing` — means over recent inferences, in seconds. `round_trip_s` is the controller's
@@ -971,7 +960,7 @@ half the wall-clock time, in 5-second freezes. RTC cannot do this job instead �
 denoising steps. **For anything resembling a live demo, the x86+CUDA target remains the
 practical answer** — the numbers above are Mac-specific.
 
-### Execution timing: `blend_s`, `margin_s`, `inference_timeout_s`
+### Execution timing
 
 Every chunk is placed on a time axis. Row i of a chunk inferred from an
 observation at `t_obs` means "be here at `t_obs + (i+1)/fps`", and each tick
@@ -979,15 +968,15 @@ commands the reference at the instant its target is due at the arm (two ticks
 ahead under `arm_write: "stream"`, one under `"setpoint"`). Rows whose moment
 has passed are never executed, so there is nothing stale to drop or to tune.
 
-- `blend_s` (default `2/fps`; `0` under `delta-ee`): when a chunk lands while
-  the previous plan still has rows ahead, the new plan crossfades in over this
-  many seconds (smoothstep). `0` switches outright.
-- `margin_s` (default `2/fps`): inference fires when the plan has less than
-  `expected_latency + blend_s + margin_s` left. `expected_latency` is measured:
-  the max of the last five observation-to-landing intervals, and the chunk
-  duration until the first one exists.
-- `inference_timeout_s` (default 30): a wait for a chunk longer than this fails
-  the tick (and the run, under the default `stop_on_error`).
+- When a chunk lands while the previous plan still has rows ahead, the new
+  plan crossfades in over two ticks (smoothstep). Under `delta-ee` it switches
+  outright.
+- Inference fires when the plan has less than `expected_latency` plus four
+  ticks left (two for the crossfade, two of margin). `expected_latency` is
+  measured: the max of the last five observation-to-landing intervals, and the
+  chunk duration until the first one exists.
+- A wait for a chunk longer than 30 s fails the tick (and the run, under the
+  default `stop_on_error`).
 - `smooth_rows` (default 7; `0` under `delta-ee`): each landing chunk's joint
   columns are smoothed once with a quadratic least-squares fit over that many
   rows. The whole chunk is known in advance, so the filter looks both ways and
@@ -1006,7 +995,7 @@ below. A failed or timed-out warm-up is logged and the run starts anyway.
 
 With one inference in flight, chunks land at most one per latency, and each
 is observed only when the previous one lands. So once
-`2 * expected_latency + blend_s + margin_s` reaches the chunk duration,
+`2 * expected_latency` plus four ticks reaches the chunk duration,
 overlapping would starve between landings, or observe mid-chunk and land rows
 the arm has already passed. The controller then switches to the `sequential`
 regime: it waits for the plan to run out, observes at rest, and runs the whole
@@ -1014,16 +1003,17 @@ next chunk. `status.regime` says which is active.
 
 `mode`, `merge`, `blend_ticks`, `queue_threshold` and `actions_per_chunk` were
 removed; a config that still sets one fails validation with its replacement.
+The crossfade, the trigger margin and the timeout are fixed: tuning them never
+changed a result on the robot.
 
 ### Cutting inference latency: `num_steps`
 
-Latency decides the regime: `overlap` needs `2 * expected_latency + blend_s + margin_s` to
+Latency decides the regime: `overlap` needs `2 * expected_latency` plus four ticks to
 stay under the chunk duration, and the shorter the latency the fresher every executed row.
 smolvla's `num_steps` (10 by default) is the flow-matching step count and the dominant
 tunable term in that latency. Measured on the Jetson Orin with `smolvla-box-bot-subtasks`:
 1.07 s at 10 steps, 0.66 s at 5, 0.58 s at 4, roughly 0.25 s fixed plus 0.08 s per step.
-At 30 fps the 50-step chunk is 1.67 s and the default `blend_s` and `margin_s` are 0.067 s
-each, so overlap needs latency under about 0.77 s: 4 or 5 steps fit, 10 runs `sequential`.
+At 30 fps the 50-step chunk is 1.67 s and four ticks are 0.13 s, so overlap needs latency under about 0.77 s: 4 or 5 steps fit, 10 runs `sequential`.
 Set `num_steps` on the `#policy` service to trade some action quality for speed, and
 measure both: `avg_latency_s` and `regime` in the controller's `status` for the speed,
 `tools/replay_eval.py` for the quality. The `#policy` `specs` report the value in force.
@@ -1035,7 +1025,7 @@ measure both: `avg_latency_s` and `regime` in the controller's `status` for the 
   the controller has no RTC scheduler. Deferred
   until CUDA latency is measured: RTC needs `delay < chunk_length` to function at all,
   and on the measured Apple Silicon numbers `delay > chunk_length`. The reference buffer
-  (see [Execution timing](#execution-timing-blend_s-margin_s-inference_timeout_s)) is the
+  (see [Execution timing](#execution-timing)) is the
   shipped answer to slow inference; it crossfades each seam on the time axis but does not
   condition the new chunk on the old one the way RTC would.
 - **`state_units`/`action_units: "normalized"` is unsupported.** It needs a source of

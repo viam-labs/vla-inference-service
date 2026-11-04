@@ -915,7 +915,7 @@ def test_safety_config_parse_still_defaults_to_the_joints_action_space():
 
 
 # ---------------------------------------------------------------------------
-# Time-indexed buffer: blend_s, margin_s, inference_timeout_s, removed keys
+# Time-indexed buffer: fixed timing, removed keys
 # ---------------------------------------------------------------------------
 
 
@@ -923,9 +923,9 @@ def test_safety_config_parse_still_defaults_to_the_joints_action_space():
     "key,value,hint",
     [
         ("mode", "async", "overlaps"),
-        ("merge", "aligned", "blend_s"),
-        ("blend_ticks", 3, "blend_s"),
-        ("queue_threshold", 5, "margin_s"),
+        ("merge", "aligned", "crossfade"),
+        ("blend_ticks", 3, "two ticks"),
+        ("queue_threshold", 5, "measured latency"),
         ("actions_per_chunk", 10, "nothing to truncate"),
     ],
 )
@@ -941,23 +941,8 @@ def test_blend_and_margin_default_to_two_ticks():
     assert cfg.inference_timeout_s == 30.0
 
 
-def test_blend_s_zero_is_a_hard_switch_and_negative_is_refused():
-    assert ControllerConfig.parse({**BASE, "blend_s": 0.0}).blend_s == 0.0
-    with pytest.raises(ConfigError, match="blend_s"):
-        ControllerConfig.parse({**BASE, "blend_s": -0.1})
-
-
-def test_delta_ee_defaults_blend_to_zero_and_refuses_a_blend():
-    base = {**DELTA_EE_BASE}
-    assert ControllerConfig.parse(base).blend_s == 0.0
-    with pytest.raises(ConfigError, match="blend_s"):
-        ControllerConfig.parse({**base, "blend_s": 0.1})
-
-
-@pytest.mark.parametrize("key,value", [("margin_s", -0.1), ("inference_timeout_s", 0)])
-def test_rejects_a_negative_margin_and_a_zero_inference_timeout(key, value):
-    with pytest.raises(ConfigError, match=key):
-        ControllerConfig.parse({**BASE, key: value})
+def test_delta_ee_fixes_blend_at_zero():
+    assert ControllerConfig.parse(DELTA_EE_BASE).blend_s == 0.0
 
 
 def test_smooth_rows_defaults_to_seven_and_zero_turns_it_off():
