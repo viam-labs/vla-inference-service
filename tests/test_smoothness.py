@@ -100,7 +100,6 @@ def test_steady():
     assert gap_jitter(s.arm.stream_points) <= STAMP_TOL
     assert long_gaps(s.arm.stream_points) == 0
     print(f"steady knot_accel baseline: {knot_accel(s):.4f} deg")  # blind to densification
-    print("steady stream_accel (max, p99):", stream_accel(s, after=s.policy.reply_times[1] + 3 * PERIOD))
 
 
 def test_stream_lead_is_exactly_one_tick():

@@ -88,12 +88,9 @@ def monotone_tangents(
     """
     out0, out1 = [], []
     for a, b, c in zip(m0, m1, d):
-        if abs(c) < 1e-12:
-            out0.append(0.0)
-            out1.append(0.0)
-            continue
-        alpha = a / c if a * c > 0 else 0.0
-        beta = b / c if b * c > 0 else 0.0
+        ok = abs(c) >= 1e-12  # a negligible chord is a zero chord, never a NaN
+        alpha = a / c if ok and a * c > 0 else 0.0
+        beta = b / c if ok and b * c > 0 else 0.0
         r = math.hypot(alpha, beta)
         if r > _FC_RADIUS:
             alpha, beta = alpha * _FC_RADIUS / r, beta * _FC_RADIUS / r

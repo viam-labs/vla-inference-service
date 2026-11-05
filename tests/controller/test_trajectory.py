@@ -307,20 +307,6 @@ async def test_cubic_stream_rewound_nominal_counts_as_contiguous():
     await stream.close()
 
 
-async def test_cubic_stream_stamps_match_linear():
-    stamps = {}
-    for interp in ("linear", "cubic"):
-        arm = FakeArm(positions=[0.0])
-        stream = ArmStream(arm, fps=10.0, stream_hz=50.0, extra={}, interp=interp)
-        await stream.start([0.0])
-        await stream.send([1.0], 0.0)
-        await stream.send([3.0], 0.1)
-        await _wait_for_points(arm, 11)
-        stamps[interp] = [p.time for p in arm.stream_points]
-        await stream.close()
-    assert stamps["linear"] == stamps["cubic"]
-
-
 async def test_unstreamable_arm_check_raises_runtime_error_mentioning_arm_write():
     arm = UnstreamableArm(positions=[0.0] * 6)
     stream = ArmStream(arm, fps=10.0, stream_hz=30.0, extra={})

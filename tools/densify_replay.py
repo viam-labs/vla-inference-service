@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay dumped traces' commanded knots through both stream densifiers.
 
-  uv run python tools/densify_replay.py [--cols 0-4] [--stream-hz 100] run.csv ...
+  uv run python tools/densify_replay.py [--cols 0,1,2,3,4] [--stream-hz 100] run.csv ...
 
 Reads `tools/dump_trace.py` CSVs (nominal_t, cmd0..cmdN). Each tick's
 commanded target is a knot; `interpolate` and `cubic_tick` (the functions
@@ -63,25 +63,15 @@ def replay(t: np.ndarray, knots: np.ndarray, cols: list[int], stream_hz: float, 
     return float(a.max()), float(np.percentile(a, 99)), speed / chord if chord else 0.0
 
 
-def parse_cols(spec: str | None, dof: int) -> list[int]:
-    if not spec:
-        return list(range(dof))
-    out: list[int] = []
-    for part in spec.split(","):
-        lo, _, hi = part.partition("-")
-        out.extend(range(int(lo), int(hi or lo) + 1))
-    return out
-
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("traces", nargs="+")
-    p.add_argument("--cols", help="cmd columns to measure, e.g. 0-4 or 0,2,3 (default: all)")
+    p.add_argument("--cols", type=lambda v: [int(c) for c in v.split(",")], help="cmd columns to measure, e.g. 0,1,2 (default: all)")
     p.add_argument("--stream-hz", type=float, default=100.0)
     args = p.parse_args()
     for path in args.traces:
         t, knots = load(path)
-        cols = parse_cols(args.cols, knots.shape[1])
+        cols = args.cols or list(range(knots.shape[1]))
         print(f"{Path(path).name} ({len(t)} ticks)")
         for name, cubic in (("linear", False), ("cubic", True)):
             mx, p99, ratio = replay(t, knots, cols, args.stream_hz, cubic)
