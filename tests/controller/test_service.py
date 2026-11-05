@@ -1363,6 +1363,7 @@ async def test_status_reports_every_documented_field():
         "starved_ticks",
         "reanchors",
         "arm_write",
+        "stream_interp",
         "stream_points_sent",
         "timing",
         "last_error",
@@ -2257,7 +2258,9 @@ class _IncrementingPolicy(FakePolicyClient):
 async def test_stream_mode_sends_a_rest_point_then_densified_ticks():
     arm = FakeArm(positions=[0.0] * 6)
     policy = _IncrementingPolicy(n=1)  # one action per chunk: infer() every tick
-    svc = _svc(config=_stream_config(), deps=_deps(policy=policy, arm=arm))
+    # Linear, so each group is exactly `interpolate`'s output; cubic chaining is
+    # covered in test_trajectory.py.
+    svc = _svc(config=_stream_config(stream_interp="linear"), deps=_deps(policy=policy, arm=arm))
     n = round(90.0 / 30.0)
 
     await svc.do_command({"command": "start", "task": "t"})
@@ -2301,6 +2304,7 @@ async def test_stream_mode_stop_closes_the_stream_and_stops_the_arm():
     await _wait_until(lambda: len(arm.stream_points) > 1, "at least one streamed tick")
     status = await svc.do_command({"command": "status"})
     assert status["arm_write"] == "stream"
+    assert status["stream_interp"] == "cubic"
     assert status["stream_points_sent"] > 1
 
     await svc.do_command({"command": "stop"})

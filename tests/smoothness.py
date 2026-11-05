@@ -397,6 +397,29 @@ def knot_accel(session: Session) -> float:
     return float(np.abs(np.diff(pos, n=2, axis=0)).max())
 
 
+def stream_accel(session: Session, *, after: float) -> tuple[float, float]:
+    """(max, p99) of |second difference| (deg per step²) over every streamed
+    point, joints 0-4, for triples due at or after `after`.
+
+    What densification changes: knot_accel only sees each tick's last point.
+    Due time is the stream anchor (first batch's receive time) plus the
+    stamp, as in `residual`. The rest point is skipped, and so is any triple
+    spanning a gap longer than a period (a hold, not acceleration).
+    """
+    arm = session.arm
+    r0 = arm.batch_stamps[0][0]
+    pts = arm.stream_points[1:]
+    t = np.array([r0 + p.time.total_seconds() for p in pts])
+    pos = np.array([list(p.positions)[:TAG] for p in pts])
+    acc = np.abs(pos[2:] - 2 * pos[1:-1] + pos[:-2]).max(axis=1)
+    dt = np.diff(t)
+    period = 1.0 / session.fps
+    keep = (t[:-2] >= after) & (dt[:-1] <= period) & (dt[1:] <= period)
+    acc = acc[keep]
+    assert acc.size, "stream_accel: no streamed triples after `after`"
+    return float(acc.max()), float(np.percentile(acc, 99))
+
+
 def residual(session: Session, *, after: float) -> tuple[np.ndarray, np.ndarray]:
     """(due time, executed - reference) per tick target due at or after `after`.
 

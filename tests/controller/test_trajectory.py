@@ -1,11 +1,12 @@
 import asyncio
+import random
 from datetime import timedelta
 
 import pytest
 from grpclib.exceptions import GRPCError
 
 from tests.fakes import FakeArm, UnstreamableArm
-from vla.controller.trajectory import ArmStream, interpolate
+from vla.controller.trajectory import ArmStream, cubic_tick, hermite, interpolate, monotone_tangents
 
 
 def test_n_equals_1_returns_target_only():
@@ -38,6 +39,92 @@ def test_raises_on_n_less_than_1():
 def test_raises_on_mismatched_lengths():
     with pytest.raises(ValueError):
         interpolate([0, 0], [1, 1, 1], 3)
+
+
+# ---------------------------------------------------------------------------
+# Cubic segment
+# ---------------------------------------------------------------------------
+
+
+def test_hermite_with_chord_tangents_is_linear():
+    prev, target = [0.0, 10.0], [4.0, 30.0]
+    d = [t - p for p, t in zip(prev, target)]
+    got = hermite(prev, target, 4, d, d)
+    want = interpolate(prev, target, 4)
+    for g, w in zip(got, want):
+        assert g == pytest.approx(w, abs=1e-12)
+
+
+def test_hermite_last_point_is_target_exactly():
+    assert hermite([0.29], [0.87], 3, [0.0], [0.5])[-1] == [0.87]
+
+
+def test_hermite_validates_like_interpolate():
+    with pytest.raises(ValueError):
+        hermite([0.0], [1.0], 0, [0.0], [0.0])
+    with pytest.raises(ValueError):
+        hermite([0.0], [1.0, 2.0], 2, [0.0], [0.0])
+
+
+def test_monotone_tangents_zeroes_a_tangent_against_the_chord():
+    m0, m1 = monotone_tangents([-1.0], [1.0], [1.0])
+    assert m0 == [0.0] and m1 == [1.0]
+
+
+def test_monotone_tangents_zero_chord_zeroes_both():
+    assert monotone_tangents([2.0], [3.0], [0.0]) == ([0.0], [0.0])
+
+
+def test_monotone_tangents_negligible_chord_is_zero_not_nan():
+    assert monotone_tangents([1.0], [5e-324], [5e-324]) == ([0.0], [0.0])
+
+
+def test_monotone_tangents_rescales_onto_radius_three():
+    m0, m1 = monotone_tangents([5.0], [1.0], [1.0])
+    assert (m0[0] ** 2 + m1[0] ** 2) == pytest.approx(9.0)
+    assert m0[0] / m1[0] == pytest.approx(5.0)
+
+
+def test_cubic_tick_points_stay_inside_the_chord():
+    rng = random.Random(4)
+    for _ in range(2000):
+        dof = 3
+        prev = [rng.uniform(-10, 10) for _ in range(dof)]
+        target = [p + rng.choice([0.0, rng.uniform(-5, 5)]) for p in prev]
+        tangent = [rng.uniform(-20, 20) for _ in range(dof)]
+        points, _ = cubic_tick(prev, target, rng.randint(1, 10), tangent)
+        for pt in points:
+            for j in range(dof):
+                lo, hi = min(prev[j], target[j]), max(prev[j], target[j])
+                assert lo - 1e-9 <= pt[j] <= hi + 1e-9
+
+
+def test_cubic_tick_on_a_ramp_matches_linear_after_the_first_tick():
+    knots = [[0.5 * i, -2.0 * i] for i in range(6)]
+    tangent = None
+    for i, (prev, target) in enumerate(zip(knots, knots[1:])):
+        points, tangent = cubic_tick(prev, target, 5, tangent)
+        if i == 0:
+            continue  # starts from rest: not linear
+        for g, w in zip(points, interpolate(prev, target, 5)):
+            assert g == pytest.approx(w, abs=1e-9)
+
+
+def test_cubic_tick_returns_the_limited_end_tangent():
+    # Carried tangent 10 against chord 1: alpha=10, beta=1, rescaled onto r=3.
+    _, tangent = cubic_tick([0.0], [1.0], 5, [10.0])
+    assert tangent[0] == pytest.approx(3.0 / (101 ** 0.5))
+
+
+def test_cubic_tick_none_tangent_starts_from_rest():
+    points, tangent = cubic_tick([0.0], [1.0], 4, None)
+    assert points[0][0] < 0.25  # slower than linear's first step
+    assert tangent == [1.0]
+
+
+def test_cubic_tick_with_one_point_is_the_target():
+    points, _ = cubic_tick([0.0, 1.0], [2.0, 3.0], 1, [5.0, 5.0])
+    assert points == [[2.0, 3.0]]
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +257,68 @@ async def test_send_monotonic_guard_survives_a_rewound_nominal_time():
     times = [p.time for p in arm.stream_points]
     assert all(a < b for a, b in zip(times, times[1:]))
     await stream.close()
+
+
+async def test_cubic_stream_first_send_starts_from_rest_and_carries_the_chord():
+    arm = FakeArm(positions=[0.0])
+    stream = ArmStream(arm, fps=10.0, stream_hz=50.0, extra={}, interp="cubic")
+    await stream.start([0.0])
+    await stream.send([1.0], 0.0)
+    await _wait_for_points(arm, 6)
+    first = arm.stream_points[1].positions[0]
+    assert 0.0 < first < 0.2  # linear would be exactly 0.2
+    assert arm.stream_points[-1].positions == [1.0]
+    await stream.close()
+
+
+async def test_cubic_stream_contiguous_send_carries_the_tangent():
+    arm = FakeArm(positions=[0.0])
+    stream = ArmStream(arm, fps=10.0, stream_hz=50.0, extra={}, interp="cubic")
+    await stream.start([0.0])
+    await stream.send([1.0], 0.0)
+    await stream.send([2.0], 0.1)  # constant velocity, contiguous: linear from here
+    await _wait_for_points(arm, 11)
+    second = [p.positions[0] for p in arm.stream_points[6:]]
+    assert second == pytest.approx([1.2, 1.4, 1.6, 1.8, 2.0], abs=1e-9)
+    await stream.close()
+
+
+async def test_cubic_stream_resets_the_tangent_after_a_hold():
+    arm = FakeArm(positions=[0.0])
+    stream = ArmStream(arm, fps=10.0, stream_hz=50.0, extra={}, interp="cubic")
+    await stream.start([0.0])
+    await stream.send([1.0], 0.0)
+    await stream.send([2.0], 0.5)  # four ticks later: the arm held at 1.0
+    await _wait_for_points(arm, 11)
+    # From rest: 1.072. A wrongly carried tangent would give linear's 1.2.
+    assert arm.stream_points[6].positions[0] == pytest.approx(1.072)
+    await stream.close()
+
+
+async def test_cubic_stream_rewound_nominal_counts_as_contiguous():
+    arm = FakeArm(positions=[0.0])
+    stream = ArmStream(arm, fps=10.0, stream_hz=50.0, extra={}, interp="cubic")
+    await stream.start([0.0])
+    await stream.send([1.0], 0.0)
+    await stream.send([2.0], -100.0)  # rewind: the max() guard stamps it one step on
+    await _wait_for_points(arm, 11)
+    second = [p.positions[0] for p in arm.stream_points[6:]]
+    assert second == pytest.approx([1.2, 1.4, 1.6, 1.8, 2.0], abs=1e-9)
+    await stream.close()
+
+
+async def test_cubic_stream_stamps_match_linear():
+    stamps = {}
+    for interp in ("linear", "cubic"):
+        arm = FakeArm(positions=[0.0])
+        stream = ArmStream(arm, fps=10.0, stream_hz=50.0, extra={}, interp=interp)
+        await stream.start([0.0])
+        await stream.send([1.0], 0.0)
+        await stream.send([3.0], 0.1)
+        await _wait_for_points(arm, 11)
+        stamps[interp] = [p.time for p in arm.stream_points]
+        await stream.close()
+    assert stamps["linear"] == stamps["cubic"]
 
 
 async def test_unstreamable_arm_check_raises_runtime_error_mentioning_arm_write():
