@@ -12,6 +12,7 @@ import selectors
 import math
 import random
 from dataclasses import dataclass, replace
+from unittest.mock import patch
 
 import numpy as np
 from google.protobuf.struct_pb2 import Struct
@@ -55,7 +56,8 @@ class VirtualLoop(asyncio.SelectorEventLoop):
     `asyncio.sleep`, `wait_for`, and `call_at` all key off `time()`, so they
     become virtual and event-ordered with no further injection. It assumes all
     awaited work is timer-driven: real threads (`to_thread`/executors) would
-    race the virtual clock.
+    race the virtual clock, so `run_session` runs the controller's image
+    offload inline.
     """
 
     def __init__(self) -> None:
@@ -291,7 +293,13 @@ def run_session(
         await svc.do_command({"command": "stop"})
         return Session(arm=arm, policy=policy, status=status, fps=fps)
 
-    return run_virtual(main())
+    async def inline(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    # The controller offloads image work to threads; the virtual clock cannot
+    # wait for them, so run it inline for the session.
+    with patch("vla.controller.observation.to_thread", inline):
+        return run_virtual(main())
 
 
 # --- metrics -----------------------------------------------------------------

@@ -262,14 +262,27 @@ class VLAPolicy(Generic, EasyResource):
 
         # Wrap per-camera: a bare WireError from decode_image says the payload
         # was malformed but not which feed produced it, and a robot log needs
-        # to name the camera.
-        images = {}
+        # to name the camera. With several bad feeds, the one named is
+        # whichever fails first.
+        payloads = {}
         for key, payload in images_raw.items():
             try:
-                payload = _require_dict(payload, "image payload")
-                images[key] = decode_image(payload)
+                payloads[key] = _require_dict(payload, "image payload")
             except WireError as exc:
                 raise WireError(f"{key}: {exc}") from exc
+
+        # Off the event loop, one thread per camera: this process's loop also
+        # drives the controller's ticks, and a JPEG decode is CPU-bound. PIL
+        # releases the GIL in its decode path, so the cameras largely decode
+        # in parallel.
+        async def decode(key: str, payload: dict[str, Any]) -> np.ndarray:
+            try:
+                return await asyncio.to_thread(decode_image, payload)
+            except WireError as exc:
+                raise WireError(f"{key}: {exc}") from exc
+
+        decoded = await asyncio.gather(*(decode(k, p) for k, p in payloads.items()))
+        images = dict(zip(payloads, decoded))
 
         if specs is not None:
             expected_keys = set(specs.image_feature_keys)
