@@ -379,6 +379,7 @@ class VLAController(Generic, EasyResource):
             # resuming from now instead of replaying them as a burst.
             "reanchors": self._schedule.reanchors if self._schedule else 0,
             "arm_write": self._cfg.arm_write if self._cfg else "",
+            "stream_interp": self._cfg.stream_interp if self._cfg else "",
             # Live while the stream is open; the final total after it closes.
             "stream_points_sent": (
                 self._stream.points_sent if self._stream is not None else self._stream_points_sent
@@ -717,6 +718,7 @@ class VLAController(Generic, EasyResource):
                     fps=cfg.fps,
                     stream_hz=cfg.stream_hz,
                     extra=dict(cfg.arm_move_extra),
+                    interp=cfg.stream_interp,
                 )
                 await self._stream.start(measured)
 

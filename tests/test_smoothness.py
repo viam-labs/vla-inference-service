@@ -32,6 +32,7 @@ from tests.smoothness import (
     run_session,
     seam_jump,
     seeded_jitter,
+    stream_accel,
 )
 
 
@@ -98,7 +99,7 @@ def test_steady():
     _assert_healthy(s)
     assert gap_jitter(s.arm.stream_points) <= STAMP_TOL
     assert long_gaps(s.arm.stream_points) == 0
-    print(f"steady knot_accel baseline: {knot_accel(s):.4f} deg")  # for #4; no gate
+    print(f"steady knot_accel baseline: {knot_accel(s):.4f} deg")  # blind to densification
 
 
 def test_stream_lead_is_exactly_one_tick():
@@ -282,3 +283,29 @@ def test_stream_lead_s_writes_each_point_from_that_far_ahead_on_the_plan():
     assert len(t) > 100
     assert np.abs(res - expected).max() <= 1e-4
     assert np.abs(expected).max() > 0.1  # the lead is visible, not lost in noise
+
+
+def _accel_pair(**config):
+    out = {}
+    for interp in ("linear", "cubic"):
+        s = run_session(latency_s=0.33, stream_interp=interp, **config)
+        _assert_healthy(s)
+        assert gap_jitter(s.arm.stream_points) <= STAMP_TOL
+        assert long_gaps(s.arm.stream_points) == 0
+        out[interp] = stream_accel(s, after=s.policy.reply_times[1] + 3 * PERIOD)
+    print(config, out)
+    return out["linear"], out["cubic"]
+
+
+def test_cubic_densification_cuts_streamed_acceleration_on_smooth_knots():
+    # Measured ratios (spec, Measurement): max 0.61, p99 0.81.
+    (lin_max, lin_p99), (cub_max, cub_p99) = _accel_pair()
+    assert cub_max <= 0.7 * lin_max
+    assert cub_p99 <= 0.9 * lin_p99
+
+
+def test_cubic_densification_does_not_regress_on_alternating_chords():
+    # +/-0.3 deg row noise, unsmoothed: same-sign chords alternating large and
+    # small trip the Fritsch-Carlson rescale every tick. Measured ratio 1.04.
+    (lin_max, _), (cub_max, _) = _accel_pair(smooth_rows=0, row_noise=0.3)
+    assert cub_max <= 1.1 * lin_max

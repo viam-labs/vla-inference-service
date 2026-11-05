@@ -1,5 +1,5 @@
-"""Linear interpolation between successive policy actions, and `ArmStream`,
-the streamed arm write built on top of it.
+"""Linear and cubic densification between successive policy actions, and `ArmStream`,
+the streamed arm write built on top of them.
 
 Densifies one policy action per control tick into the higher setpoint cadence
 `move_through_joint_positions_streamed` servo mode wants, without the policy
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from datetime import timedelta
 from typing import Any, Sequence
 
@@ -39,6 +40,79 @@ def interpolate(prev: Sequence[float], target: Sequence[float], n: int) -> list[
     return points
 
 
+# Fritsch-Carlson radius: tangents (as multiples of the chord) are kept inside
+# a circle of this radius, which keeps every point between the two knots.
+# ponytail: fixed at 3; drop to 2 to lower peak point speed if a driver faults on servo speed.
+_FC_RADIUS = 3.0
+
+
+def hermite(
+    prev: Sequence[float], target: Sequence[float], n: int, m0: Sequence[float], m1: Sequence[float]
+) -> list[list[float]]:
+    """`n` points of the cubic Hermite segment from `prev` (exclusive) to `target` (inclusive).
+
+    Tangents are in position per tick, so the segment spans s = k/n, k = 1..n.
+    `m0 = m1 = target - prev` gives `interpolate`'s points. The last point is
+    `list(target)` exactly, as there.
+    """
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    if not len(prev) == len(target) == len(m0) == len(m1):
+        raise ValueError(
+            "prev, target, m0 and m1 must be the same length, got "
+            f"{len(prev)}, {len(target)}, {len(m0)} and {len(m1)}"
+        )
+
+    points = []
+    for k in range(1, n):
+        s = k / n
+        h00 = 2 * s**3 - 3 * s**2 + 1
+        h10 = s**3 - 2 * s**2 + s
+        h01 = -2 * s**3 + 3 * s**2
+        h11 = s**3 - s**2
+        points.append(
+            [h00 * p + h10 * a + h01 * t + h11 * b for p, t, a, b in zip(prev, target, m0, m1)]
+        )
+    points.append(list(target))
+    return points
+
+
+def monotone_tangents(
+    m0: Sequence[float], m1: Sequence[float], d: Sequence[float]
+) -> tuple[list[float], list[float]]:
+    """Fritsch-Carlson limiting, per joint, against chord `d`.
+
+    A tangent against the chord, or any tangent on a zero chord, becomes 0;
+    (m0/d, m1/d) is then scaled onto the radius-`_FC_RADIUS` circle if outside
+    it. The segment then never leaves [prev, target].
+    """
+    out0, out1 = [], []
+    for a, b, c in zip(m0, m1, d):
+        ok = abs(c) >= 1e-12  # a negligible chord is a zero chord, never a NaN
+        alpha = a / c if ok and a * c > 0 else 0.0
+        beta = b / c if ok and b * c > 0 else 0.0
+        r = math.hypot(alpha, beta)
+        if r > _FC_RADIUS:
+            alpha, beta = alpha * _FC_RADIUS / r, beta * _FC_RADIUS / r
+        out0.append(alpha * c)
+        out1.append(beta * c)
+    return out0, out1
+
+
+def cubic_tick(
+    prev: Sequence[float], target: Sequence[float], n: int, tangent: Sequence[float] | None
+) -> tuple[list[list[float]], list[float]]:
+    """One tick of cubic densification: (points, end tangent to carry).
+
+    The end tangent is this tick's chord (a backward difference: no lookahead);
+    the start tangent is the carried one, None meaning at rest. Both are limited
+    by `monotone_tangents`, and the limited end tangent is returned for the next tick.
+    """
+    d = [t - p for p, t in zip(prev, target)]
+    m0, m1 = monotone_tangents([0.0] * len(d) if tangent is None else tangent, d, d)
+    return hermite(prev, target, n, m0, m1), m1
+
+
 _SENTINEL = object()
 
 # The xArm driver waits for the arm to physically stop moving after the
@@ -57,6 +131,9 @@ class ArmStream:
     iterator ends the trajectory after the arm stops. Which point the driver
     anchors its clock on is version-dependent, so the rest point ships in the
     same batch as the first tick's motion points, and `_t0` is that tick's nominal time.
+
+    `interp='cubic'` replaces linear points with `cubic_tick`'s monotone
+    segment; stamps are identical.
     """
 
     def __init__(
@@ -66,11 +143,15 @@ class ArmStream:
         fps: float,
         stream_hz: float,
         extra: dict[str, Any],
+        interp: str = "linear",
     ) -> None:
         self._arm = arm
         self._fps = fps
         self._stream_hz = stream_hz
         self._extra = extra
+        self._interp = interp
+        # cubic only: the last segment's (limited) end tangent, per tick; None = at rest.
+        self._tangent: list[float] | None = None
         self._queue: asyncio.Queue | None = None
         self._task: asyncio.Task | None = None
         self._fault: Exception | None = None
@@ -124,8 +205,18 @@ class ArmStream:
         elapsed = nominal_t - self._t0
         prev = self._measured if first_send else self._last
 
+        tangent = None
+        if self._interp == "cubic":
+            # Contiguous when this tick starts no later than the last stamp sent:
+            # anything later is a hold (starvation restart, re-anchor, skipped
+            # tick) the arm spent at rest on `prev`.
+            contiguous = not first_send and elapsed + lead <= self._last_time + 1e-6
+            points, tangent = cubic_tick(prev, target, n, self._tangent if contiguous else None)
+        else:
+            points = interpolate(prev, target, n)
+
         last_time = self._last_time
-        for k, p in enumerate(interpolate(prev, target, n)):
+        for k, p in enumerate(points):
             # Stamp one tick ahead (a past-due point is sent immediately, and a
             # stream of past-due points collapses into bursts at fps); the max()
             # keeps times strictly increasing across a re-anchor or a rewind.
@@ -146,6 +237,7 @@ class ArmStream:
         self.points_sent += len(batch)
         self._last = list(target)
         self._last_time = last_time
+        self._tangent = tangent
 
     def check(self) -> None:
         if self._fault is not None:

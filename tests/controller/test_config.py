@@ -962,6 +962,19 @@ def test_delta_ee_defaults_smoothing_off_and_refuses_it():
         ControllerConfig.parse({**DELTA_EE_BASE, "smooth_rows": 5})
 
 
+def test_stream_interp_defaults_to_cubic_under_stream_and_needs_stream():
+    stream = {**BASE, "arm_write": "stream", "fps": 20.0}
+    assert ControllerConfig.parse(stream).stream_interp == "cubic"
+    assert ControllerConfig.parse({**stream, "stream_interp": "linear"}).stream_interp == "linear"
+    assert ControllerConfig.parse(BASE).stream_interp == "linear"
+    assert ControllerConfig.parse({**stream, "stream_interp": "cubic"}).stream_interp == "cubic"
+    assert ControllerConfig.parse({**BASE, "stream_interp": "linear"}).stream_interp == "linear"
+    with pytest.raises(ConfigError, match="stream_interp"):
+        ControllerConfig.parse({**stream, "stream_interp": "spline"})
+    with pytest.raises(ConfigError, match="stream_interp"):
+        ControllerConfig.parse({**BASE, "stream_interp": "cubic"})
+
+
 def test_stream_lead_s_defaults_to_zero_and_needs_stream():
     stream = {**BASE, "arm_write": "stream", "fps": 20.0}
     assert ControllerConfig.parse(stream).stream_lead_s == 0.0

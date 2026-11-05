@@ -336,6 +336,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `arm_write` | `setpoint` \| `stream` | `"setpoint"` | `joints` only. `"stream"` feeds the arm's servo mode at `stream_hz` instead of one setpoint per tick — see [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
 | `stream_hz` | number | `100.0` | `arm_write: "stream"` only. Must be ≥ `fps` — interpolation needs at least one point per tick. Rounded to a whole number of points per tick, so the actual rate is that count × `fps`, not `stream_hz` itself — `100` at `fps: 30` runs at 90 Hz. |
 | `stream_lead_s` | number, 0–1 | `0` | `arm_write: "stream"` only. How far ahead of its stamp each streamed point is sampled, to cover the servo's response time. See [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
+| `stream_interp` | `linear` \| `cubic` | `"cubic"` | `arm_write: "stream"` only. How each tick is densified: `"cubic"` keeps velocity continuous across knots; `"linear"` steps velocity at each one. See [Smooth servo streaming](#smooth-servo-streaming-arm_write-stream). |
 | `duration_warn_s` | number | `0.1` | Log a warning when observation assembly takes longer than this. |
 | `stale_frame_warn_s` | number | `0.5` | Log a warning when a camera frame is older than this. |
 | `safety.max_joint_delta_degs` | number | `8.0` | `joints` only. Per-tick clamp against the arm's *measured* position. Derived automatically from `max_vel_degs_per_sec` when that is set instead — see [Safety](#safety). |
@@ -533,6 +534,7 @@ The one command to watch while a loop runs.
   "starved_ticks": 0,
   "reanchors": 0,
   "arm_write": "setpoint",
+  "stream_interp": "linear",
   "stream_points_sent": 0,
   "last_error": ""
 }
@@ -574,6 +576,7 @@ What to read it for:
 - `last_error` — non-empty after a failed tick, even when `stop_on_error` is `false` and
   the loop kept going.
 - `arm_write` — `"setpoint"` or `"stream"`, echoing the configured value.
+- `stream_interp` — `"linear"` or `"cubic"`, echoing the configured value (labels A/B runs).
 - `stream_points_sent` — cumulative `TrajectoryPoint`s sent under `arm_write: "stream"`;
   always `0` under `"setpoint"`. The first tick sends the rest point and its motion batch
   together, so this jumps straight from `0` to `1 + n` — a value stuck at `0` while `state`
@@ -713,7 +716,7 @@ more. The driver's unary RPC interpolates a single target up to 100 Hz itself, b
 streamed RPC, `move_through_joint_positions_streamed`, sends each `TrajectoryPoint`
 verbatim at its stamped time, so under `arm_write: "stream"` the controller densifies.
 
-What gets sent: `round(stream_hz / fps)` linearly interpolated points per tick (100 at
+What gets sent: `round(stream_hz / fps)` interpolated points per tick (100 at
 `fps: 30` rounds to 3 per tick, 90 Hz), stamped one tick ahead of the tick's *nominal*
 start on the loop's fixed schedule, not of when the tick happened to run, so tick-to-tick
 jitter in the control loop never reaches the arm. The lead matters because a point that arrives past its stamp is sent immediately, and a
@@ -721,6 +724,16 @@ stream where every point is late collapses back into bursts at `fps`. The mandat
 rest point at `time=0` ships in the *same* batch as tick one's motion points: which
 point a driver anchors its clock on is version-dependent, and keeping both together
 keeps either anchor within one transport hop of the controller's clock.
+
+Densification: `stream_interp: "linear"` moves at constant velocity within each tick,
+so velocity steps at every policy action. `"cubic"` (the default) uses a monotone cubic
+Hermite segment per tick: it starts at the previous segment's ending velocity and ends at
+this tick's average velocity, so it needs no lookahead and adds no latency. Every point
+stays between the tick's two targets, and the segment still ends exactly on the target.
+A direction reversal, or chords that alternate between large and small, still step
+(unsmoothed policy jitter can be slightly worse than linear; keep `smooth_rows` on), and
+the speed between points can briefly exceed the tick's average, by up to ~1.3× on
+SO-101 traces. `tools/densify_replay.py` replays a dumped trace through both.
 
 Lifecycle: one stream per run, opened in `start` after every other pre-motion check.
 Nothing is sent until the first tick, so a driver without the RPC is refused there,
@@ -740,7 +753,9 @@ Requirements and fallback: `viam-sdk` >= 0.82.0, which this module already
 depends on, and an xArm module at or after `d83b4d9` (2026-09-15). `"setpoint"` stays
 the default and the fallback. The safety clamp enforces the same `max_vel_degs_per_sec`
 on both paths: every interpolated point lies between two already-clamped targets, so
-streaming changes how often a target is sent, not how fast it may move. The clamp
+streaming changes how often a target is sent, not how far it may move per tick; under
+`stream_interp: "cubic"` the speed between points can briefly exceed the tick's average
+(see Densification above). The clamp
 measures a target against the arm's position now, and a streamed target is sampled
 `2/fps + stream_lead_s` ahead rather than `1/fps`, so its per-tick allowance is scaled
 by that many ticks (logged at configure time). Unscaled, 120 °/s on an SO-101 clamped

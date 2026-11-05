@@ -45,6 +45,9 @@ RPC. The real rate is `round(stream_hz / fps) * fps` (100 at 30 fps runs at 90 H
 A driver writes each streamed point at its stamp, so a servo that takes time to
 respond arrives late; `stream_lead_s` (default 0, stream only) samples each
 point from that far ahead on the plan to give it that time.
+`stream_interp` (stream only) picks how each tick is densified: `"cubic"` (the
+default) is a monotone cubic, so velocity doesn't step at every knot; `"linear"`
+is the old constant-velocity segment.
 README: "Smooth servo streaming".
 """
 
@@ -77,6 +80,7 @@ __all__ = [
     "JOINTS",
     "DELTA_EE",
     "ARM_WRITES",
+    "STREAM_INTERPS",
 ]
 
 ENCODINGS = ("jpeg", "png", "raw")
@@ -84,6 +88,8 @@ ENCODINGS = ("jpeg", "png", "raw")
 # "setpoint": one move_to_joint_positions per tick. "stream": interpolated
 # points over move_through_joint_positions_streamed (README, Smooth servo streaming).
 ARM_WRITES = ("setpoint", "stream")
+# How each streamed tick is densified (README, Smooth servo streaming).
+STREAM_INTERPS = ("linear", "cubic")
 
 # Keys removed with the time-indexed buffer. A config that still sets one fails
 # with its replacement, rather than being silently ignored by raw.get().
@@ -528,6 +534,10 @@ class ControllerConfig:
     # Seconds ahead of its stamp each streamed point is sampled: the servo's
     # response time, which a point written at its stamp otherwise arrives late by.
     stream_lead_s: float = 0.0
+    # "cubic": monotone cubic Hermite per tick, velocity continuous at knots
+    # (trajectory.cubic_tick). parse() defaults it to "cubic" under stream and
+    # "linear" otherwise, where it has no effect.
+    stream_interp: str = "linear"
     # Operator-configurable rather than fixed module defaults: a checkpoint
     # run at 2 Hz and one at 10 Hz imply very different "this tick is late"
     # and "this frame is stale" thresholds. Defaults match observation.py's
@@ -621,6 +631,15 @@ class ControllerConfig:
                 f'stream_lead_s={stream_lead_s} only applies to arm_write="stream": a setpoint '
                 "is already sent a tick before it is due. Remove it."
             )
+        stream_interp = as_choice(
+            raw.get("stream_interp", "cubic" if arm_write == "stream" else "linear"),
+            "stream_interp",
+            STREAM_INTERPS,
+        )
+        if stream_interp != "linear" and arm_write != "stream":
+            raise ConfigError(
+                f'stream_interp="{stream_interp}" only applies to arm_write="stream". Remove it.'
+            )
         if arm_write == "stream":
             if stream_hz < fps:
                 raise ConfigError(
@@ -687,6 +706,7 @@ class ControllerConfig:
             arm_write=arm_write,
             stream_hz=stream_hz,
             stream_lead_s=stream_lead_s,
+            stream_interp=stream_interp,
             arm_move_extra=_parse_arm_move_extra(raw.get("arm_move_extra")),
             duration_warn_s=as_float(
                 raw.get("duration_warn_s", DEFAULT_DURATION_WARN_S), "duration_warn_s", minimum=0.0
