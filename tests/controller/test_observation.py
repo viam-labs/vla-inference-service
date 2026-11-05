@@ -639,11 +639,10 @@ async def _blocked_ticks_during_build(builder, budget_s: float = 0.4) -> int:
     build takes.
     """
     ticks = 0
-    running = True
 
     async def heartbeat():
         nonlocal ticks
-        while running:
+        while True:
             ticks += 1
             await asyncio.sleep(0.001)
 
@@ -652,7 +651,6 @@ async def _blocked_ticks_during_build(builder, budget_s: float = 0.4) -> int:
     try:
         await asyncio.wait_for(builder.build(), timeout=budget_s)
     finally:
-        running = False
         beat.cancel()
         try:
             await beat
@@ -673,7 +671,7 @@ async def test_image_decode_does_not_block_the_event_loop(monkeypatch):
 
     ticks = await _blocked_ticks_during_build(_builder())
 
-    assert ticks > 5, (
+    assert ticks > 20, (
         f"only {ticks} heartbeats ran during a 50ms decode: the decode is "
         "blocking the event loop, which stalls every control tick due during it"
     )
@@ -690,7 +688,7 @@ async def test_image_encode_does_not_block_the_event_loop(monkeypatch):
 
     ticks = await _blocked_ticks_during_build(_builder())
 
-    assert ticks > 5, (
+    assert ticks > 20, (
         f"only {ticks} heartbeats ran during a 50ms encode: the encode is "
         "blocking the event loop"
     )
