@@ -624,6 +624,45 @@ async def test_infer_does_not_block_the_event_loop(tmp_path):
     )
 
 
+async def test_image_decode_does_not_block_the_event_loop(tmp_path, monkeypatch):
+    # The policy shares the controller's event loop (one module process), so
+    # an inline decode stalls control ticks. A blocking sleep stands in for a
+    # JPEG decode; it releases the GIL as PIL does.
+    svc = await _ready_service(tmp_path, action_dim=6, n_action_steps=5)
+
+    def slow_decode(payload):
+        time.sleep(0.05)
+        return np.zeros((224, 224, 3), dtype=np.uint8)
+
+    monkeypatch.setattr("vla.policy.service.decode_image", slow_decode)
+
+    ticks = 0
+    running = True
+
+    async def heartbeat():
+        nonlocal ticks
+        while running:
+            ticks += 1
+            await asyncio.sleep(0.001)
+
+    beat = asyncio.create_task(heartbeat())
+    await asyncio.sleep(0)
+    try:
+        await svc.do_command(_infer_cmd())
+    finally:
+        running = False
+        beat.cancel()
+        try:
+            await beat
+        except asyncio.CancelledError:
+            pass
+
+    assert ticks > 5, (
+        f"only {ticks} heartbeats ran during a 50ms decode: the policy's image "
+        "decode is blocking the event loop it shares with the controller"
+    )
+
+
 # --- 3. non-dict payloads must raise WireError naming the field, not a bare
 # AttributeError/TypeError escaping from a builtin (standing requirement 5).
 
