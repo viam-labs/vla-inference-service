@@ -637,11 +637,10 @@ async def test_image_decode_does_not_block_the_event_loop(tmp_path, monkeypatch)
     monkeypatch.setattr("vla.policy.service.decode_image", slow_decode)
 
     ticks = 0
-    running = True
 
     async def heartbeat():
         nonlocal ticks
-        while running:
+        while True:
             ticks += 1
             await asyncio.sleep(0.001)
 
@@ -650,14 +649,13 @@ async def test_image_decode_does_not_block_the_event_loop(tmp_path, monkeypatch)
     try:
         await svc.do_command(_infer_cmd())
     finally:
-        running = False
         beat.cancel()
         try:
             await beat
         except asyncio.CancelledError:
             pass
 
-    assert ticks > 5, (
+    assert ticks > 20, (
         f"only {ticks} heartbeats ran during a 50ms decode: the policy's image "
         "decode is blocking the event loop it shares with the controller"
     )

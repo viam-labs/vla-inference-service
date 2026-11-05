@@ -272,7 +272,9 @@ class VLAPolicy(Generic, EasyResource):
                 raise WireError(f"{key}: {exc}") from exc
 
         # Off the event loop, one thread per camera: this process's loop also
-        # drives the controller's ticks, and a JPEG decode is CPU-bound.
+        # drives the controller's ticks, and a JPEG decode is CPU-bound. PIL
+        # releases the GIL in its decode path, so the cameras largely decode
+        # in parallel.
         async def decode(key: str, payload: dict[str, Any]) -> np.ndarray:
             try:
                 return await asyncio.to_thread(decode_image, payload)
