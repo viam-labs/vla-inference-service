@@ -293,8 +293,8 @@ def run_session(
         await svc.do_command({"command": "stop"})
         return Session(arm=arm, policy=policy, status=status, fps=fps)
 
-    async def inline(fn, *args):
-        return fn(*args)
+    async def inline(fn, /, *args, **kwargs):
+        return fn(*args, **kwargs)
 
     # The controller offloads image work to threads; the virtual clock cannot
     # wait for them, so run it inline for the session.

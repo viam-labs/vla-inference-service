@@ -183,9 +183,10 @@ class ObservationBuilder:
 
         # Off the event loop, one thread per camera: resize plus JPEG encode
         # is tens of milliseconds of CPU per frame, and this coroutine runs on
-        # the loop that drives the control ticks. PIL and numpy release the
-        # GIL in their C paths, so the cameras encode in parallel. Called by
-        # the module-level name so tests/smoothness.py can run it inline.
+        # the loop that drives the control ticks. PIL releases the GIL in its
+        # decode, resize and encode paths, so the cameras largely run in
+        # parallel. Called by the module-level name so tests/smoothness.py can
+        # run it inline.
         encoded = await asyncio.gather(
             *(to_thread(self._encode, key, arr) for key, (arr, _age) in zip(keys, frame_results))
         )
@@ -235,8 +236,9 @@ class ObservationBuilder:
         if not images:
             raise ObservationError(f"camera {key!r} returned zero images")
         # Off the event loop for the same reason as the encode in `build()`:
-        # JPEG decode plus RGB convert. One task already runs per camera, so
-        # the cameras decode in parallel.
+        # JPEG decode plus RGB convert. One task already runs per camera, and
+        # PIL releases the GIL in its decode path, so the cameras largely
+        # decode in parallel.
         arr = await to_thread(self._to_array, images[0])
         age = self._frame_age_s(metadata)
         return arr, age
