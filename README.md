@@ -960,6 +960,12 @@ half the wall-clock time, in 5-second freezes. RTC cannot do this job instead â€
 denoising steps. **For anything resembling a live demo, the x86+CUDA target remains the
 practical answer** â€” the numbers above are Mac-specific.
 
+The controller and the policy share one process and one event loop. Camera
+decode and encode on the controller, and image decode on the policy, run in
+threads (one per camera), so control ticks stay on time while an observation
+is built or decoded. Before this, an Orin Nano ran at 2.67 of a configured
+10 fps.
+
 ### Execution timing
 
 Every chunk is placed on a time axis. Row i of a chunk inferred from an
