@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 lerobot = [
-    "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@ff7cc3de1de830f5f3276918a013d04bdf9ea4be",
+    "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee",
 ]
 
 [dependency-groups]

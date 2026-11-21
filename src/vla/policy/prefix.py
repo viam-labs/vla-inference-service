@@ -4,7 +4,8 @@ Port of lerobot `rollout/inference/rtc.py::_normalize_prev_actions_length`.
 Kept as pure numpy so it is testable with no torch present.
 
 Verified against lerobot at git SHA
-`ff7cc3de1de830f5f3276918a013d04bdf9ea4be`,
+`ff7cc3de1de830f5f3276918a013d04bdf9ea4be` (the helper no longer exists
+at the current pin, 02655292; this port is now the reference),
 `src/lerobot/rollout/inference/rtc.py:83-94`
 (`_normalize_prev_actions_length`): same truncation side (keep the first
 `target_steps` rows), same zero-padding placement (existing rows first,
