@@ -18,6 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 lerobot = [
+    # Direct deps so [tool.uv.sources] below applies (uv ignores sources for transitive deps).
+    "torch",
+    "torchvision",
     "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee",
 ]
 
@@ -50,3 +53,15 @@ packages = ["src/vla"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# torch/torchvision from the CUDA 12.8 index on Linux, as lerobot <= ff7cc3de configured it.
+# lerobot 02655292c moved to PyPI wheels (CUDA 13, higher driver floor); keeping cu128 holds the
+# module's runtime unchanged across the pin bump. Jetson still swaps in sm_87 wheels in setup.sh.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]

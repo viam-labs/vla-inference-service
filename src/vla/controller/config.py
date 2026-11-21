@@ -114,7 +114,7 @@ DELTA_EE = "delta-ee"
 ACTION_SPACES = (JOINTS, DELTA_EE)
 
 # "pad" mirrors smolvla's own training-time convention (resize_with_pad,
-# lerobot/policies/common/vla_utils.py:219): scale to fit inside the declared
+# lerobot/policies/common/vla_utils.py:218): scale to fit inside the declared
 # (h, w) preserving aspect ratio, then pad black on the LEFT and TOP.
 # "stretch_bicubic" squashes the whole frame onto the target with EVO1's
 # resampler, and is the default under `action_space="delta-ee"`; see
