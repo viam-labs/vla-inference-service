@@ -675,7 +675,10 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     # the looser form is satisfied by the NEXT tick's write even when the
     # in-tick order is swapped.
     assert events.index("arm") == 1, events
-    assert events[:3] == ["gripper", "arm", "gripper"], events
+    # Writes are deferred to their row's time (a tick or more after the move that
+    # sampled them), but each still follows an arm move within its tick.
+    assert events[0] == "gripper" and "gripper" in events[2:], events
+    assert all(events[i - 1] == "arm" for i, e in enumerate(events) if i and e == "gripper"), events
 
 
 async def test_do_command_gripper_is_driven_through_a_real_tick():
@@ -743,7 +746,10 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
     await svc.do_command({"command": "stop"})
     # Same prefix assertion as the sibling test above, for the same reason.
     assert events.index("arm") == 1, events
-    assert events[:3] == ["gripper", "arm", "gripper"], events
+    # Writes are deferred to their row's time (a tick or more after the move that
+    # sampled them), but each still follows an arm move within its tick.
+    assert events[0] == "gripper" and "gripper" in events[2:], events
+    assert all(events[i - 1] == "arm" for i, e in enumerate(events) if i and e == "gripper"), events
 
 
 @pytest.mark.parametrize(
@@ -2644,3 +2650,104 @@ async def test_the_delta_clamp_allows_the_velocity_over_however_far_ahead_target
     budget = svc._safety.limits.max_joint_delta_degs
     await svc.do_command({"command": "stop"})
     assert budget == pytest.approx(120.0 / 20.0 * ticks_ahead)
+
+
+# ---------------------------------------------------------------------------
+# Bounded per-tick RPCs, halt-before-start
+# ---------------------------------------------------------------------------
+
+
+class _HangsOnce(FakeArm):
+    """Behaves until its first move, then hangs `hang` forever."""
+
+    def __init__(self, hang, **kw):
+        super().__init__(**kw)
+        self.hang = hang
+
+    def _maybe_hang(self, name):
+        return name == self.hang and self.moves
+
+    async def get_joint_positions(self, **kw):
+        if self._maybe_hang("get_joint_positions"):
+            await asyncio.sleep(3600)
+        return await super().get_joint_positions(**kw)
+
+    async def move_to_joint_positions(self, positions, **kw):
+        if self._maybe_hang("move_to_joint_positions"):
+            await asyncio.sleep(3600)
+        return await super().move_to_joint_positions(positions, **kw)
+
+
+class _HangingGripper(FakeDoCommandGripper):
+    async def do_command(self, command, **kw):
+        if "set" in command and any("set" in c for c in self.commands):  # past the preflight write
+            await asyncio.sleep(3600)
+        return await super().do_command(command, **kw)
+
+
+@pytest.mark.parametrize("hang", ["get_joint_positions", "move_to_joint_positions", "gripper write"])
+async def test_a_hung_per_tick_rpc_errors_the_run_instead_of_hanging(hang, monkeypatch):
+    monkeypatch.setattr("vla.controller.service._rpc_timeout_s", lambda fps: 0.05)
+    arm = _HangsOnce(None if hang == "gripper write" else hang, positions=[0.0] * 6)
+    extra = {"g": _HangingGripper(position=95.0)} if hang == "gripper write" else {}
+    svc = _svc(
+        config=_config(gripper=_DO_COMMAND_GRIPPER) if extra else _config(),
+        deps=_deps(policy=FakePolicyClient(action_dim=6) if extra else None, arm=arm, **extra),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "did not return within" in status["last_error"]
+    assert arm.stopped >= 1
+
+
+async def test_a_hung_policy_status_poll_errors_the_run(monkeypatch):
+    monkeypatch.setattr("vla.controller.service._POLICY_STATUS_TIMEOUT_S", 0.05)
+
+    class Hung(FakePolicyClient):
+        async def do_command(self, command, **kw):
+            await asyncio.sleep(3600)
+
+    svc = _svc(deps=_deps(policy=Hung()))
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "policy status did not return" in status["last_error"]
+
+
+async def test_a_hung_arm_stop_does_not_hang_stop(monkeypatch):
+    monkeypatch.setattr("vla.controller.service._rpc_timeout_s", lambda fps: 0.05)
+
+    class HungStop(FakeArm):
+        async def stop(self, **kw):
+            await asyncio.sleep(3600)
+
+    arm = HungStop(positions=[0.0] * 6)
+    svc = _svc(deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await asyncio.wait_for(svc.do_command({"command": "stop"}), 2.0)
+
+
+async def test_start_after_reconfigure_waits_for_the_old_halt():
+    events = []
+
+    class SlowStop(FakeArm):
+        async def stop(self, **kw):
+            events.append("stop_begin")
+            await asyncio.sleep(0.1)
+            events.append("stop_end")
+
+        async def move_to_joint_positions(self, positions, **kw):
+            events.append("move")
+            return await super().move_to_joint_positions(positions, **kw)
+
+    arm = SlowStop(positions=[0.0] * 6)
+    svc = _svc(deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    svc.reconfigure(_config(), _deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: events[events.index("stop_end"):].count("move") >= 1 if "stop_end" in events else False, "a move after the halt")
+    await svc.do_command({"command": "stop"})
+    # Nothing of the new run ran while the old arm.stop was in flight.
+    between = events[events.index("stop_begin"):events.index("stop_end")]
+    assert "move" not in between, events

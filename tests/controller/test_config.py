@@ -983,3 +983,14 @@ def test_stream_lead_s_defaults_to_zero_and_needs_stream():
         ControllerConfig.parse({**stream, "stream_lead_s": -0.01})
     with pytest.raises(ConfigError, match="stream_lead_s"):
         ControllerConfig.parse({**BASE, "stream_lead_s": 0.05})
+
+
+def test_inference_timeout_s_defaults_to_30_and_is_configurable():
+    assert ControllerConfig.parse(BASE).inference_timeout_s == 30.0
+    assert ControllerConfig.parse({**BASE, "inference_timeout_s": 90}).inference_timeout_s == 90.0
+
+
+@pytest.mark.parametrize("value", [0, -1.0, True, "30"])
+def test_inference_timeout_s_must_be_a_positive_number(value):
+    with pytest.raises(ConfigError, match="inference_timeout_s"):
+        ControllerConfig.parse({**BASE, "inference_timeout_s": value})

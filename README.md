@@ -355,6 +355,7 @@ backoff for up to `policy_ready_timeout_s`.
 | `smooth_rows` | odd integer, or 0 | `7`, `0` under `delta-ee` | Rows in the zero-phase quadratic (Savitzky–Golay) filter applied to each chunk as it lands. Removes tick-to-tick jitter in the policy's output without adding lag. `0` turns it off. See [Execution timing](#execution-timing). |
 | `starvation_grace_ticks` | integer | `3` | How many consecutive bad ticks the loop tolerates before halting. Counts consecutive tick *failures* (when `stop_on_error` is `false`) and, under `delta-ee`, consecutive `move_to_position` refusals. Waiting for a chunk is never fatal and never counted here; see `starved_ticks`. |
 | `policy_ready_timeout_s` | integer | `600` | How long, in the background, `start` waits for a cold policy before giving up. |
+| `inference_timeout_s` | number, > 0 | `30` | How long the loop waits for a chunk (and for the pre-motion warm-up inference) before failing the run. Raise it for a slow policy. |
 | `state_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit of the state vector sent to the policy. `"normalized"` is not yet supported — see [Limitations](#limitations). Under `delta-ee` this is per-segment; see [Units](#units). |
 | `action_units` | `degrees` \| `radians`, or an object under `delta-ee` | `"degrees"` | Unit the policy's action is expressed in. Per-segment under `delta-ee`. |
 | `image_encoding` | `jpeg` \| `png` \| `raw` | `"jpeg"` | A debugging knob (JPEG artifacts vs. the training distribution), not a tuning one. |

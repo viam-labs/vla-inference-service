@@ -276,13 +276,3 @@ class ArmStream:
             await self._task
         except asyncio.CancelledError:
             pass
-            return
-        try:
-            await asyncio.wait_for(self._task, _CLOSE_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            self._task.cancel()
-            try:
-                # Let teardown finish before the caller stops the arm.
-                await self._task
-            except asyncio.CancelledError:
-                pass
