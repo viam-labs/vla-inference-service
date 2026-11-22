@@ -38,6 +38,14 @@ def _require_dict(value: Any, field_name: str) -> dict[str, Any]:
     return value
 
 
+def _check_history_len(items: list, n_obs: int, what: str) -> None:
+    if len(items) != n_obs:
+        raise WireError(
+            f"'{what}' list has {len(items)} observation(s), expected {n_obs} "
+            "(specs.n_obs_steps), oldest first"
+        )
+
+
 class VLAPolicy(Generic, EasyResource):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam-labs", "vla"), "policy")
 
@@ -159,6 +167,9 @@ class VLAPolicy(Generic, EasyResource):
             LOGGER.warning("no state feature declared; skipping warmup")
             return
         state = np.zeros(int(specs.state_dim), dtype=np.float32)
+        if specs.n_obs_steps > 1:
+            images = {k: [v] * specs.n_obs_steps for k, v in images.items()}
+            state = [state] * specs.n_obs_steps
         backend.predict_chunk(images, state, "warmup", None)
 
     async def await_ready(self, *, expect_failure: bool = False) -> None:
@@ -264,10 +275,19 @@ class VLAPolicy(Generic, EasyResource):
         # was malformed but not which feed produced it, and a robot log needs
         # to name the camera. With several bad feeds, the one named is
         # whichever fails first.
+        # A value is one image payload, or a list of them (oldest first) for a
+        # policy that takes observation history (n_obs_steps > 1).
+        n_obs = specs.n_obs_steps if specs is not None else 1
         payloads = {}
+        is_list = {}
         for key, payload in images_raw.items():
             try:
-                payloads[key] = _require_dict(payload, "image payload")
+                is_list[key] = isinstance(payload, list)
+                if is_list[key]:
+                    _check_history_len(payload, n_obs, "images")
+                    payloads[key] = [_require_dict(p, "image payload") for p in payload]
+                else:
+                    payloads[key] = _require_dict(payload, "image payload")
             except WireError as exc:
                 raise WireError(f"{key}: {exc}") from exc
 
@@ -275,8 +295,14 @@ class VLAPolicy(Generic, EasyResource):
         # drives the controller's ticks, and a JPEG decode is CPU-bound. PIL
         # releases the GIL in its decode path, so the cameras largely decode
         # in parallel.
-        async def decode(key: str, payload: dict[str, Any]) -> np.ndarray:
+        async def decode(key: str, payload: Any) -> Any:
             try:
+                if isinstance(payload, list):
+                    return list(
+                        await asyncio.gather(
+                            *(asyncio.to_thread(decode_image, p) for p in payload)
+                        )
+                    )
                 return await asyncio.to_thread(decode_image, payload)
             except WireError as exc:
                 raise WireError(f"{key}: {exc}") from exc
@@ -300,13 +326,20 @@ class VLAPolicy(Generic, EasyResource):
         # decode_vector, not a bare asarray: `command.get("state") or []` would
         # silently yield an empty array for a missing or malformed state, and
         # the shape mismatch would surface deep inside the backend instead.
-        state_payload = _require_dict(command["state"], "state")
-        state = decode_vector(state_payload)
-        if specs is not None and state.shape[0] != specs.state_dim:
-            raise WireError(
-                f"'state' vector has length {state.shape[0]}, expected "
-                f"{specs.state_dim} (specs.state_dim)"
-            )
+        state_raw = command["state"]
+        if isinstance(state_raw, list):
+            _check_history_len(state_raw, n_obs, "state")
+            state = [decode_vector(_require_dict(p, "state")) for p in state_raw]
+            state_vecs = state
+        else:
+            state = decode_vector(_require_dict(state_raw, "state"))
+            state_vecs = [state]
+        for vec in state_vecs:
+            if specs is not None and vec.shape[0] != specs.state_dim:
+                raise WireError(
+                    f"'state' vector has length {vec.shape[0]}, expected "
+                    f"{specs.state_dim} (specs.state_dim)"
+                )
 
         task_raw = command.get("task")
         if task_raw is None:

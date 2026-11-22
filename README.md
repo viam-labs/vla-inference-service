@@ -161,6 +161,7 @@ controller's `cameras`, `state_joint_indices`, and `gripper` have to line up wit
   "action_dim": 6,
   "state_dim": 6,
   "n_action_steps": 50,
+  "n_obs_steps": 1,
   "input_features": {
     "observation.state": [6],
     "observation.images.camera1": [3, 256, 256],
@@ -185,6 +186,10 @@ controller's `cameras`, `state_joint_indices`, and `gripper` have to line up wit
   "dtype": "bfloat16"
 }
 ```
+
+`n_obs_steps` is how many observations one `infer` call takes (read from the checkpoint's
+config, `1` when it has none). Diffusion checkpoints are typically trained with `2`; see
+[`infer`](#infer).
 
 `preprocess_image_size` is `(height, width)` — the size the policy's own preprocessing
 resizes every frame to before the encoder (smolvla's `resize_imgs_with_padding`, which the
@@ -235,6 +240,27 @@ waiting for the policy's lock and decoding the images, so `server_s - compute_s`
 plus overhead. A `seq` in the request is echoed back, so a caller can match replies to
 requests.
 `encoding` may be `jpeg`, `png`, or `raw`; see `src/vla/wire.py`.
+
+**Observation history (`n_obs_steps > 1`, e.g. diffusion).** Each `images[key]` and `state`
+may instead be a list of exactly `specs.n_obs_steps` payloads, oldest first, the last being
+the current observation:
+
+```json
+{
+  "command": "infer",
+  "images": { "observation.images.top": [{ "...": "older frame" }, { "...": "current frame" }] },
+  "state": [{ "values": [0.0] }, { "values": [0.1] }]
+}
+```
+
+Frames must be spaced at the training fps (1/fps apart); the policy has no timestamps, so
+other spacing silently changes what it sees. A list of the wrong length is an error. A single
+(non-list) observation sent to a model with `n_obs_steps > 1` is accepted: it is repeated
+`n_obs_steps` times, as LeRobot does on the first step, and a one-time warning is logged.
+For `n_obs_steps == 1` the request format is unchanged (a one-element list is also accepted).
+
+Diffusion (`policy_type: "diffusion"`) is supported; the module's `lerobot` extra installs
+`diffusers` for it.
 
 RTC callers add an optional `rtc` object:
 
