@@ -1010,6 +1010,18 @@ encode on the controller, and image decode on the policy, run in threads (one pe
 camera), so image work no longer stalls control ticks. Before this, an Orin Nano ran at
 2.67 of a configured 10 fps.
 
+### Observation history (`n_obs_steps > 1`)
+
+The controller reads `n_obs_steps` from the policy's `specs`. With `1` (most policies)
+requests are unchanged. With `n > 1` (diffusion is typically trained with `2`) each
+inference captures a burst of `n` observations, `1/fps` apart, and sends `images[key]` and
+`state` as lists of `n`, oldest first, as the policy's [`infer`](#infer) expects; the last is
+the current observation and sets `t_obs`. The burst adds `(n - 1) / fps` before the request
+leaves, and the controller counts it in `expected_latency` (so in the overlap/sequential
+choice and the inference trigger). A failed read in any frame fails the observation. If
+reads take longer than `1/fps` the frames are spaced by the read time instead. There is no
+config key; it follows the policy.
+
 ### Execution timing
 
 Every chunk is placed on a time axis. Row i of a chunk inferred from an

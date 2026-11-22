@@ -33,7 +33,7 @@ import asyncio
 import logging
 import time
 from asyncio import to_thread
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -102,6 +102,9 @@ class Observation:
     # Controller-clock time the arm-state read returned. Row i of the chunk
     # inferred from this observation means "be here at t_obs + (i+1)/fps".
     t_obs: float
+    # With n_obs_steps > 1: all n observations, oldest first, the last being
+    # this one (so `images`/`state`/`t_obs` are the newest). Empty otherwise.
+    history: tuple["Observation", ...] = ()
 
 
 class ObservationBuilder:
@@ -125,6 +128,8 @@ class ObservationBuilder:
         duration_warn_s: float = DEFAULT_DURATION_WARN_S,
         stale_frame_warn_s: float = STALE_FRAME_WARN_S,
         clock: Callable[[], float] = time.perf_counter,
+        n_obs_steps: int = 1,
+        fps: float = 10.0,
     ) -> None:
         self._cameras = dict(cameras)
         self._arm = arm
@@ -139,8 +144,32 @@ class ObservationBuilder:
         self._duration_warn_s = duration_warn_s
         self._stale_frame_warn_s = stale_frame_warn_s
         self._clock = clock
+        self._n_obs = n_obs_steps
+        self._period = 1.0 / fps
 
     async def build(self) -> Observation:
+        """One observation, or a burst of `n_obs_steps` spaced 1/fps apart.
+
+        A burst starts each capture 1/fps after the previous one started (no
+        wait when a capture overran its slot), so the frames are `period` apart
+        as the policy was trained. A failed capture fails the whole burst.
+        """
+        if self._n_obs == 1:
+            return await self._build_one()
+        started = self._clock()
+        frames: list[Observation] = []
+        for k in range(self._n_obs):
+            delay = started + k * self._period - self._clock()
+            if k and delay > 0:
+                await asyncio.sleep(delay)
+            frames.append(await self._build_one())
+        shapes = {tuple((key, p["height"], p["width"]) for key, p in sorted(f.images.items())) for f in frames}
+        if len(shapes) > 1:
+            raise ObservationError(f"burst frames differ in image shape: {sorted(shapes)}")
+        # duration_s spans the whole burst, from the first capture.
+        return replace(frames[-1], duration_s=self._clock() - started, history=tuple(frames))
+
+    async def _build_one(self) -> Observation:
         started = self._clock()
         keys = list(self._cameras)
 

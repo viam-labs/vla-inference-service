@@ -781,6 +781,7 @@ class VLAController(Generic, EasyResource):
             # sent -- it has no entry in image_sizes, so ObservationBuilder
             # would fail trying to resize/encode it for a resolution nothing
             # declared, for a feed the policy never asked to see.
+            n_obs = int(specs.get("n_obs_steps", 1))
             builder = ObservationBuilder(
                 clock=self._clock,
                 cameras={key: self._resource(cfg.cameras[key]) for key in image_sizes},
@@ -795,6 +796,8 @@ class VLAController(Generic, EasyResource):
                 action_space=cfg.action_space,
                 duration_warn_s=cfg.duration_warn_s,
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
+                n_obs_steps=n_obs,
+                fps=cfg.fps,
             )
             self._safety = self._build_safety(gripper)
             self._buffer = ReferenceBuffer(
@@ -812,6 +815,7 @@ class VLAController(Generic, EasyResource):
                 margin_s=cfg.margin_s,
                 timeout_s=cfg.inference_timeout_s,
                 clock=self._clock,
+                capture_s=(n_obs - 1) / cfg.fps,
             )
 
             # One full round trip before motion, its chunk discarded. The policy's
@@ -864,10 +868,15 @@ class VLAController(Generic, EasyResource):
         """
         obs = await builder.build()
         self._seq += 1
+        if obs.history:
+            images = {k: [f.images[k] for f in obs.history] for k in obs.images}
+            state: Any = [encode_vector(f.state) for f in obs.history]
+        else:
+            images, state = obs.images, encode_vector(obs.state)
         payload: dict[str, Any] = {
             "command": "infer",
-            "images": obs.images,
-            "state": encode_vector(obs.state),
+            "images": images,
+            "state": state,
             "task": self._active_task_text,
             "seq": self._seq,
             "t_obs": obs.t_obs,
