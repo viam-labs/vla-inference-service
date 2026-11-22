@@ -130,3 +130,22 @@ def test_backend_wrong_list_length_errors():
     b, _ = _backend(2, True)
     with pytest.raises(ValueError, match="n_obs_steps=2"):
         b.predict_chunk({KEY: [_frame(0)] * 3}, [_state(1)] * 2, "", None)
+
+
+def test_unverified_type_with_history_rejected_at_load():
+    from vla.config_util import ConfigError
+
+    cfg = SimpleNamespace(type="g05", n_obs_steps=2)
+    with pytest.raises(ConfigError, match="g05"):
+        LeRobotBackend._check_history_supported(cfg)
+    LeRobotBackend._check_history_supported(SimpleNamespace(type="diffusion", n_obs_steps=2))
+    LeRobotBackend._check_history_supported(SimpleNamespace(type="g05", n_obs_steps=1))
+
+
+async def test_infer_history_frames_must_share_shape(tmp_path):
+    svc = await _ready_service(tmp_path, n_obs_steps=2)
+    small = encode_image(np.zeros((100, 100, 3), dtype=np.uint8), encoding="png")
+    with pytest.raises(WireError, match=KEY):
+        await svc.do_command(
+            {"command": "infer", "images": {KEY: [_img(1), small]}, "state": [_vec(1), _vec(2)]}
+        )

@@ -102,6 +102,7 @@ class LeRobotBackend:
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
         cfg = PreTrainedConfig.from_pretrained(checkpoint_dir)
+        self._check_history_supported(cfg)
         self._apply_num_steps(cfg, num_steps)
         policy_cls = get_policy_class(cfg.type)
         policy = policy_cls.from_pretrained(checkpoint_dir, config=cfg)
@@ -152,6 +153,16 @@ class LeRobotBackend:
         self._specs = self._build_specs(
             cfg, policy, supports_rtc, preprocessor, resolved_device, unused_image_features
         )
+
+    @staticmethod
+    def _check_history_supported(cfg) -> None:
+        n_obs = getattr(cfg, "n_obs_steps", 1)
+        if n_obs > 1 and cfg.type not in _TIME_AXIS_POLICIES:
+            raise ConfigError(
+                f"policy type {cfg.type!r} has n_obs_steps={n_obs}, but observation history is "
+                f"only verified for {sorted(_TIME_AXIS_POLICIES)}; its state/image layout is "
+                "unchecked"
+            )
 
     @staticmethod
     def _apply_num_steps(cfg, num_steps: int | None) -> None:
@@ -297,7 +308,7 @@ class LeRobotBackend:
             raise RuntimeError("backend not loaded")
 
         n_obs = self._specs.n_obs_steps
-        stacked = self._time_axis or n_obs > 1
+        stacked = self._time_axis
         batch: dict[str, Any] = {"task": task}
         for key, img in images.items():
             frames = self._history(img, n_obs, f"images[{key!r}]")

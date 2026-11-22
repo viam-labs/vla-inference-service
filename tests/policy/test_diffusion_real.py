@@ -1,7 +1,7 @@
 """Real DiffusionPolicy through LeRobotBackend.predict_chunk (needs torch, lerobot, diffusers).
 
 `integration`-marked: skipped by `mise run test`. The in-memory test needs no files; the
-checkpoint test also skips when DIFFUSION_CHECKPOINT (default below) is missing.
+checkpoint test skips unless DIFFUSION_CHECKPOINT points at a checkpoint dir.
 """
 
 from __future__ import annotations
@@ -14,12 +14,7 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-CHECKPOINT = Path(
-    os.environ.get(
-        "DIFFUSION_CHECKPOINT",
-        "/Users/nick.hehr/src/diff-ik/.runs/policy-act/diffusion-v2/pkg",
-    )
-)
+CHECKPOINT = Path(os.environ["DIFFUSION_CHECKPOINT"]) if "DIFFUSION_CHECKPOINT" in os.environ else None
 
 
 def _run(backend, n_obs, h, w, d):
@@ -37,7 +32,9 @@ def _run(backend, n_obs, h, w, d):
     )
 
 
-@pytest.mark.skipif(not CHECKPOINT.exists(), reason=f"{CHECKPOINT} missing")
+@pytest.mark.skipif(
+    CHECKPOINT is None or not CHECKPOINT.exists(), reason="DIFFUSION_CHECKPOINT unset or missing"
+)
 def test_real_checkpoint_loads_and_predicts():
     from vla.policy.lerobot_backend import LeRobotBackend
 

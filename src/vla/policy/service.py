@@ -279,11 +279,9 @@ class VLAPolicy(Generic, EasyResource):
         # policy that takes observation history (n_obs_steps > 1).
         n_obs = specs.n_obs_steps if specs is not None else 1
         payloads = {}
-        is_list = {}
         for key, payload in images_raw.items():
             try:
-                is_list[key] = isinstance(payload, list)
-                if is_list[key]:
+                if isinstance(payload, list):
                     _check_history_len(payload, n_obs, "images")
                     payloads[key] = [_require_dict(p, "image payload") for p in payload]
                 else:
@@ -298,11 +296,17 @@ class VLAPolicy(Generic, EasyResource):
         async def decode(key: str, payload: Any) -> Any:
             try:
                 if isinstance(payload, list):
-                    return list(
+                    frames = list(
                         await asyncio.gather(
                             *(asyncio.to_thread(decode_image, p) for p in payload)
                         )
                     )
+                    shapes = {f.shape for f in frames}
+                    if len(shapes) > 1:
+                        raise WireError(
+                            f"history frames differ in shape: {sorted(shapes)}"
+                        )
+                    return frames
                 return await asyncio.to_thread(decode_image, payload)
             except WireError as exc:
                 raise WireError(f"{key}: {exc}") from exc
