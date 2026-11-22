@@ -62,8 +62,8 @@ The two settings most likely to bite you are `state_units`/`action_units` (see
 | `model_revision` | string | `"main"` | Hub revision/tag/commit SHA. Ignored for `model_path`. |
 | `hf_token_env` | string | — | The **name** of an environment variable holding a Hugging Face token — never the token itself. Machine configs are readable by anyone with fleet access. |
 | `device` | `auto` \| `cuda` \| `mps` \| `cpu` | `"auto"` | `auto` tries cuda → mps → cpu, first available. Covers all three deployment targets with no per-machine edits. |
-| `dtype` | `auto` \| `float32` \| `bfloat16` \| `float16` | `"auto"` | Parsed and validated but **not yet applied** to loaded weights — see [Limitations](#limitations). |
-| `num_steps` | integer, 1–1000 | — (the checkpoint's own) | Overrides the policy's flow-matching / denoising step count (smolvla ships `10`). Inference latency scales roughly linearly with it; see [Cutting inference latency](#cutting-inference-latency-num_steps). Refused at load for a policy type that has no such setting. |
+| `dtype` | `auto` \| `float32` \| `bfloat16` \| `float16` | `"auto"` | Applied to policies that read a config `dtype` when building the model: `pi05`, `cosmos3_edge`, `cosmos3_nano` (float32 or bfloat16 only; `float16` is refused). Ignored with a warning for other policies (act, diffusion, smolvla), which keep the checkpoint's dtype. `auto` never changes it. **bfloat16 is recommended on MPS for pi05 and cosmos3_edge**: pi05 is about 14.5 GB in float32 on a 24 GB Mac. |
+| `num_steps` | integer, 1–1000 | — (the checkpoint's own) | Overrides the policy's flow-matching / denoising step count (smolvla ships `10`). Maps to the config's `num_steps`, or `num_inference_steps` for diffusion, pi05 and cosmos3_edge. Inference latency scales roughly linearly with it; see [Cutting inference latency](#cutting-inference-latency-num_steps). Refused at load for a policy type that has no such setting. |
 | `warmup_inferences` | integer, 0–100 | `2` | Throwaway inferences run on synthetic input at load, before `status` reports `ready`. First-call latency on a cold GPU is often several times steady-state. |
 | `load_timeout_s` | number, 0.001–86400 | `1800` | Bounds checkpoint-resolve + load + warmup as a whole. A hang (stuck download, wedged deserialize) becomes `state: failed` with a message instead of `loading` forever. |
 | `rtc.enabled` | boolean | `false` | Enables the RTC processor on the policy, if the checkpoint supports it (ignored with a logged warning otherwise). |
@@ -258,6 +258,8 @@ other spacing silently changes what it sees. A list of the wrong length is an er
 (non-list) observation sent to a model with `n_obs_steps > 1` is accepted: it is repeated
 `n_obs_steps` times, as LeRobot does on the first step, and a one-time warning is logged.
 For `n_obs_steps == 1` the request format is unchanged (a one-element list is also accepted).
+
+`pi05` and `cosmos3_edge` are also supported (the `lerobot` extra includes `pi` and `cosmos3`); set `dtype: "bfloat16"` on MPS.
 
 Diffusion (`policy_type: "diffusion"`) is supported; the module's `lerobot` extra installs
 `diffusers` for it.
@@ -1095,12 +1097,11 @@ measure both: `avg_latency_s` and `regime` in the controller's `status` for the 
   (via each `TrajectoryPoint`'s `KinematicConstraints`) — are reachable on `viam-sdk`
   >= 0.82.0, but this module sets no constraint on them, so the velocity bound still
   lives entirely in the safety layer's per-tick clamp (see [Safety](#safety)).
-- **`dtype` is parsed and validated but not applied.** Casting weights with
-  `policy.to(dtype=...)` breaks inference on at least one target (the deserialized
-  `DeviceProcessorStep` has `float_dtype=None` and keeps emitting float32 regardless).
-  The checkpoint's own dtype is used as-is; a non-`"auto"` setting logs a warning rather
-  than silently doing nothing. (`lerobot/smolvla_base` runs `bfloat16` natively, which is
-  why this has not blocked phase-1 testing.)
+- **`dtype` only applies to pi05 and cosmos3.** Casting weights after load with
+  `policy.to(dtype=...)` breaks inference (the deserialized `DeviceProcessorStep` has
+  `float_dtype=None` and keeps emitting float32), so `dtype` is instead set on the config before
+  `from_pretrained`, which only pi05 and cosmos3 honor. Other policies log a warning and keep
+  the checkpoint's dtype.
 
 ## Development
 

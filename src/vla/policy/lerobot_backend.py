@@ -69,6 +69,12 @@ def _select_device(requested: str) -> str:
     return "cpu"
 
 
+# Policies whose modeling reads `config.dtype` when building the model, and whose configs
+# reject anything but float32/bfloat16. Every PreTrainedConfig inherits a `dtype` field
+# (default None), so hasattr() alone would also match act/diffusion/smolvla, which ignore it.
+_DTYPE_POLICIES = frozenset({"pi05", "cosmos3_edge", "cosmos3_nano"})
+
+
 class LeRobotBackend:
     """Loads a checkpoint and turns observations into action chunks.
 
@@ -104,21 +110,13 @@ class LeRobotBackend:
         cfg = PreTrainedConfig.from_pretrained(checkpoint_dir)
         self._check_history_supported(cfg)
         self._apply_num_steps(cfg, num_steps)
+        self._apply_dtype(cfg, dtype)
         policy_cls = get_policy_class(cfg.type)
         policy = policy_cls.from_pretrained(checkpoint_dir, config=cfg)
 
         resolved_device = _select_device(device)
         policy.to(resolved_device)
         policy.eval()
-
-        if dtype != "auto":
-            # Deliberately not applied. Casting weights with `policy.to(dtype=...)`
-            # leaves the preprocessor emitting float32 (its serialized
-            # DeviceProcessorStep.float_dtype is None), producing
-            # "expected scalar type BFloat16 but found Float". Upstream never
-            # casts weights; it uses torch.autocast gated on config.use_amp.
-            # Wiring that up is deferred - see "Deferred to follow-up plans".
-            LOGGER.warning("dtype=%s is not yet applied; running in the checkpoint's dtype", dtype)
 
         supports_rtc = bool(policy.supports_rtc())
         if rtc is not None and rtc.enabled:
@@ -170,15 +168,38 @@ class LeRobotBackend:
         type that has no such setting rather than ship an inert latency knob."""
         if num_steps is None:
             return
-        if not hasattr(cfg, "num_steps"):
+        # smolvla/evo1 call it num_steps; diffusion, pi05 and cosmos3 num_inference_steps.
+        field = next((f for f in ("num_steps", "num_inference_steps") if hasattr(cfg, f)), None)
+        if field is None:
             raise ConfigError(
                 f"num_steps={num_steps} was configured but policy type {cfg.type!r} has no "
                 "num_steps setting; remove it"
             )
         LOGGER.info(
-            "num_steps overridden: checkpoint declares %s, running %d", cfg.num_steps, num_steps
+            "num_steps overridden: checkpoint declares %s=%s, running %d",
+            field,
+            getattr(cfg, field),
+            num_steps,
         )
-        cfg.num_steps = num_steps
+        setattr(cfg, field, num_steps)
+
+    @staticmethod
+    def _apply_dtype(cfg, dtype: str) -> None:
+        """Set the config's `dtype` before `from_pretrained`, for policies that honor it
+        (pi05, cosmos3), which then cast their own weights. Casting afterwards with
+        `policy.to(dtype=...)` is deliberately avoided: the preprocessor keeps emitting
+        float32 (its DeviceProcessorStep.float_dtype is None). Policies without the field
+        (act, diffusion, smolvla) and `auto` keep the checkpoint's dtype."""
+        if dtype == "auto":
+            return
+        if cfg.type not in _DTYPE_POLICIES or not hasattr(cfg, "dtype"):
+            LOGGER.warning("dtype=%s ignored: %s does not apply it", dtype, cfg.type)
+            return
+        if dtype == "float16":
+            raise ConfigError(f"policy type {cfg.type!r} supports dtype float32 or bfloat16, not float16")
+        import torch
+
+        cfg.dtype = getattr(torch, dtype)
 
     @staticmethod
     def _configure_rtc(policy, rtc) -> None:

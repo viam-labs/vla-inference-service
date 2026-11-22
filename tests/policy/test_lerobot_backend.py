@@ -220,6 +220,36 @@ def test_num_steps_is_refused_for_a_policy_type_without_one():
         LeRobotBackend._apply_num_steps(cfg, 4)
 
 
+def test_num_steps_maps_to_num_inference_steps():
+    cfg = SimpleNamespace(type="cosmos3_edge", num_inference_steps=30)
+    LeRobotBackend._apply_num_steps(cfg, 8)
+    assert cfg.num_inference_steps == 8
+    assert not hasattr(cfg, "num_steps")
+
+
+def test_dtype_is_set_on_a_config_that_has_the_field():
+    torch = pytest.importorskip("torch")
+    cfg = SimpleNamespace(type="pi05", dtype=torch.float32)
+    LeRobotBackend._apply_dtype(cfg, "bfloat16")
+    assert cfg.dtype is torch.bfloat16
+
+
+def test_dtype_is_left_alone_when_auto_or_field_absent():
+    torch = pytest.importorskip("torch")
+    cfg = SimpleNamespace(type="pi05", dtype=torch.float32)
+    LeRobotBackend._apply_dtype(cfg, "auto")
+    assert cfg.dtype is torch.float32
+    plain = SimpleNamespace(type="diffusion")
+    LeRobotBackend._apply_dtype(plain, "bfloat16")
+    assert not hasattr(plain, "dtype")
+
+
+def test_dtype_float16_is_refused_where_the_config_rejects_it():
+    cfg = SimpleNamespace(type="pi05", dtype=None)
+    with pytest.raises(ConfigError, match="float16"):
+        LeRobotBackend._apply_dtype(cfg, "float16")
+
+
 class _FakeTorch:
     """Enough torch surface for `_select_device`, with a controllable device.
 
@@ -292,3 +322,21 @@ def test_an_explicit_device_is_never_probed_or_downgraded(monkeypatch):
     fake = _FakeTorch(cuda_available=True, cuda_works=False)
     assert _select(monkeypatch, fake)("cuda") == "cuda"
     assert fake.launched == []
+
+
+@pytest.mark.differential
+def test_real_configs_expose_the_names_we_map():
+    """Meta-device check at the pinned lerobot: no weights, no download."""
+    torch = pytest.importorskip("torch")
+    from lerobot.policies.cosmos3.configuration_cosmos3 import Cosmos3EdgeConfig
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
+
+    for cfg in (PI05Config(), Cosmos3EdgeConfig()):
+        LeRobotBackend._apply_dtype(cfg, "bfloat16")
+        LeRobotBackend._apply_num_steps(cfg, 3)
+        assert cfg.dtype is torch.bfloat16 and cfg.num_inference_steps == 3
+    d = DiffusionConfig()
+    LeRobotBackend._apply_dtype(d, "bfloat16")
+    LeRobotBackend._apply_num_steps(d, 3)
+    assert d.dtype is None and d.num_inference_steps == 3
