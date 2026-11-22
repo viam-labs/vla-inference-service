@@ -168,8 +168,10 @@ class LeRobotBackend:
         type that has no such setting rather than ship an inert latency knob."""
         if num_steps is None:
             return
-        # smolvla/evo1 call it num_steps; diffusion, pi05 and cosmos3 num_inference_steps.
-        field = next((f for f in ("num_steps", "num_inference_steps") if hasattr(cfg, f)), None)
+        # smolvla calls it num_steps; diffusion, pi05 and cosmos3 num_inference_steps; evo1
+        # num_inference_timesteps.
+        fields = ("num_steps", "num_inference_steps", "num_inference_timesteps")
+        field = next((f for f in fields if hasattr(cfg, f)), None)
         if field is None:
             raise ConfigError(
                 f"num_steps={num_steps} was configured but policy type {cfg.type!r} has no "

@@ -340,3 +340,9 @@ def test_real_configs_expose_the_names_we_map():
     LeRobotBackend._apply_dtype(d, "bfloat16")
     LeRobotBackend._apply_num_steps(d, 3)
     assert d.dtype is None and d.num_inference_steps == 3
+
+
+def test_num_steps_maps_to_evo1_num_inference_timesteps():
+    cfg = SimpleNamespace(type="evo1", num_inference_timesteps=32)
+    LeRobotBackend._apply_num_steps(cfg, 8)
+    assert cfg.num_inference_timesteps == 8
