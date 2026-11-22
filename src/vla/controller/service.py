@@ -1001,6 +1001,8 @@ class VLAController(Generic, EasyResource):
                         f"{consecutive_read_timeouts} consecutive read timeouts exceeded "
                         f"starvation_grace_ticks={cfg.starvation_grace_ticks}: {exc}"
                     ) from exc
+                # Due gripper values are not held through a skipped tick.
+                await self._flush_gripper(gripper)
 
             last_tick = self._record_tick(last_tick)
             await self._pace(schedule)

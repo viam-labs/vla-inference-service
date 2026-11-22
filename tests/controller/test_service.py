@@ -665,6 +665,23 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
         config=_config(gripper=_DO_COMMAND_GRIPPER),
         deps=_deps(policy=policy, arm=arm, g=gripper),
     )
+    orig_wait = svc._wait_for_chunk
+
+    async def marked(*a, **k):
+        events.append("wait>")
+        try:
+            return await orig_wait(*a, **k)
+        finally:
+            events.append("<wait")
+
+    svc._wait_for_chunk = marked
+    orig_pace = svc._pace
+
+    async def paced(*a, **k):
+        events.append("pace")
+        return await orig_pace(*a, **k)
+
+    svc._pace = paced
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
@@ -674,10 +691,21 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     # events[first_arm_idx + 1] is load-bearing: with ~8 ticks in the window,
     # the looser form is satisfied by the NEXT tick's write even when the
     # in-tick order is swapped.
-    assert events.index("arm") == 1, events
-    # Writes are deferred to their row's time, so only the preflight write may
-    # precede the first arm move, and a write follows it later.
-    assert events[0] == "gripper" and "gripper" in events[2:], events
+    assert events[0] == "gripper", events
+    # Only the preflight write may precede the first arm move. Outside a chunk wait,
+    # a write is the in-tick one: it must directly follow its arm move and end its
+    # tick (the pace marker). Inside a wait it is a deferred flush, with no arm move.
+    in_wait, tick_writes = False, 0
+    for i, e in enumerate(events):
+        if e == "wait>":
+            in_wait = True
+        elif e == "<wait":
+            in_wait = False
+        elif e == "gripper" and i > 0 and not in_wait:
+            assert events[i - 1] == "arm", events
+            assert events[i + 1] == "pace", events  # the write ends its tick
+            tick_writes += 1
+    assert tick_writes >= 1, events
 
 
 async def test_do_command_gripper_is_driven_through_a_real_tick():
@@ -740,14 +768,42 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
         ),
         deps=_deps(policy=policy, arm=arm, g=g),
     )
+    orig_wait = svc._wait_for_chunk
+
+    async def marked(*a, **k):
+        events.append("wait>")
+        try:
+            return await orig_wait(*a, **k)
+        finally:
+            events.append("<wait")
+
+    svc._wait_for_chunk = marked
+    orig_pace = svc._pace
+
+    async def paced(*a, **k):
+        events.append("pace")
+        return await orig_pace(*a, **k)
+
+    svc._pace = paced
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
     # Same prefix assertion as the sibling test above, for the same reason.
-    assert events.index("arm") == 1, events
-    # Writes are deferred to their row's time, so only the preflight write may
-    # precede the first arm move, and a write follows it later.
-    assert events[0] == "gripper" and "gripper" in events[2:], events
+    assert events[0] == "gripper", events
+    # Only the preflight write may precede the first arm move. Outside a chunk wait,
+    # a write is the in-tick one: it must directly follow its arm move and end its
+    # tick (the pace marker). Inside a wait it is a deferred flush, with no arm move.
+    in_wait, tick_writes = False, 0
+    for i, e in enumerate(events):
+        if e == "wait>":
+            in_wait = True
+        elif e == "<wait":
+            in_wait = False
+        elif e == "gripper" and i > 0 and not in_wait:
+            assert events[i - 1] == "arm", events
+            assert events[i + 1] == "pace", events  # the write ends its tick
+            tick_writes += 1
+    assert tick_writes >= 1, events
 
 
 @pytest.mark.parametrize(
@@ -2726,6 +2782,20 @@ async def test_one_read_timeout_skips_the_tick_and_the_run_continues():
     arm.svc = svc
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_until(lambda: arm.loop_reads > 6 and len(arm.moves) >= 5, "ticks past the timeout")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["state"] == "running"
+
+
+async def test_read_timeouts_never_in_a_row_do_not_escalate():
+    # More timeouts than starvation_grace_ticks allows, but never two in a row.
+    arm = _SlowReads({2, 4, 6, 8}, positions=[0.0] * 6)
+    svc = _svc(
+        config=_config(rpc_timeout_s=0.02, starvation_grace_ticks=2), deps=_deps(arm=arm)
+    )
+    arm.svc = svc
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: arm.loop_reads > 12, "ticks past every timeout")
     status = await svc.do_command({"command": "status"})
     await svc.do_command({"command": "stop"})
     assert status["state"] == "running"
