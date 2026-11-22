@@ -36,6 +36,14 @@ class FailsOnSecondRead(FakeCamera):
         return await super().get_images(*a, **kw)
 
 
+class SlowSecondRead(FakeCamera):
+    async def get_images(self, *a, **kw):
+        self.calls = getattr(self, "calls", 0) + 1
+        if self.calls == 2:
+            await asyncio.sleep(1.5 / FPS)
+        return await super().get_images(*a, **kw)
+
+
 def _builder(clock, camera=None, n=2):
     return ObservationBuilder(
         cameras={KEY: camera or FakeCamera()},
@@ -112,3 +120,59 @@ def test_end_to_end_single_step_request_unchanged():
     s = run_session(latency_s=0.2, duration_s=4.0)
     for req in s.policy.requests:
         assert isinstance(req["images"][KEY], dict) and isinstance(req["state"], dict)
+
+
+def test_slow_read_never_compresses_a_later_gap():
+    obs = _build(SlowSecondRead(), n=3)
+    assert min(obs.gaps) >= 1.0 / FPS - 1e-9
+    assert max(obs.gaps) == pytest.approx(1.5 / FPS)
+
+
+def test_capture_time_is_measured_not_assumed():
+    clock = [0.0]
+
+    async def infer():
+        t_obs = clock[0] + 0.5  # the burst took 0.5 s, not the assumed 0.1
+        clock[0] += 0.6
+        return np.zeros((10, 1)), t_obs
+
+    buf = ReferenceBuffer(10.0, blend_s=0.2, interp_cols=1, consume=False, smooth_rows=0)
+    lp = InferenceLoop(
+        infer, buf, chunk_s=100.0, blend_s=0.2, margin_s=0.2, timeout_s=5.0,
+        clock=lambda: clock[0], capture_s=0.1,
+    )
+    asyncio.run(lp._infer_and_land())
+    assert lp.captures[-1] == pytest.approx(0.5)
+    assert lp.expected_latency == pytest.approx(0.1 + 0.5)
+
+
+def test_overlap_end_to_end_anchors_to_newest_frame():
+    from vla.controller.observation import ObservationBuilder as OB
+    from vla.wire import decode_vector
+
+    seen: list[float] = []
+    orig = OB._build_one
+
+    async def spy(self):
+        obs = await orig(self)
+        seen.append(obs.t_obs)
+        return obs
+
+    with patch.object(OB, "_build_one", spy):
+        s = run_session(latency_s=0.3, duration_s=30.0, n_obs_steps=2)
+    assert s.status["regime"] == "overlap"
+    assert s.status["starved_ticks"] == 0
+    assert s.status["obs_gaps_s"] == pytest.approx([0.1])
+    assert len(s.policy.requests) >= 5
+    newest = set(seen[1::2])  # frames come in (oldest, newest) pairs
+    for i, req in enumerate(s.policy.requests):
+        old, new = (decode_vector(v) for v in req["state"])
+        if i:  # the first request is observed at rest, before any motion
+            assert not np.allclose(old, new)  # the arm is moving
+        assert req["t_obs"] in newest  # the policy's rows are stamped from the newest frame
+
+
+def test_n_obs_steps_below_one_fails_at_start():
+    s = run_session(latency_s=0.2, duration_s=2.0, n_obs_steps=0)
+    assert s.status["state"] == "error"
+    assert "n_obs_steps" in s.status["last_error"]
