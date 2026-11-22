@@ -87,19 +87,16 @@ from .observation import ObservationBuilder, pose_state_from_proto
 from .pose import orientation_vector, state_compose, state_rotation
 from .reference_buffer import ReferenceBuffer
 from .safety import CartesianSafetyLayer, SafetyLayer
-from .trajectory import ArmStream
+from .trajectory import _CLOSE_TIMEOUT_S, ArmStream
 from .units import to_degrees, to_working
 
 # Policy `status`/`specs` are cheap lookups, but a busy policy server can be slow
 # to answer; this only has to catch one that never does.
 _POLICY_STATUS_TIMEOUT_S = 10.0
-# How long `start` waits on the halt a reconfigure scheduled.
-_HALT_WAIT_S = 6.0
 
 
-def _rpc_timeout_s(fps: float) -> float:
-    """Bound on one per-tick arm or gripper RPC: a few control periods."""
-    return max(0.5, 5.0 / fps)
+class _ReadTimeout(TimeoutError):
+    """A per-tick read RPC hung. The tick is skipped, not the run."""
 
 
 async def _bounded(awaitable: Any, timeout_s: float, what: str) -> Any:
@@ -108,6 +105,13 @@ async def _bounded(awaitable: Any, timeout_s: float, what: str) -> Any:
         return await asyncio.wait_for(awaitable, timeout_s)
     except asyncio.TimeoutError:
         raise TimeoutError(f"{what} did not return within {timeout_s:.2f}s") from None
+
+
+async def _bounded_read(awaitable: Any, timeout_s: float, what: str) -> Any:
+    try:
+        return await _bounded(awaitable, timeout_s, what)
+    except TimeoutError as exc:
+        raise _ReadTimeout(str(exc)) from None
 
 LOGGER = logging.getLogger(__name__)
 
@@ -256,7 +260,7 @@ class VLAController(Generic, EasyResource):
             # command. Keep a reference: CPython may otherwise garbage-collect
             # a bare task handle before it ever runs.
             self._stop_task = asyncio.create_task(
-                self._halt(old_arm, old_stream, _rpc_timeout_s(self._cfg.fps))
+                self._halt(old_arm, old_stream, self._cfg.rpc_timeout_s)
             )
 
         self._cfg = ControllerConfig.parse(struct_to_dict(config.attributes))
@@ -416,10 +420,13 @@ class VLAController(Generic, EasyResource):
         # A reconfigure schedules the old run's halt without awaiting it; an
         # arm.stop landing after this start's first move would kill it.
         if self._stop_task is not None and not self._stop_task.done():
+            wait_s = _CLOSE_TIMEOUT_S + self._cfg.rpc_timeout_s + 1.0
             try:
-                await asyncio.wait_for(asyncio.shield(self._stop_task), _HALT_WAIT_S)
+                await asyncio.wait_for(asyncio.shield(self._stop_task), wait_s)
             except asyncio.TimeoutError:
-                LOGGER.warning("previous halt still pending after %ss; starting anyway", _HALT_WAIT_S)
+                raise RuntimeError(
+                    f"previous halt still pending after {wait_s:.1f}s; refusing to start"
+                ) from None
         if self._task and not self._task.done():
             raise RuntimeError("already running")
         assert self._cfg is not None
@@ -513,7 +520,7 @@ class VLAController(Generic, EasyResource):
     async def _safe_stop_arm(self) -> None:
         if not self._cfg:
             return
-        await self._stop_arm(self._deps.get(self._cfg.arm), _rpc_timeout_s(self._cfg.fps))
+        await self._stop_arm(self._deps.get(self._cfg.arm), self._cfg.rpc_timeout_s)
 
     async def _await_policy(self) -> dict[str, Any]:
         cfg = self._cfg
@@ -521,9 +528,15 @@ class VLAController(Generic, EasyResource):
         deadline = time.monotonic() + cfg.policy_ready_timeout_s
         delay = 0.05
         while True:
-            status = await _bounded(
-                policy.do_command({"command": "status"}), _POLICY_STATUS_TIMEOUT_S, "policy status"
-            )
+            try:
+                status = await _bounded(
+                    policy.do_command({"command": "status"}),
+                    _POLICY_STATUS_TIMEOUT_S,
+                    "policy status",
+                )
+            except TimeoutError:
+                # A busy policy server: not ready yet, keep polling to the deadline.
+                status = {}
             state = status.get("state")
             if state == "ready":
                 return await _bounded(
@@ -672,8 +685,9 @@ class VLAController(Generic, EasyResource):
         """
         if not gripper.has_normalized_tail:
             return
-        value = await gripper.read()
-        await gripper.write(value)
+        rpc_s = self._cfg.rpc_timeout_s
+        value = await _bounded(gripper.read(), rpc_s, "gripper read")
+        await _bounded(gripper.write(value), rpc_s, "gripper write")
 
     @staticmethod
     def _consumed_image_size(specs: dict[str, Any]) -> tuple[int, int] | None:
@@ -889,6 +903,7 @@ class VLAController(Generic, EasyResource):
         last_tick = self._clock()
         consecutive_failures = 0
         consecutive_rejected_moves = 0
+        consecutive_read_timeouts = 0
 
         while True:
             # The sample time is fixed at the top of the tick. The stream stamp
@@ -906,7 +921,7 @@ class VLAController(Generic, EasyResource):
                     # restart the tick: the sample and the stamp must use a time
                     # after the wait, or the stamp goes out past due as a burst.
                     waited_from = self._clock()
-                    await inference.wait()
+                    await self._wait_for_chunk(inference, gripper)
                     if buffer.last_sampled > -math.inf:  # not the first fill
                         self._starved_ticks += round((self._clock() - waited_from) * cfg.fps)
                     schedule.restart()
@@ -955,22 +970,37 @@ class VLAController(Generic, EasyResource):
                 await self._pace(schedule)
                 continue
 
-            if delta_ee:
-                if await self._command_pose(arm, action):
-                    consecutive_rejected_moves = 0
+            try:
+                if delta_ee:
+                    if await self._command_pose(arm, action):
+                        consecutive_rejected_moves = 0
+                    else:
+                        consecutive_rejected_moves += 1
+                        if consecutive_rejected_moves > cfg.starvation_grace_ticks:
+                            raise RuntimeError(
+                                f"{consecutive_rejected_moves} consecutive move_to_position "
+                                "refusals exceeded starvation_grace_ticks="
+                                f"{cfg.starvation_grace_ticks}; stopping"
+                            )
                 else:
-                    consecutive_rejected_moves += 1
-                    if consecutive_rejected_moves > cfg.starvation_grace_ticks:
-                        raise RuntimeError(
-                            f"{consecutive_rejected_moves} consecutive move_to_position "
-                            "refusals exceeded starvation_grace_ticks="
-                            f"{cfg.starvation_grace_ticks}; stopping"
-                        )
-            else:
-                await self._command_joints(
-                    arm, gripper, action, check_start=first, nominal=schedule.nominal, sample_t=t
+                    await self._command_joints(
+                        arm, gripper, action, check_start=first, nominal=schedule.nominal, sample_t=t
+                    )
+                    first = False
+                consecutive_read_timeouts = 0
+            except _ReadTimeout as exc:
+                # A read hung before anything was commanded: skip the tick, like a
+                # sampling failure, and escalate only if it keeps happening.
+                consecutive_read_timeouts += 1
+                self._last_error = str(exc)
+                LOGGER.error(
+                    "tick skipped (%d consecutive): %s", consecutive_read_timeouts, exc
                 )
-                first = False
+                if consecutive_read_timeouts > cfg.starvation_grace_ticks:
+                    raise RuntimeError(
+                        f"{consecutive_read_timeouts} consecutive read timeouts exceeded "
+                        f"starvation_grace_ticks={cfg.starvation_grace_ticks}: {exc}"
+                    ) from exc
 
             last_tick = self._record_tick(last_tick)
             await self._pace(schedule)
@@ -1009,15 +1039,15 @@ class VLAController(Generic, EasyResource):
         # config) holds its measured position rather than being sent an
         # implicit 0.0, and so each driven value lands on the joint it
         # was actually clamped against.
-        rpc_s = _rpc_timeout_s(cfg.fps)
+        rpc_s = cfg.rpc_timeout_s
         measured = list(
-            (await _bounded(arm.get_joint_positions(), rpc_s, "arm.get_joint_positions")).values
+            (await _bounded_read(arm.get_joint_positions(), rpc_s, "arm.get_joint_positions")).values
         )
         joint_current = [measured[i] for i in cfg.state_joint_indices]
         if gripper.arm_joint_index is not None:
             joint_current.append(measured[gripper.arm_joint_index])
         elif gripper.in_state:
-            joint_current.append(await _bounded(gripper.read(), rpc_s, "gripper read"))
+            joint_current.append(await _bounded_read(gripper.read(), rpc_s, "gripper read"))
         current = np.asarray(joint_current, dtype=np.float32)
 
         if check_start:
@@ -1074,10 +1104,10 @@ class VLAController(Generic, EasyResource):
             )
         self._trace.append((nominal_t, sample_t, target, measured, clamped, send_t))
         if gripper.has_normalized_tail:
-            await self._write_gripper(gripper, sample_t, float(safe[-1]), rpc_s)
+            await self._write_gripper(gripper, sample_t, float(safe[-1]))
 
     async def _write_gripper(
-        self, gripper: GripperAdapter, sample_t: float, value: float, rpc_s: float
+        self, gripper: GripperAdapter, sample_t: float, value: float
     ) -> None:
         """Write the gripper value that is due now, not the one just sampled.
 
@@ -1088,6 +1118,9 @@ class VLAController(Generic, EasyResource):
         never gets here.
         """
         self._gripper_queue.append((sample_t, value))
+        await self._flush_gripper(gripper)
+
+    async def _flush_gripper(self, gripper: GripperAdapter) -> None:
         # The slack absorbs float rounding: a tick paced to land on sample_t can
         # read the clock an ulp short of it, which would cost a whole tick.
         now = self._clock() + 1e-6
@@ -1095,7 +1128,31 @@ class VLAController(Generic, EasyResource):
         while self._gripper_queue and self._gripper_queue[0][0] <= now:
             due = self._gripper_queue.popleft()[1]
         if due is not None:
-            await _bounded(gripper.write(due), rpc_s, "gripper write")
+            await _bounded(gripper.write(due), self._cfg.rpc_timeout_s, "gripper write")
+
+    async def _wait_for_chunk(self, inference: InferenceLoop, gripper: GripperAdapter) -> None:
+        """`inference.wait()`, writing queued gripper values as their rows come due.
+
+        Sequential regime waits out a whole inference between chunks; the last
+        rows' gripper changes must not sit in the queue until it lands.
+        """
+        waiter = asyncio.ensure_future(inference.wait())
+        try:
+            while True:
+                timeout = None
+                if self._gripper_queue:
+                    timeout = max(0.0, self._gripper_queue[0][0] - self._clock())
+                done, _ = await asyncio.wait({waiter}, timeout=timeout)
+                if done:
+                    return waiter.result()
+                await self._flush_gripper(gripper)
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+                try:
+                    await waiter
+                except asyncio.CancelledError:
+                    pass
 
     async def _command_pose(self, arm: Any, action: np.ndarray) -> bool:
         """One tick of `action_space="delta-ee"`. Returns False if the arm refused.
@@ -1130,8 +1187,8 @@ class VLAController(Generic, EasyResource):
         delta = to_working(np.asarray(action, dtype=np.float32), self._cfg.action_units)
         safe = self._safety.apply(delta)
 
-        rpc_s = _rpc_timeout_s(self._cfg.fps)
-        pose = await _bounded(arm.get_end_position(), rpc_s, "arm.get_end_position")
+        rpc_s = self._cfg.rpc_timeout_s
+        pose = await _bounded_read(arm.get_end_position(), rpc_s, "arm.get_end_position")
         current = pose_state_from_proto(pose)
         target = state_compose(current, safe)
         vector = orientation_vector(state_rotation(target))
@@ -1155,7 +1212,7 @@ class VLAController(Generic, EasyResource):
                 rpc_s,
                 "arm.move_to_position",
             )
-        except (asyncio.CancelledError, TimeoutError):
+        except (asyncio.CancelledError, TimeoutError):  # TimeoutError: see _bounded
             # A hang is not a refusal: the arm's state is unknown, so it is fatal.
             raise
         except Exception as exc:  # noqa: BLE001

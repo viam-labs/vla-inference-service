@@ -34,7 +34,8 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 with a zero-phase quadratic fit over that many rows, removing tick-to-tick
 jitter in the policy's output without lag. The crossfade (`blend_s`), the
 trigger's lead (`margin_s`) are fixed by parse(), not configured;
-`inference_timeout_s` (default 30) is the one timing knob an operator sets. See `reference_buffer.py` and `inference_loop.py`.
+`inference_timeout_s` (default 30) and `rpc_timeout_s` (default `max(2, 10/fps)`)
+are the timing knobs an operator sets. See `reference_buffer.py` and `inference_loop.py`.
 The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
 `actions_per_chunk`) are refused with their replacement; see `REMOVED_KEYS`.
 
@@ -516,6 +517,10 @@ class ControllerConfig:
     # DoCommand timeout, so without it a hung policy hangs the controller.
     # Configurable: a slow policy (diffusion on a small GPU) may need more.
     inference_timeout_s: float = 30.0
+    # Bound on one per-tick arm or gripper RPC. A read that exceeds it skips the
+    # tick (counted toward starvation_grace_ticks); a move or write is fatal.
+    # parse() defaults it to max(2, 10/fps).
+    rpc_timeout_s: float = 2.0
     starvation_grace_ticks: int = 3
     policy_ready_timeout_s: int = 600
     # A plain unit string under action_space="joints" (a joint vector is one
@@ -653,11 +658,14 @@ class ControllerConfig:
                     "pose path writes with move_to_position"
                 )
 
-        inference_timeout_s = as_float(
-            raw.get("inference_timeout_s", 30.0), "inference_timeout_s", minimum=0.0
-        )
-        if inference_timeout_s == 0.0:
-            raise ConfigError("inference_timeout_s must be > 0, got 0.0")
+        def positive(key: str, default: float) -> float:
+            value = as_float(raw.get(key, default), key, minimum=0.0)
+            if value == 0.0:
+                raise ConfigError(f"{key} must be > 0, got 0.0")
+            return value
+
+        inference_timeout_s = positive("inference_timeout_s", 30.0)
+        rpc_timeout_s = positive("rpc_timeout_s", max(2.0, 10.0 / fps))
 
         return ControllerConfig(
             policy_service=policy_service,
@@ -670,6 +678,7 @@ class ControllerConfig:
             blend_s=0.0 if delta_ee else 2.0 / fps,
             margin_s=2.0 / fps,
             inference_timeout_s=inference_timeout_s,
+            rpc_timeout_s=rpc_timeout_s,
             smooth_rows=smooth_rows,
             starvation_grace_ticks=as_int(
                 raw.get("starvation_grace_ticks", 3), "starvation_grace_ticks", minimum=0

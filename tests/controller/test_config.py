@@ -994,3 +994,15 @@ def test_inference_timeout_s_defaults_to_30_and_is_configurable():
 def test_inference_timeout_s_must_be_a_positive_number(value):
     with pytest.raises(ConfigError, match="inference_timeout_s"):
         ControllerConfig.parse({**BASE, "inference_timeout_s": value})
+
+
+def test_rpc_timeout_s_defaults_to_max_of_2_and_10_periods_and_is_configurable():
+    assert ControllerConfig.parse(BASE).rpc_timeout_s == 2.0  # fps 10
+    assert ControllerConfig.parse({**BASE, "fps": 2.0}).rpc_timeout_s == 5.0
+    assert ControllerConfig.parse({**BASE, "rpc_timeout_s": 0.7}).rpc_timeout_s == 0.7
+
+
+@pytest.mark.parametrize("value", [0, -1.0, True, "2"])
+def test_rpc_timeout_s_must_be_a_positive_number(value):
+    with pytest.raises(ConfigError, match="rpc_timeout_s"):
+        ControllerConfig.parse({**BASE, "rpc_timeout_s": value})

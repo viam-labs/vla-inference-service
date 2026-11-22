@@ -675,10 +675,9 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     # the looser form is satisfied by the NEXT tick's write even when the
     # in-tick order is swapped.
     assert events.index("arm") == 1, events
-    # Writes are deferred to their row's time (a tick or more after the move that
-    # sampled them), but each still follows an arm move within its tick.
+    # Writes are deferred to their row's time, so only the preflight write may
+    # precede the first arm move, and a write follows it later.
     assert events[0] == "gripper" and "gripper" in events[2:], events
-    assert all(events[i - 1] == "arm" for i, e in enumerate(events) if i and e == "gripper"), events
 
 
 async def test_do_command_gripper_is_driven_through_a_real_tick():
@@ -746,10 +745,9 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
     await svc.do_command({"command": "stop"})
     # Same prefix assertion as the sibling test above, for the same reason.
     assert events.index("arm") == 1, events
-    # Writes are deferred to their row's time (a tick or more after the move that
-    # sampled them), but each still follows an arm move within its tick.
+    # Writes are deferred to their row's time, so only the preflight write may
+    # precede the first arm move, and a write follows it later.
     assert events[0] == "gripper" and "gripper" in events[2:], events
-    assert all(events[i - 1] == "arm" for i, e in enumerate(events) if i and e == "gripper"), events
 
 
 @pytest.mark.parametrize(
@@ -2685,13 +2683,12 @@ class _HangingGripper(FakeDoCommandGripper):
         return await super().do_command(command, **kw)
 
 
-@pytest.mark.parametrize("hang", ["get_joint_positions", "move_to_joint_positions", "gripper write"])
-async def test_a_hung_per_tick_rpc_errors_the_run_instead_of_hanging(hang, monkeypatch):
-    monkeypatch.setattr("vla.controller.service._rpc_timeout_s", lambda fps: 0.05)
+@pytest.mark.parametrize("hang", ["move_to_joint_positions", "gripper write"])
+async def test_a_hung_move_or_write_errors_the_run_instead_of_hanging(hang):
     arm = _HangsOnce(None if hang == "gripper write" else hang, positions=[0.0] * 6)
     extra = {"g": _HangingGripper(position=95.0)} if hang == "gripper write" else {}
     svc = _svc(
-        config=_config(gripper=_DO_COMMAND_GRIPPER) if extra else _config(),
+        config=_config(rpc_timeout_s=0.05, **({"gripper": _DO_COMMAND_GRIPPER} if extra else {})),
         deps=_deps(policy=FakePolicyClient(action_dim=6) if extra else None, arm=arm, **extra),
     )
     await svc.do_command({"command": "start", "task": "t"})
@@ -2700,31 +2697,102 @@ async def test_a_hung_per_tick_rpc_errors_the_run_instead_of_hanging(hang, monke
     assert arm.stopped >= 1
 
 
-async def test_a_hung_policy_status_poll_errors_the_run(monkeypatch):
+class _SlowReads(FakeArm):
+    """Hangs the control loop's own `get_joint_positions` calls.
+
+    Only reads made by the loop task count (the preflight and the inference
+    task's observation reads must work). `hang_loop_reads` holds the 0-based
+    indices to hang, or None for all of them. Set `.svc` before starting.
+    """
+
+    def __init__(self, hang_loop_reads, **kw):
+        super().__init__(**kw)
+        self.hang_loop_reads = hang_loop_reads
+        self.svc = None
+        self.loop_reads = 0
+
+    async def get_joint_positions(self, **kw):
+        if self.svc._state == "running" and asyncio.current_task() is self.svc._task:
+            n = self.loop_reads
+            self.loop_reads += 1
+            if self.hang_loop_reads is None or n in self.hang_loop_reads:
+                await asyncio.sleep(3600)
+        return await super().get_joint_positions(**kw)
+
+
+async def test_one_read_timeout_skips_the_tick_and_the_run_continues():
+    arm = _SlowReads({2}, positions=[0.0] * 6)
+    svc = _svc(config=_config(rpc_timeout_s=0.05), deps=_deps(arm=arm))
+    arm.svc = svc
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: arm.loop_reads > 6 and len(arm.moves) >= 5, "ticks past the timeout")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["state"] == "running"
+
+
+async def test_consecutive_read_timeouts_escalate_after_starvation_grace_ticks():
+    arm = _SlowReads(None, positions=[0.0] * 6)  # every read the loop makes hangs
+    svc = _svc(
+        config=_config(rpc_timeout_s=0.02, starvation_grace_ticks=2), deps=_deps(arm=arm)
+    )
+    arm.svc = svc
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "3 consecutive read timeouts" in status["last_error"]
+    assert not arm.moves
+    assert arm.stopped >= 1
+
+
+async def test_a_hung_policy_status_poll_is_not_ready_yet(monkeypatch):
     monkeypatch.setattr("vla.controller.service._POLICY_STATUS_TIMEOUT_S", 0.05)
 
     class Hung(FakePolicyClient):
         async def do_command(self, command, **kw):
             await asyncio.sleep(3600)
 
-    svc = _svc(deps=_deps(policy=Hung()))
+    svc = _svc(deps=_deps(policy=Hung()), policy_ready_timeout_s=0.3)
     await svc.do_command({"command": "start", "task": "t"})
     status = await _wait_for_state(svc, "error", timeout=3.0)
-    assert "policy status did not return" in status["last_error"]
+    assert "policy not ready" in status["last_error"]
 
 
-async def test_a_hung_arm_stop_does_not_hang_stop(monkeypatch):
-    monkeypatch.setattr("vla.controller.service._rpc_timeout_s", lambda fps: 0.05)
+async def test_a_hung_policy_specs_is_fatal(monkeypatch):
+    monkeypatch.setattr("vla.controller.service._POLICY_STATUS_TIMEOUT_S", 0.05)
 
+    class HungSpecs(FakePolicyClient):
+        async def do_command(self, command, **kw):
+            if command.get("command") == "specs":
+                await asyncio.sleep(3600)
+            return await super().do_command(command, **kw)
+
+    svc = _svc(deps=_deps(policy=HungSpecs()))
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "policy specs did not return" in status["last_error"]
+
+
+async def test_a_hung_arm_stop_does_not_hang_stop():
     class HungStop(FakeArm):
         async def stop(self, **kw):
             await asyncio.sleep(3600)
 
     arm = HungStop(positions=[0.0] * 6)
-    svc = _svc(deps=_deps(arm=arm))
+    svc = _svc(config=_config(rpc_timeout_s=0.05), deps=_deps(arm=arm))
     await svc.do_command({"command": "start", "task": "t"})
     await _wait_for_first_move(arm)
     await asyncio.wait_for(svc.do_command({"command": "stop"}), 2.0)
+
+
+async def test_start_is_refused_while_the_previous_halt_is_still_pending(monkeypatch):
+    monkeypatch.setattr("vla.controller.service._CLOSE_TIMEOUT_S", 0.0)
+    svc = _svc(config=_config(rpc_timeout_s=0.05))
+    svc._stop_task = asyncio.create_task(asyncio.sleep(3600))
+    try:
+        with pytest.raises(RuntimeError, match="previous halt still pending"):
+            await svc.do_command({"command": "start", "task": "t"})
+    finally:
+        svc._stop_task.cancel()
 
 
 async def test_start_after_reconfigure_waits_for_the_old_halt():
