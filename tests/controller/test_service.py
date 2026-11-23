@@ -665,6 +665,23 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
         config=_config(gripper=_DO_COMMAND_GRIPPER),
         deps=_deps(policy=policy, arm=arm, g=gripper),
     )
+    orig_wait = svc._wait_for_chunk
+
+    async def marked(*a, **k):
+        events.append("wait>")
+        try:
+            return await orig_wait(*a, **k)
+        finally:
+            events.append("<wait")
+
+    svc._wait_for_chunk = marked
+    orig_pace = svc._pace
+
+    async def paced(*a, **k):
+        events.append("pace")
+        return await orig_pace(*a, **k)
+
+    svc._pace = paced
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
@@ -674,8 +691,21 @@ async def test_gripper_write_order_is_after_arm_move_not_before():
     # events[first_arm_idx + 1] is load-bearing: with ~8 ticks in the window,
     # the looser form is satisfied by the NEXT tick's write even when the
     # in-tick order is swapped.
-    assert events.index("arm") == 1, events
-    assert events[:3] == ["gripper", "arm", "gripper"], events
+    assert events[0] == "gripper", events
+    # Only the preflight write may precede the first arm move. Outside a chunk wait,
+    # a write is the in-tick one: it must directly follow its arm move and end its
+    # tick (the pace marker). Inside a wait it is a deferred flush, with no arm move.
+    in_wait, tick_writes = False, 0
+    for i, e in enumerate(events):
+        if e == "wait>":
+            in_wait = True
+        elif e == "<wait":
+            in_wait = False
+        elif e == "gripper" and i > 0 and not in_wait:
+            assert events[i - 1] == "arm", events
+            assert events[i + 1] == "pace", events  # the write ends its tick
+            tick_writes += 1
+    assert tick_writes >= 1, events
 
 
 async def test_do_command_gripper_is_driven_through_a_real_tick():
@@ -738,12 +768,42 @@ async def test_do_command_gripper_write_order_is_after_arm_move_not_before():
         ),
         deps=_deps(policy=policy, arm=arm, g=g),
     )
+    orig_wait = svc._wait_for_chunk
+
+    async def marked(*a, **k):
+        events.append("wait>")
+        try:
+            return await orig_wait(*a, **k)
+        finally:
+            events.append("<wait")
+
+    svc._wait_for_chunk = marked
+    orig_pace = svc._pace
+
+    async def paced(*a, **k):
+        events.append("pace")
+        return await orig_pace(*a, **k)
+
+    svc._pace = paced
     await svc.do_command({"command": "start", "task": "t"})
     await asyncio.sleep(0.15)
     await svc.do_command({"command": "stop"})
     # Same prefix assertion as the sibling test above, for the same reason.
-    assert events.index("arm") == 1, events
-    assert events[:3] == ["gripper", "arm", "gripper"], events
+    assert events[0] == "gripper", events
+    # Only the preflight write may precede the first arm move. Outside a chunk wait,
+    # a write is the in-tick one: it must directly follow its arm move and end its
+    # tick (the pace marker). Inside a wait it is a deferred flush, with no arm move.
+    in_wait, tick_writes = False, 0
+    for i, e in enumerate(events):
+        if e == "wait>":
+            in_wait = True
+        elif e == "<wait":
+            in_wait = False
+        elif e == "gripper" and i > 0 and not in_wait:
+            assert events[i - 1] == "arm", events
+            assert events[i + 1] == "pace", events  # the write ends its tick
+            tick_writes += 1
+    assert tick_writes >= 1, events
 
 
 @pytest.mark.parametrize(
@@ -2644,3 +2704,188 @@ async def test_the_delta_clamp_allows_the_velocity_over_however_far_ahead_target
     budget = svc._safety.limits.max_joint_delta_degs
     await svc.do_command({"command": "stop"})
     assert budget == pytest.approx(120.0 / 20.0 * ticks_ahead)
+
+
+# ---------------------------------------------------------------------------
+# Bounded per-tick RPCs, halt-before-start
+# ---------------------------------------------------------------------------
+
+
+class _HangsOnce(FakeArm):
+    """Behaves until its first move, then hangs `hang` forever."""
+
+    def __init__(self, hang, **kw):
+        super().__init__(**kw)
+        self.hang = hang
+
+    def _maybe_hang(self, name):
+        return name == self.hang and self.moves
+
+    async def get_joint_positions(self, **kw):
+        if self._maybe_hang("get_joint_positions"):
+            await asyncio.sleep(3600)
+        return await super().get_joint_positions(**kw)
+
+    async def move_to_joint_positions(self, positions, **kw):
+        if self._maybe_hang("move_to_joint_positions"):
+            await asyncio.sleep(3600)
+        return await super().move_to_joint_positions(positions, **kw)
+
+
+class _HangingGripper(FakeDoCommandGripper):
+    async def do_command(self, command, **kw):
+        if "set" in command and any("set" in c for c in self.commands):  # past the preflight write
+            await asyncio.sleep(3600)
+        return await super().do_command(command, **kw)
+
+
+@pytest.mark.parametrize("hang", ["move_to_joint_positions", "gripper write"])
+async def test_a_hung_move_or_write_errors_the_run_instead_of_hanging(hang):
+    arm = _HangsOnce(None if hang == "gripper write" else hang, positions=[0.0] * 6)
+    extra = {"g": _HangingGripper(position=95.0)} if hang == "gripper write" else {}
+    svc = _svc(
+        config=_config(rpc_timeout_s=0.05, **({"gripper": _DO_COMMAND_GRIPPER} if extra else {})),
+        deps=_deps(policy=FakePolicyClient(action_dim=6) if extra else None, arm=arm, **extra),
+    )
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "did not return within" in status["last_error"]
+    assert arm.stopped >= 1
+
+
+class _SlowReads(FakeArm):
+    """Hangs the control loop's own `get_joint_positions` calls.
+
+    Only reads made by the loop task count (the preflight and the inference
+    task's observation reads must work). `hang_loop_reads` holds the 0-based
+    indices to hang, or None for all of them. Set `.svc` before starting.
+    """
+
+    def __init__(self, hang_loop_reads, **kw):
+        super().__init__(**kw)
+        self.hang_loop_reads = hang_loop_reads
+        self.svc = None
+        self.loop_reads = 0
+
+    async def get_joint_positions(self, **kw):
+        if self.svc._state == "running" and asyncio.current_task() is self.svc._task:
+            n = self.loop_reads
+            self.loop_reads += 1
+            if self.hang_loop_reads is None or n in self.hang_loop_reads:
+                await asyncio.sleep(3600)
+        return await super().get_joint_positions(**kw)
+
+
+async def test_one_read_timeout_skips_the_tick_and_the_run_continues():
+    arm = _SlowReads({2}, positions=[0.0] * 6)
+    svc = _svc(config=_config(rpc_timeout_s=0.05), deps=_deps(arm=arm))
+    arm.svc = svc
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: arm.loop_reads > 6 and len(arm.moves) >= 5, "ticks past the timeout")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["state"] == "running"
+
+
+async def test_read_timeouts_never_in_a_row_do_not_escalate():
+    # More timeouts than starvation_grace_ticks allows, but never two in a row.
+    arm = _SlowReads({2, 4, 6, 8}, positions=[0.0] * 6)
+    svc = _svc(
+        config=_config(rpc_timeout_s=0.02, starvation_grace_ticks=2), deps=_deps(arm=arm)
+    )
+    arm.svc = svc
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: arm.loop_reads > 12, "ticks past every timeout")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["state"] == "running"
+
+
+async def test_consecutive_read_timeouts_escalate_after_starvation_grace_ticks():
+    arm = _SlowReads(None, positions=[0.0] * 6)  # every read the loop makes hangs
+    svc = _svc(
+        config=_config(rpc_timeout_s=0.02, starvation_grace_ticks=2), deps=_deps(arm=arm)
+    )
+    arm.svc = svc
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "3 consecutive read timeouts" in status["last_error"]
+    assert not arm.moves
+    assert arm.stopped >= 1
+
+
+async def test_a_hung_policy_status_poll_is_not_ready_yet(monkeypatch):
+    monkeypatch.setattr("vla.controller.service._POLICY_STATUS_TIMEOUT_S", 0.05)
+
+    class Hung(FakePolicyClient):
+        async def do_command(self, command, **kw):
+            await asyncio.sleep(3600)
+
+    svc = _svc(deps=_deps(policy=Hung()), policy_ready_timeout_s=0.3)
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "policy not ready" in status["last_error"]
+
+
+async def test_a_hung_policy_specs_is_fatal(monkeypatch):
+    monkeypatch.setattr("vla.controller.service._POLICY_STATUS_TIMEOUT_S", 0.05)
+
+    class HungSpecs(FakePolicyClient):
+        async def do_command(self, command, **kw):
+            if command.get("command") == "specs":
+                await asyncio.sleep(3600)
+            return await super().do_command(command, **kw)
+
+    svc = _svc(deps=_deps(policy=HungSpecs()))
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error", timeout=3.0)
+    assert "policy specs did not return" in status["last_error"]
+
+
+async def test_a_hung_arm_stop_does_not_hang_stop():
+    class HungStop(FakeArm):
+        async def stop(self, **kw):
+            await asyncio.sleep(3600)
+
+    arm = HungStop(positions=[0.0] * 6)
+    svc = _svc(config=_config(rpc_timeout_s=0.05), deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    await asyncio.wait_for(svc.do_command({"command": "stop"}), 2.0)
+
+
+async def test_start_is_refused_while_the_previous_halt_is_still_pending(monkeypatch):
+    monkeypatch.setattr("vla.controller.service._CLOSE_TIMEOUT_S", 0.0)
+    svc = _svc(config=_config(rpc_timeout_s=0.05))
+    svc._stop_task = asyncio.create_task(asyncio.sleep(3600))
+    try:
+        with pytest.raises(RuntimeError, match="previous halt still pending"):
+            await svc.do_command({"command": "start", "task": "t"})
+    finally:
+        svc._stop_task.cancel()
+
+
+async def test_start_after_reconfigure_waits_for_the_old_halt():
+    events = []
+
+    class SlowStop(FakeArm):
+        async def stop(self, **kw):
+            events.append("stop_begin")
+            await asyncio.sleep(0.1)
+            events.append("stop_end")
+
+        async def move_to_joint_positions(self, positions, **kw):
+            events.append("move")
+            return await super().move_to_joint_positions(positions, **kw)
+
+    arm = SlowStop(positions=[0.0] * 6)
+    svc = _svc(deps=_deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_for_first_move(arm)
+    svc.reconfigure(_config(), _deps(arm=arm))
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: events[events.index("stop_end"):].count("move") >= 1 if "stop_end" in events else False, "a move after the halt")
+    await svc.do_command({"command": "stop"})
+    # Nothing of the new run ran while the old arm.stop was in flight.
+    between = events[events.index("stop_begin"):events.index("stop_end")]
+    assert "move" not in between, events

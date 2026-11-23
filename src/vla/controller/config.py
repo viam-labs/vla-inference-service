@@ -33,8 +33,10 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `smooth_rows` (default 7, 0 under `"delta-ee"`) filters each landing chunk
 with a zero-phase quadratic fit over that many rows, removing tick-to-tick
 jitter in the policy's output without lag. The crossfade (`blend_s`), the
-trigger's lead (`margin_s`) and `inference_timeout_s` are fixed by parse(), not
-configured; see `reference_buffer.py` and `inference_loop.py`.
+trigger's lead (`margin_s`) are fixed by parse(), not configured;
+`inference_timeout_s` (default 30) and `rpc_timeout_s` (default `max(2, 10/fps)`,
+or `max(5, 10/fps)` under `"delta-ee"` or with a `do_command` gripper)
+are the timing knobs an operator sets. See `reference_buffer.py` and `inference_loop.py`.
 The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
 `actions_per_chunk`) are refused with their replacement; see `REMOVED_KEYS`.
 
@@ -503,7 +505,7 @@ class ControllerConfig:
     gripper: dict[str, Any] = field(default_factory=lambda: {"type": "none"})
     task: str = ""
     fps: float = 10.0
-    # Not configurable: parse() sets these three. Seconds a landing chunk takes
+    # Not configurable: parse() sets these two. Seconds a landing chunk takes
     # to crossfade in from the old plan: 2/fps, or 0 under delta-ee (deltas
     # cannot be blended).
     blend_s: float = 0.2
@@ -514,7 +516,13 @@ class ControllerConfig:
     smooth_rows: int = 7
     # A wait for a chunk longer than this fails the tick; _infer passes no
     # DoCommand timeout, so without it a hung policy hangs the controller.
+    # Configurable: a slow policy (diffusion on a small GPU) may need more.
     inference_timeout_s: float = 30.0
+    # Bound on one per-tick arm or gripper RPC. A read that exceeds it skips the
+    # tick (counted toward starvation_grace_ticks); a move or write is fatal.
+    # parse() defaults it to max(2, 10/fps), or max(5, 10/fps) under delta-ee
+    # or with a do_command gripper.
+    rpc_timeout_s: float = 2.0
     starvation_grace_ticks: int = 3
     policy_ready_timeout_s: int = 600
     # A plain unit string under action_space="joints" (a joint vector is one
@@ -652,6 +660,19 @@ class ControllerConfig:
                     "pose path writes with move_to_position"
                 )
 
+        def positive(key: str, default: float) -> float:
+            value = as_float(raw.get(key, default), key, minimum=0.0)
+            if value == 0.0:
+                raise ConfigError(f"{key} must be > 0, got 0.0")
+            return value
+
+        inference_timeout_s = positive("inference_timeout_s", 30.0)
+        # move_to_position runs the arm's motion planner and a do_command
+        # gripper's "set" may block until the jaws stop; both are slow on a
+        # healthy machine, so their floor is higher.
+        slow_rpcs = delta_ee or gripper_type == "do_command"
+        rpc_timeout_s = positive("rpc_timeout_s", max(5.0 if slow_rpcs else 2.0, 10.0 / fps))
+
         return ControllerConfig(
             policy_service=policy_service,
             arm=arm,
@@ -662,6 +683,8 @@ class ControllerConfig:
             fps=fps,
             blend_s=0.0 if delta_ee else 2.0 / fps,
             margin_s=2.0 / fps,
+            inference_timeout_s=inference_timeout_s,
+            rpc_timeout_s=rpc_timeout_s,
             smooth_rows=smooth_rows,
             starvation_grace_ticks=as_int(
                 raw.get("starvation_grace_ticks", 3), "starvation_grace_ticks", minimum=0
