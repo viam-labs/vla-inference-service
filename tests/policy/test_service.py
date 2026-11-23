@@ -8,6 +8,7 @@ import pytest
 from viam.proto.app.robot import ServiceConfig
 from google.protobuf.struct_pb2 import Struct
 
+from vla.policy import installer as ins
 from vla.policy.config import PolicyConfig
 from tests.policy.fake_backend import FakePolicyBackend
 from vla.policy.service import VLAPolicy
@@ -1070,9 +1071,6 @@ async def test_concurrent_infers_never_overlap_in_predict_chunk(tmp_path):
     await svc.await_ready()
     await asyncio.gather(*(svc.do_command(_infer_cmd()) for _ in range(3)))
     assert peak == 1
-
-
-from vla.policy import installer as ins
 
 
 async def test_load_runs_installer_before_backend_load(tmp_path, monkeypatch):
