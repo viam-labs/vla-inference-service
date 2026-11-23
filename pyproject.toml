@@ -25,6 +25,7 @@ dependencies = [
 # Installed lazily on a deployed host by vla/policy/installer.py from files that
 # tools/export_requirements.py exports from these extras. `base` is torch +
 # LeRobot with no LeRobot extras; each per-type extra adds only that type's deps.
+# Bump all seven lerobot pins together; `uv lock` errors if they differ.
 base = [
     # Direct deps so [tool.uv.sources] below applies (uv ignores sources for transitive deps).
     "torch",
