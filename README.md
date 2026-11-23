@@ -41,7 +41,7 @@ The two settings most likely to bite you are `state_units`/`action_units` (see
 
 - **Python 3.12+.** LeRobot `main` requires it; a 3.11 venv fails to resolve.
 - **Install size.** Installing the module (`first_run`) installs only the core: viam-sdk,
-  numpy, pillow, scipy, huggingface-hub and uv (about MEASURED_MB MB on macOS). Torch, LeRobot and
+  numpy, pillow, scipy, huggingface-hub and uv (about 180 MB on macOS). Torch, LeRobot and
   the policy type's extras are installed by the policy service on its **first load**, while
   `status` reports `loading`; a machine that runs only the controller never downloads them.
   That first load takes several minutes (torch+cu128 with its CUDA libraries is multi-GB on
