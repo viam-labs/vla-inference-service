@@ -88,9 +88,10 @@ def is_jetson() -> bool:
 
 def glibc_version() -> tuple[int, ...] | None:
     name, version = platform.libc_ver()
-    if name != "glibc" or not version:
+    m = re.match(r"(\d+)\.(\d+)", version)
+    if name != "glibc" or not m:
         return None
-    return tuple(int(p) for p in version.split(".") if p.isdigit())
+    return int(m.group(1)), int(m.group(2))
 
 
 def jetson_settings(env: Mapping[str, str]) -> dict[str, str] | None:

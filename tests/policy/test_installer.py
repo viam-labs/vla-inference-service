@@ -121,3 +121,20 @@ def test_jetson_with_old_glibc_falls_back_to_generic_with_a_warning(monkeypatch,
     assert ins.jetson_settings({}) is None
     assert "glibc is 2.35" in caplog.text
     assert "JetPack 7" in caplog.text
+
+
+def test_glibc_version_parses_major_minor_ignoring_suffix(monkeypatch):
+    monkeypatch.setattr(ins.platform, "libc_ver", lambda: ("glibc", "2.38a"))
+    assert ins.glibc_version() == (2, 38)
+
+
+@pytest.mark.parametrize("libc", [("glibc", ""), ("", "")])
+def test_glibc_version_none_when_unknown(monkeypatch, libc):
+    monkeypatch.setattr(ins.platform, "libc_ver", lambda: libc)
+    assert ins.glibc_version() is None
+
+
+def test_jetson_with_unknown_glibc_takes_the_sm87_path(monkeypatch):
+    monkeypatch.setattr(ins, "is_jetson", lambda: True)
+    monkeypatch.setattr(ins, "glibc_version", lambda: None)
+    assert ins.jetson_settings({}) == ins.JETSON_DEFAULTS
