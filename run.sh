@@ -2,6 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# The policy installer reads the requirement files shipped in the tarball.
+export VLA_REQUIREMENTS_DIR="$PWD/requirements"
+
 VENV_NAME="${VIAM_MODULE_DATA:?must be set by viam-server}/venv"
 PYTHON="$VENV_NAME/bin/python"
 

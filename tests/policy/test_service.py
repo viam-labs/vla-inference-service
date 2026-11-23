@@ -1070,3 +1070,64 @@ async def test_concurrent_infers_never_overlap_in_predict_chunk(tmp_path):
     await svc.await_ready()
     await asyncio.gather(*(svc.do_command(_infer_cmd()) for _ in range(3)))
     assert peak == 1
+
+
+from vla.policy import installer as ins
+
+
+async def test_load_runs_installer_before_backend_load(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_install(checkpoint_dir, **_):
+        calls.append(("install", checkpoint_dir))
+
+    class RecordingBackend(FakePolicyBackend):
+        def load(self, checkpoint_dir, **kwargs):
+            calls.append(("load", checkpoint_dir))
+            super().load(checkpoint_dir, **kwargs)
+
+    monkeypatch.setattr("vla.policy.service.ensure_installed_for_checkpoint", fake_install)
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    svc._backend_factory = RecordingBackend
+    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
+    await svc.await_ready()
+    assert [c[0] for c in calls] == ["install", "load"]
+    assert calls[0][1] == calls[1][1]
+    assert (await svc.do_command({"command": "status"}))["state"] == "ready"
+
+
+async def test_install_failure_surfaces_in_status(tmp_path, monkeypatch):
+    async def failing(checkpoint_dir, **_):
+        raise ins.InstallError("`uv pip install` failed (exit 2):\nno space left")
+
+    monkeypatch.setattr("vla.policy.service.ensure_installed_for_checkpoint", failing)
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    svc._backend_factory = FakePolicyBackend
+    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
+    await svc.await_ready(expect_failure=True)
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "failed"
+    assert "no space left" in status["error"]
+
+
+async def test_close_during_install_cancels_it(tmp_path, monkeypatch):
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def slow_install(checkpoint_dir, **_):
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr("vla.policy.service.ensure_installed_for_checkpoint", slow_install)
+    _make_checkpoint(tmp_path)
+    svc = VLAPolicy("p")
+    svc._backend_factory = FakePolicyBackend
+    svc.reconfigure(_config({"model_path": str(tmp_path)}), {})
+    await asyncio.wait_for(started.wait(), 5)
+    await svc.close()
+    assert cancelled.is_set()

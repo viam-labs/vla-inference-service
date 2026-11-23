@@ -18,6 +18,7 @@ from viam.utils import struct_to_dict
 from ..config_util import VLAError, as_int
 from ..wire import WireError, decode_image, decode_matrix, decode_vector, encode_matrix
 from .config import PolicyConfig
+from .installer import ensure_installed_for_checkpoint
 from .lerobot_backend import LeRobotBackend
 from .resolver import resolve_checkpoint
 
@@ -134,6 +135,10 @@ class VLAPolicy(Generic, EasyResource):
     async def _resolve_and_load(self, cfg: PolicyConfig, backend: Any) -> None:
         """The part of `_load` bounded by `cfg.load_timeout_s`."""
         checkpoint = await asyncio.to_thread(resolve_checkpoint, cfg)
+        # Torch, LeRobot and this checkpoint type's extras, on first load only.
+        # Awaited directly, not via to_thread: cancelling this task (reconfigure,
+        # close, load_timeout_s) must reach the uv subprocess.
+        await ensure_installed_for_checkpoint(checkpoint)
         rtc = cfg.rtc if cfg.rtc.enabled else None
         await asyncio.to_thread(
             backend.load,
