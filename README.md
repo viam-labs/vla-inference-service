@@ -40,14 +40,16 @@ The two settings most likely to bite you are `state_units`/`action_units` (see
 ## Requirements
 
 - **Python 3.12+.** LeRobot `main` requires it; a 3.11 venv fails to resolve.
-- **Install size.** A full `uv sync --extra lerobot` venv — the one that actually runs
-  inference — measured **824 MB on macOS** (Apple Silicon). Breakdown: torch 356 MB,
-  cmake 124 MB, cv2 119 MB, transformers 44 MB, sympy 29 MB, viam-sdk 22 MB, numpy 22 MB.
-  Linux resolves `torch+cu128`/`torchvision+cu128`, which bundle CUDA runtime libraries
-  the macOS wheels omit, so the Linux figure will be **substantially larger** — measure
-  on the actual target image (Jetson in particular) before committing to it. The base
-  install (no `lerobot` extra — config parsing, the controller's pure-numpy code, the
-  wire codec) has no torch dependency at all and measured **81 MB** on the same machine.
+- **Install size.** Installing the module (`first_run`) installs only the core: viam-sdk,
+  numpy, pillow, scipy, huggingface-hub and uv (about MEASURED_MB MB on macOS). Torch, LeRobot and
+  the policy type's extras are installed by the policy service on its **first load**, while
+  `status` reports `loading`; a machine that runs only the controller never downloads them.
+  That first load takes several minutes (torch+cu128 with its CUDA libraries is multi-GB on
+  Linux), counts toward `load_timeout_s`, needs network access and `git`, and is skipped on
+  later loads. On Jetson the sm_87 torch from `JETSON_TORCH_INDEX` is installed directly
+  (`JETSON_TORCH_INDEX`, `JETSON_TORCH_VERSION`, `JETSON_TORCHVISION_VERSION` override it).
+  To pre-install on a host that will be offline later, run
+  `$VIAM_MODULE_DATA/venv/bin/python -m vla.policy.installer <policy_type> <module_dir>/requirements`.
 
 ## Policy
 
@@ -1197,5 +1199,9 @@ closed-loop error, only rule out the config faults.
   `viam_key_id` and `viam_key_value` repository secrets. The wheel's own version in `pyproject.toml`
   stays static; the registry version is the tag, and `setup.sh` reinstalls the wheel on every reload.
 - `mise run build` / `mise run package` build the wheel and the deployable
-  `module.tar.gz` (`meta.json` + `run.sh` + `setup.sh` + the wheel — no `docs/`, so
+  `module.tar.gz` (`meta.json` + `run.sh` + `setup.sh` + the wheel + `requirements/` exported from `uv.lock` — no `docs/`, so
   internal specs and plans never leak to the module registry).
+- `tools/export_requirements.py` writes `requirements/core.txt`, `base.txt` and one file per
+  policy-type extra from `uv.lock`; `mise run package` runs it. After changing dependencies,
+  run `uv lock` and the per-type extras in `pyproject.toml` stay in sync with
+  `TYPE_FILES` in `src/vla/policy/installer.py`.
