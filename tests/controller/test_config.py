@@ -1002,6 +1002,14 @@ def test_rpc_timeout_s_defaults_to_max_of_2_and_10_periods_and_is_configurable()
     assert ControllerConfig.parse({**BASE, "rpc_timeout_s": 0.7}).rpc_timeout_s == 0.7
 
 
+def test_rpc_timeout_s_floor_is_5_under_delta_ee_or_a_do_command_gripper():
+    grip = {"type": "do_command", "name": "g", "open_value": 95, "closed_value": 0}
+    assert ControllerConfig.parse(DELTA_EE_BASE).rpc_timeout_s == 5.0
+    assert ControllerConfig.parse({**BASE, "gripper": grip}).rpc_timeout_s == 5.0
+    assert ControllerConfig.parse({**BASE, "gripper": grip, "fps": 1.0}).rpc_timeout_s == 10.0
+    assert ControllerConfig.parse({**DELTA_EE_BASE, "rpc_timeout_s": 1.5}).rpc_timeout_s == 1.5
+
+
 @pytest.mark.parametrize("value", [0, -1.0, True, "2"])
 def test_rpc_timeout_s_must_be_a_positive_number(value):
     with pytest.raises(ConfigError, match="rpc_timeout_s"):
