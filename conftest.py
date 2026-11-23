@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 
 def pytest_ignore_collect(collection_path, config):
     if collection_path.name != "test_differential_guard.py":
@@ -67,3 +69,9 @@ def pytest_ignore_collect(collection_path, config):
     if negated:
         return True  # explicitly excluded: skip collection, let the run proceed
     return None  # explicitly or ambiguously included: collect, and fail loudly if broken
+
+
+@pytest.fixture(autouse=True)
+def _no_lazy_install(monkeypatch):
+    # Tests must never start a real policy install from a developer's environment.
+    monkeypatch.delenv("VLA_REQUIREMENTS_DIR", raising=False)

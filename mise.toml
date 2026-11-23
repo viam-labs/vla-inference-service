@@ -22,10 +22,11 @@ run = "uv run pytest -v"
 # copy and set the exec bit only there -- `chmod +x run.sh` in place would put
 # the bit back on the tree the CLI uploads and re-break the cloud build.
 run = """
-rm -rf dist/pkg && mkdir -p dist/pkg/dist
+rm -rf dist/pkg && mkdir -p dist/pkg/dist dist/pkg/requirements
 install -m 644 meta.json dist/pkg/
 install -m 755 run.sh setup.sh dist/pkg/
 install -m 644 dist/*.whl dist/pkg/dist/
+uv run --no-project python tools/export_requirements.py dist/pkg/requirements
 tar -czf module.tar.gz -C dist/pkg .
 """
 depends = ["build"]

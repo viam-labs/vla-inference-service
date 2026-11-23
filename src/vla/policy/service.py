@@ -18,6 +18,7 @@ from viam.utils import struct_to_dict
 from ..config_util import VLAError, as_int
 from ..wire import WireError, decode_image, decode_matrix, decode_vector, encode_matrix
 from .config import PolicyConfig
+from .installer import ensure_installed_for_checkpoint
 from .lerobot_backend import LeRobotBackend
 from .resolver import resolve_checkpoint
 
@@ -134,6 +135,10 @@ class VLAPolicy(Generic, EasyResource):
     async def _resolve_and_load(self, cfg: PolicyConfig, backend: Any) -> None:
         """The part of `_load` bounded by `cfg.load_timeout_s`."""
         checkpoint = await asyncio.to_thread(resolve_checkpoint, cfg)
+        # Torch, LeRobot and this checkpoint type's extras, on first load only.
+        # Awaited directly, not via to_thread: cancelling this task (reconfigure,
+        # close, load_timeout_s) must reach the uv subprocess.
+        await ensure_installed_for_checkpoint(checkpoint)
         rtc = cfg.rtc if cfg.rtc.enabled else None
         await asyncio.to_thread(
             backend.load,
@@ -196,8 +201,9 @@ class VLAPolicy(Generic, EasyResource):
         executor's threads, so an orphan can block interpreter exit until
         viam-server's SIGTERM hits.
 
-        We cannot interrupt the worker thread itself: backend.load() and
-        resolve_checkpoint() run inside asyncio.to_thread, which has no
+        We cannot interrupt the worker threads: resolve_checkpoint() and
+        backend.load() run inside asyncio.to_thread (the policy install
+        between them is awaited directly and IS cancelled here), which has no
         cancellation hook once the call has actually started -- cancelling
         the task here only abandons our own await on it. What we CAN do:
         stop serving requests immediately, drop the backend reference so a
@@ -223,9 +229,9 @@ class VLAPolicy(Generic, EasyResource):
         if still_loading:
             LOGGER.warning(
                 "close() called for %r while a load was still in progress; "
-                "cancelling only abandons this resource's own await -- the "
-                "underlying checkpoint download/deserialize thread cannot "
-                "be interrupted and may still be running to completion in "
+                "cancelling only abandons this resource's own await -- a "
+                "pending policy install is cancelled, but a checkpoint "
+                "download/deserialize thread cannot be interrupted and may still be running to completion in "
                 "the background. If viam-server immediately constructs a "
                 "replacement resource for this config (its normal "
                 "remove-then-add reconfigure), that replacement may block "
