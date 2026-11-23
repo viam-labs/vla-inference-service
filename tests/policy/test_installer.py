@@ -1,3 +1,8 @@
+import asyncio
+import os
+import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -139,10 +144,6 @@ def test_jetson_with_unknown_glibc_takes_the_sm87_path(monkeypatch):
     monkeypatch.setattr(ins, "glibc_version", lambda: None)
     assert ins.jetson_settings({}) == ins.JETSON_DEFAULTS
 
-import asyncio
-import os
-import stat
-
 
 def _fake_uv(prefix: Path, body: str = "") -> Path:
     bin_dir = prefix / "bin"
@@ -236,7 +237,14 @@ async def test_cancellation_terminates_the_subprocess(tmp_path, env):
     with pytest.raises(asyncio.CancelledError):
         await task
     pid = int(pid_file.read_text())
-    # The whole process group is gone, the shell's `sleep` child included.
+    # The whole process group is gone, the shell's `sleep` child included
+    # (a killed child can be an unreaped zombie for a moment).
+    for _ in range(20):
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
     with pytest.raises(ProcessLookupError):
         os.killpg(pid, 0)
     assert not (prefix / ".vla-installed-smolvla.sha256").exists()
@@ -259,6 +267,7 @@ async def test_lock_waiter_can_be_cancelled(tmp_path, env):
     await asyncio.sleep(0.2)
     waiter = asyncio.create_task(ins.ensure_installed("evo1", req_dir=d, prefix=prefix))
     await asyncio.sleep(0.2)
+    assert "evo1.txt" not in env.read_text()  # blocked on the lock
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
@@ -280,3 +289,40 @@ async def test_for_checkpoint_without_config_json_fails_clearly(tmp_path, env, m
     monkeypatch.setenv("VLA_REQUIREMENTS_DIR", str(_req_dir(tmp_path)))
     with pytest.raises(ins.InstallError, match="config.json"):
         await ins.ensure_installed_for_checkpoint(str(tmp_path), prefix=tmp_path / "venv")
+
+
+def test_cli_without_any_requirements_dir_fails(tmp_path):
+    e = {k: v for k, v in os.environ.items() if k != "VLA_REQUIREMENTS_DIR"}
+    r = subprocess.run(
+        [sys.executable, "-m", "vla.policy.installer", "smolvla"], env=e, capture_output=True, text=True
+    )
+    assert r.returncode != 0
+    assert "VLA_REQUIREMENTS_DIR is unset" in r.stderr
+
+
+def test_requirements_dir_unset_or_empty_is_none(monkeypatch):
+    monkeypatch.delenv("VLA_REQUIREMENTS_DIR", raising=False)
+    assert ins.requirements_dir() is None
+    monkeypatch.setenv("VLA_REQUIREMENTS_DIR", "")
+    assert ins.requirements_dir() is None
+
+
+def test_requirements_dir_set_but_missing_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLA_REQUIREMENTS_DIR", str(tmp_path / "nope"))
+    with pytest.raises(ins.InstallError, match="is not a directory"):
+        ins.requirements_dir()
+
+
+async def test_very_long_output_line_does_not_break_the_install(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix, "head -c 200000 /dev/zero | tr '\\0' x\necho")
+    await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)
+    assert (prefix / ".vla-installed-smolvla.sha256").exists()
+
+
+async def test_unwritable_marker_raises_install_error(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix)
+    (prefix / ".vla-installed-smolvla.sha256").mkdir()  # os.replace onto a directory fails
+    with pytest.raises(ins.InstallError, match="installed, but could not write"):
+        await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)

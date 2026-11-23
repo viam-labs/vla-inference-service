@@ -160,7 +160,11 @@ _TAIL_LINES = 20
 
 def requirements_dir() -> Path | None:
     value = os.environ.get("VLA_REQUIREMENTS_DIR")
-    return Path(value) if value and Path(value).is_dir() else None
+    if not value:
+        return None
+    if not Path(value).is_dir():
+        raise InstallError(f"VLA_REQUIREMENTS_DIR={value} is not a directory; the module package is incomplete")
+    return Path(value)
 
 
 def read_policy_type(checkpoint_dir: str) -> str:
@@ -198,9 +202,13 @@ async def _stop(proc: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(proc.wait(), _TERMINATE_GRACE_S)
     except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(proc.pid, signal.SIGKILL)
-        await proc.wait()
+        pass
+    finally:
+        # Also runs if _stop itself is cancelled mid-wait: the group must not survive.
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+    await proc.wait()
 
 
 async def _run(cmd: list[str], env: dict[str, str]) -> None:
@@ -210,7 +218,12 @@ async def _run(cmd: list[str], env: dict[str, str]) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=env,
+        # A long uv output line must not raise ValueError mid-install.
+        limit=1 << 20,
         # Own process group, so _stop also reaches uv's children (git, build backends).
+        # If viam-server SIGKILLs the module before cancellation reaches _stop, uv is
+        # orphaned; the flock is released, so a restarted module may run a second uv
+        # in the same venv, and uv's own environment lock is what serializes them.
         start_new_session=True,
     )
     tail: deque[str] = deque(maxlen=_TAIL_LINES)
@@ -271,7 +284,12 @@ async def ensure_installed(
             for cmd in install_commands(str(prefix / "bin" / "uv"), sys.executable, files, jetson, Path(tmp)):
                 await _run(cmd, env)
         importlib.invalidate_caches()
-        marker.write_text(digest)
+        tmp_marker = marker.with_suffix(".tmp")
+        try:
+            tmp_marker.write_text(digest)
+            os.replace(tmp_marker, marker)
+        except OSError as exc:
+            raise InstallError(f"installed, but could not write {marker}: {exc}") from exc
         LOGGER.info("%s policy stack installed", policy_type)
 
 
@@ -286,6 +304,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     if len(sys.argv) not in (2, 3):
         sys.exit("usage: python -m vla.policy.installer <policy_type> [requirements_dir]")
-    asyncio.run(
-        ensure_installed(sys.argv[1], req_dir=Path(sys.argv[2]) if len(sys.argv) == 3 else None)
-    )
+    req = Path(sys.argv[2]) if len(sys.argv) == 3 else requirements_dir()
+    if req is None:
+        sys.exit("VLA_REQUIREMENTS_DIR is unset and no requirements_dir was given")
+    asyncio.run(ensure_installed(sys.argv[1], req_dir=req))
