@@ -10,13 +10,23 @@ docs/superpowers/specs/2026-11-22-lazy-policy-install-design.md.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import fcntl
 import hashlib
+import importlib
+import json
 import logging
 import os
 import platform
 import re
+import shutil
+import signal
+import sys
+import tempfile
+from collections import deque
 from pathlib import Path
-from typing import Mapping
+from typing import AsyncIterator, Mapping
 
 from vla.config_util import VLAError
 
@@ -142,3 +152,140 @@ def install_commands(
     ]
     rest = [filtered, *files[1:]]
     return [torch_cmd, pip + [arg for f in rest for arg in ("-r", str(f))]]
+
+_LOCK_POLL_S = 0.5
+_TERMINATE_GRACE_S = 5.0
+_TAIL_LINES = 20
+
+
+def requirements_dir() -> Path | None:
+    value = os.environ.get("VLA_REQUIREMENTS_DIR")
+    return Path(value) if value and Path(value).is_dir() else None
+
+
+def read_policy_type(checkpoint_dir: str) -> str:
+    path = Path(checkpoint_dir) / "config.json"
+    try:
+        return str(json.loads(path.read_text())["type"])
+    except (OSError, ValueError, KeyError) as exc:
+        raise InstallError(f"cannot read the policy type from {path}: {exc}") from exc
+
+
+@contextlib.asynccontextmanager
+async def _install_lock(path: Path) -> AsyncIterator[None]:
+    # LOCK_NB + sleep rather than a blocking flock, so a waiter stays cancellable.
+    # flock locks belong to the open file description, so two opens in one
+    # process still exclude each other.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(_LOCK_POLL_S)
+        yield
+    finally:
+        os.close(fd)  # releases the lock
+
+
+async def _stop(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(proc.wait(), _TERMINATE_GRACE_S)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        await proc.wait()
+
+
+async def _run(cmd: list[str], env: dict[str, str]) -> None:
+    LOGGER.info("installing: %s", " ".join(cmd))
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+        # Own process group, so _stop also reaches uv's children (git, build backends).
+        start_new_session=True,
+    )
+    tail: deque[str] = deque(maxlen=_TAIL_LINES)
+    try:
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").rstrip()
+            tail.append(line)
+            LOGGER.info("uv: %s", line)
+        code = await proc.wait()
+    except BaseException:
+        # Cancellation (reconfigure, close(), load_timeout_s) or any other error:
+        # a multi-GB install must not run on after the load that wanted it is gone.
+        await _stop(proc)
+        raise
+    if code != 0:
+        raise InstallError(f"`uv pip install` failed (exit {code}):\n" + "\n".join(tail))
+
+
+def _marker_matches(marker: Path, digest: str) -> bool:
+    try:
+        return marker.read_text().strip() == digest
+    except OSError:
+        return False
+
+
+async def ensure_installed(
+    policy_type: str, *, req_dir: Path | None = None, prefix: Path | None = None
+) -> None:
+    """Install base + `policy_type`'s extra into this venv, once per lock content."""
+    req_dir = req_dir if req_dir is not None else requirements_dir()
+    if req_dir is None:
+        LOGGER.debug("VLA_REQUIREMENTS_DIR unset; not installing (dev checkout)")
+        return
+    prefix = prefix if prefix is not None else Path(sys.prefix)
+    files = requirement_files(req_dir, policy_type)
+    jetson = jetson_settings(os.environ)
+    digest = marker_digest(files, jetson)
+    # Inside the venv: a recreated venv loses the marker along with the packages.
+    marker = prefix / f".vla-installed-{policy_type}.sha256"
+    if _marker_matches(marker, digest):
+        return
+    async with _install_lock(prefix / ".vla-install.lock"):
+        if _marker_matches(marker, digest):
+            return
+        if shutil.which("git") is None:
+            raise InstallError("git is required to install LeRobot (a git+https requirement); install git")
+        env = dict(os.environ)
+        if jetson is not None:
+            # UV_TORCH_BACKEND overrides --index-url for torch; the Jetson index must win.
+            env.pop("UV_TORCH_BACKEND", None)
+        elif sys.platform.startswith("linux"):
+            # Without this, Linux resolves PyPI's CUDA 13 torch, which falls back
+            # to CPU on cu12-driver hosts. The export has no index lines on purpose.
+            env.setdefault("UV_TORCH_BACKEND", "cu128")
+        LOGGER.info("installing the %s policy stack (first load; this can take minutes)", policy_type)
+        with tempfile.TemporaryDirectory() as tmp:
+            for cmd in install_commands(str(prefix / "bin" / "uv"), sys.executable, files, jetson, Path(tmp)):
+                await _run(cmd, env)
+        importlib.invalidate_caches()
+        marker.write_text(digest)
+        LOGGER.info("%s policy stack installed", policy_type)
+
+
+async def ensure_installed_for_checkpoint(checkpoint_dir: str, *, prefix: Path | None = None) -> None:
+    if requirements_dir() is None:
+        return
+    await ensure_installed(read_policy_type(checkpoint_dir), prefix=prefix)
+
+
+if __name__ == "__main__":
+    # Pre-provisioning: python -m vla.policy.installer <type> [REQUIREMENTS_DIR]
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if len(sys.argv) not in (2, 3):
+        sys.exit("usage: python -m vla.policy.installer <policy_type> [requirements_dir]")
+    asyncio.run(
+        ensure_installed(sys.argv[1], req_dir=Path(sys.argv[2]) if len(sys.argv) == 3 else None)
+    )

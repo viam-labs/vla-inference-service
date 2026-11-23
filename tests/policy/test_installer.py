@@ -138,3 +138,145 @@ def test_jetson_with_unknown_glibc_takes_the_sm87_path(monkeypatch):
     monkeypatch.setattr(ins, "is_jetson", lambda: True)
     monkeypatch.setattr(ins, "glibc_version", lambda: None)
     assert ins.jetson_settings({}) == ins.JETSON_DEFAULTS
+
+import asyncio
+import os
+import stat
+
+
+def _fake_uv(prefix: Path, body: str = "") -> Path:
+    bin_dir = prefix / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    uv = bin_dir / "uv"
+    uv.write_text(f'#!/bin/sh\necho "$@" >> "$UV_LOG"\n{body}\n')
+    uv.chmod(uv.stat().st_mode | stat.S_IXUSR)
+    return uv
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    log = tmp_path / "uv.log"
+    monkeypatch.setenv("UV_LOG", str(log))
+    monkeypatch.setattr(ins, "is_jetson", lambda: False)
+    return log
+
+
+async def test_no_requirements_dir_is_a_noop(tmp_path, monkeypatch, env):
+    monkeypatch.delenv("VLA_REQUIREMENTS_DIR", raising=False)
+    await ins.ensure_installed("smolvla", prefix=tmp_path / "venv")
+    assert not env.exists()
+
+
+async def test_installs_then_skips_on_matching_marker(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix)
+    await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)
+    assert env.read_text().count("pip install") == 1
+    assert (prefix / ".vla-installed-smolvla.sha256").exists()
+    await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)
+    assert env.read_text().count("pip install") == 1
+
+
+async def test_changed_requirements_reinstall(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix)
+    await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)
+    (d / "base.txt").write_text("einops==0.8.2\n")
+    await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)
+    assert env.read_text().count("pip install") == 2
+
+
+async def test_failure_raises_with_uv_output_and_writes_no_marker(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix, 'echo "error: no space left on device"\nexit 2')
+    with pytest.raises(ins.InstallError, match=r"(?s)exit 2.*no space left"):
+        await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)
+    assert not (prefix / ".vla-installed-smolvla.sha256").exists()
+
+
+async def test_missing_git_is_refused(tmp_path, env, monkeypatch):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix)
+    monkeypatch.setattr(ins.shutil, "which", lambda name: None)
+    with pytest.raises(ins.InstallError, match="git"):
+        await ins.ensure_installed("smolvla", req_dir=d, prefix=prefix)
+
+
+async def test_linux_sets_cu128_backend_unless_set(tmp_path, env, monkeypatch):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix, 'echo "backend=$UV_TORCH_BACKEND" >> "$UV_LOG"')
+    monkeypatch.setattr(ins.sys, "platform", "linux")
+    monkeypatch.delenv("UV_TORCH_BACKEND", raising=False)
+    await ins.ensure_installed("act", req_dir=d, prefix=prefix)
+    assert "backend=cu128" in env.read_text()
+
+
+async def test_jetson_drops_the_cu128_backend(tmp_path, env, monkeypatch):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix, 'echo "backend=$UV_TORCH_BACKEND" >> "$UV_LOG"')
+    monkeypatch.setattr(ins, "jetson_settings", lambda env: dict(ins.JETSON_DEFAULTS))
+    monkeypatch.setattr(ins.sys, "platform", "linux")
+    monkeypatch.setenv("UV_TORCH_BACKEND", "cu128")
+    await ins.ensure_installed("act", req_dir=d, prefix=prefix)
+    log = env.read_text()
+    assert "backend=cu128" not in log
+    assert "jetson-ai-lab" in log
+
+
+async def test_cancellation_terminates_the_subprocess(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    pid_file = tmp_path / "pid"
+    _fake_uv(prefix, f'echo $$ > "{pid_file}"\nsleep 30')
+    task = asyncio.create_task(ins.ensure_installed("smolvla", req_dir=d, prefix=prefix))
+    for _ in range(100):
+        if pid_file.exists() and pid_file.read_text().strip():
+            break
+        await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    pid = int(pid_file.read_text())
+    # The whole process group is gone, the shell's `sleep` child included.
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pid, 0)
+    assert not (prefix / ".vla-installed-smolvla.sha256").exists()
+
+
+async def test_lock_serializes_and_second_caller_skips(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix, "sleep 0.5")
+    await asyncio.gather(
+        ins.ensure_installed("smolvla", req_dir=d, prefix=prefix),
+        ins.ensure_installed("smolvla", req_dir=d, prefix=prefix),
+    )
+    assert env.read_text().count("pip install") == 1
+
+
+async def test_lock_waiter_can_be_cancelled(tmp_path, env):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix, "sleep 1")
+    first = asyncio.create_task(ins.ensure_installed("smolvla", req_dir=d, prefix=prefix))
+    await asyncio.sleep(0.2)
+    waiter = asyncio.create_task(ins.ensure_installed("evo1", req_dir=d, prefix=prefix))
+    await asyncio.sleep(0.2)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await first
+
+
+async def test_for_checkpoint_reads_the_type(tmp_path, env, monkeypatch):
+    d, prefix = _req_dir(tmp_path), tmp_path / "venv"
+    _fake_uv(prefix)
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    (ckpt / "config.json").write_text('{"type": "diffusion"}')
+    monkeypatch.setenv("VLA_REQUIREMENTS_DIR", str(d))
+    await ins.ensure_installed_for_checkpoint(str(ckpt), prefix=prefix)
+    assert "diffusion.txt" in env.read_text()
+
+
+async def test_for_checkpoint_without_config_json_fails_clearly(tmp_path, env, monkeypatch):
+    monkeypatch.setenv("VLA_REQUIREMENTS_DIR", str(_req_dir(tmp_path)))
+    with pytest.raises(ins.InstallError, match="config.json"):
+        await ins.ensure_installed_for_checkpoint(str(tmp_path), prefix=tmp_path / "venv")
