@@ -14,11 +14,30 @@ dependencies = [
     # the pose composition itself and can be deployed on a machine that never
     # loads a checkpoint (the policy service may live elsewhere).
     "scipy>=1.11",
+    # Core, not lerobot-only: the policy service downloads the checkpoint
+    # (resolver.py) before the heavy stack is installed.
+    "huggingface-hub>=1.31.0,<3.0.0",
+    # The policy installer runs `sys.prefix/bin/uv`; run.sh has no ~/.local/bin on PATH.
+    "uv>=0.13",
 ]
 
 [project.optional-dependencies]
-lerobot = [
+# Installed lazily on a deployed host by vla/policy/installer.py from files that
+# tools/export_requirements.py exports from these extras. `base` is torch +
+# LeRobot with no LeRobot extras; each per-type extra adds only that type's deps.
+base = [
     # Direct deps so [tool.uv.sources] below applies (uv ignores sources for transitive deps).
+    "torch",
+    "torchvision",
+    "lerobot @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee",
+]
+smolvla = ["lerobot[smolvla] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee"]
+evo1 = ["lerobot[evo1] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee"]
+diffusion = ["lerobot[diffusion] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee"]
+pi = ["lerobot[pi] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee"]
+cosmos3 = ["lerobot[cosmos3] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee"]
+# Everything, for development, CI and the differential tests.
+lerobot = [
     "torch",
     "torchvision",
     "lerobot[smolvla,evo1,diffusion,pi,cosmos3] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee",
