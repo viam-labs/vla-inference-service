@@ -31,6 +31,16 @@ def test_requirement_lines_skip_comments_blank_and_continuations():
     assert er.requirement_lines(text) == ["torch==2.11.0", "numpy==2.2.6"]
 
 
+def test_checked_subtract_refuses_marker_mismatch():
+    with pytest.raises(ValueError, match="smolvla: foo differs"):
+        er.checked_subtract(["foo==1.0", "bar==2"], ["foo==1.0 ; sys_platform == 'linux'"], "smolvla")
+
+
+def test_checked_subtract_passes_when_lines_match():
+    kept = ["foo==1.0 ; sys_platform == 'linux'"]
+    assert er.checked_subtract([kept[0], "bar==2"], kept, "smolvla") == ["bar==2"]
+
+
 @pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
 def test_export_against_the_real_lock(tmp_path):
     er.export(tmp_path, project=ROOT)

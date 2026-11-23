@@ -43,6 +43,16 @@ def subtract(lines: list[str], names: set[str]) -> list[str]:
     return [line for line in lines if package_name(line) not in names]
 
 
+def checked_subtract(lines: list[str], kept: list[str], label: str) -> list[str]:
+    """subtract() by name, but refuse if a dropped package's lines differ from the kept copy."""
+    for name in {package_name(l) for l in lines} & {package_name(l) for l in kept}:
+        mine = {l for l in lines if package_name(l) == name}
+        theirs = {l for l in kept if package_name(l) == name}
+        if mine != theirs:
+            raise ValueError(f"{label}: {name} differs from core/base: {sorted(mine)} vs {sorted(theirs)}")
+    return subtract(lines, {package_name(l) for l in kept})
+
+
 def _uv_export(project: Path, extra: str | None) -> list[str]:
     cmd = [
         "uv", "export", "--frozen", "--no-hashes", "--no-annotate", "--no-header",
@@ -50,7 +60,7 @@ def _uv_export(project: Path, extra: str | None) -> list[str]:
     ]
     if extra:
         cmd += ["--extra", extra]
-    out = subprocess.run(cmd, cwd=project, check=True, capture_output=True, text=True).stdout
+    out = subprocess.run(cmd, cwd=project, check=True, stdout=subprocess.PIPE, text=True).stdout
     return requirement_lines(out)
 
 
@@ -62,13 +72,11 @@ def _write(path: Path, lines: list[str]) -> None:
 def export(out_dir: Path, project: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     core = _uv_export(project, None)
-    core_names = {package_name(l) for l in core}
-    base = subtract(_uv_export(project, "base"), core_names)
-    base_names = {package_name(l) for l in base}
+    base = checked_subtract(_uv_export(project, "base"), core, "base")
     _write(out_dir / "core.txt", core)
     _write(out_dir / "base.txt", base)
     for extra in TYPE_EXTRAS:
-        _write(out_dir / f"{extra}.txt", subtract(_uv_export(project, extra), core_names | base_names))
+        _write(out_dir / f"{extra}.txt", checked_subtract(_uv_export(project, extra), core + base, extra))
 
 
 if __name__ == "__main__":
