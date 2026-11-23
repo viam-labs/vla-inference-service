@@ -9,6 +9,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - run: uv lock --check
       - run: uv sync --extra lerobot
       - name: Track lerobot main
         if: matrix.lerobot == 'main'

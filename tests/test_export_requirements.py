@@ -10,6 +10,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 import export_requirements as er  # noqa: E402
 
 
+def test_installer_table_matches_exported_extras():
+    from vla.policy.installer import TYPE_FILES
+
+    assert {f.removesuffix(".txt") for f in TYPE_FILES.values() if f} == set(er.TYPE_EXTRAS)
+
+
 def test_package_name_normalizes_specifier_and_url_lines():
     assert er.package_name("torch==2.11.0+cu128 ; sys_platform == 'linux'") == "torch"
     assert er.package_name("lerobot @ git+https://github.com/huggingface/lerobot@abc") == "lerobot"

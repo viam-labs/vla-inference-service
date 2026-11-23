@@ -76,7 +76,7 @@ build-backend = "hatchling.build"
 
 # torch/torchvision from the CUDA 12.8 index on Linux, as lerobot <= ff7cc3de configured it.
 # lerobot 02655292c moved to PyPI wheels (CUDA 13, higher driver floor); keeping cu128 holds the
-# module's runtime unchanged across the pin bump. Jetson still swaps in sm_87 wheels in setup.sh.
+# module's runtime unchanged across the pin bump. the policy installer (src/vla/policy/installer.py) installs the sm_87 wheels on Jetson.
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"

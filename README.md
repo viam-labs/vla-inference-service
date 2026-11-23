@@ -49,8 +49,9 @@ The two settings most likely to bite you are `state_units`/`action_units` (see
   later loads. On Jetson the sm_87 torch from `JETSON_TORCH_INDEX` is installed directly
   (`JETSON_TORCH_INDEX`, `JETSON_TORCH_VERSION`, `JETSON_TORCHVISION_VERSION` override it).
   On JetPack 6 (glibc < 2.38) those wheels cannot load, so the generic aarch64 torch is
-  installed instead and inference runs on CPU. The first load after upgrading from 0.4.0 or
-  earlier re-downloads torch.
+  installed instead and inference runs on CPU. On Jetson, the first load after upgrading from 0.4.0 or
+  earlier re-downloads torch; elsewhere it may, if the previously installed versions differ from the lock.
+  A machine upgraded from 0.4.0 that only runs the controller keeps its old torch stack; delete `$VIAM_MODULE_DATA/venv` and restart the module to reclaim the space.
   To pre-install on a host that will be offline later, run
   `$VIAM_MODULE_DATA/venv/bin/python -m vla.policy.installer <policy_type> <module_dir>/requirements`
   with the module's own venv python, where `$VIAM_MODULE_DATA` is the module's data directory

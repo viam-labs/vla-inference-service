@@ -7,7 +7,7 @@ Writes, into OUT_DIR:
 
 Files are disjoint by package name. No index lines are emitted: the installer
 sets UV_TORCH_BACKEND=cu128 on Linux instead (an --emit-index-url export is
-unresolvable). Usage: uv run python tools/export_requirements.py OUT_DIR
+unresolvable). Usage: uv run --no-project python tools/export_requirements.py OUT_DIR
 """
 
 from __future__ import annotations
