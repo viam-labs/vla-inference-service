@@ -217,6 +217,7 @@ class VLAController(Generic, EasyResource):
         )
         self._measured_fps = 0.0
         self._starved_ticks = 0
+        self._obs_gaps: list[float] = []
         self._schedule: TickSchedule | None = None
         self._buffer: ReferenceBuffer | None = None
         self._inference: InferenceLoop | None = None
@@ -276,6 +277,7 @@ class VLAController(Generic, EasyResource):
         self._trace.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
+        self._obs_gaps = []
         self._schedule = None
         self._state = "idle"
         self._last_error = None
@@ -404,6 +406,8 @@ class VLAController(Generic, EasyResource):
             # very first fill is not counted). Cumulative, like clamp_counts, so
             # an operator can see the loop quietly stalling without reading logs.
             "starved_ticks": self._starved_ticks,
+            # Last observation burst's t_obs gaps (empty when n_obs_steps is 1).
+            "obs_gaps_s": list(self._obs_gaps),
             # Ticks that ran more than a period late and re-anchored the schedule,
             # resuming from now instead of replaying them as a burst.
             "reanchors": self._schedule.reanchors if self._schedule else 0,
@@ -449,6 +453,7 @@ class VLAController(Generic, EasyResource):
         self._trace.clear()
         self._measured_fps = 0.0
         self._starved_ticks = 0
+        self._obs_gaps = []
         self._schedule = None
         self._gripper_queue.clear()
         self._state = "waiting_for_policy"
@@ -781,6 +786,9 @@ class VLAController(Generic, EasyResource):
             # sent -- it has no entry in image_sizes, so ObservationBuilder
             # would fail trying to resize/encode it for a resolution nothing
             # declared, for a feed the policy never asked to see.
+            n_obs = int(specs.get("n_obs_steps", 1))
+            if n_obs < 1:
+                raise ValueError(f"policy specs report n_obs_steps={n_obs}; it must be >= 1")
             builder = ObservationBuilder(
                 clock=self._clock,
                 cameras={key: self._resource(cfg.cameras[key]) for key in image_sizes},
@@ -795,6 +803,8 @@ class VLAController(Generic, EasyResource):
                 action_space=cfg.action_space,
                 duration_warn_s=cfg.duration_warn_s,
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
+                n_obs_steps=n_obs,
+                fps=cfg.fps,
             )
             self._safety = self._build_safety(gripper)
             self._buffer = ReferenceBuffer(
@@ -812,6 +822,7 @@ class VLAController(Generic, EasyResource):
                 margin_s=cfg.margin_s,
                 timeout_s=cfg.inference_timeout_s,
                 clock=self._clock,
+                capture_s=(n_obs - 1) / cfg.fps,
             )
 
             # One full round trip before motion, its chunk discarded. The policy's
@@ -864,10 +875,16 @@ class VLAController(Generic, EasyResource):
         """
         obs = await builder.build()
         self._seq += 1
+        self._obs_gaps = list(obs.gaps)
+        if obs.history:
+            images = {k: [f.images[k] for f in obs.history] for k in obs.images}
+            state: Any = [encode_vector(f.state) for f in obs.history]
+        else:
+            images, state = obs.images, encode_vector(obs.state)
         payload: dict[str, Any] = {
             "command": "infer",
-            "images": obs.images,
-            "state": encode_vector(obs.state),
+            "images": images,
+            "state": state,
             "task": self._active_task_text,
             "seq": self._seq,
             "t_obs": obs.t_obs,

@@ -115,7 +115,10 @@ class ScriptedPolicy:
         fps: float = FPS,
         row_noise: float = 0.0,
         warmup_s: float = 0.0,
+        n_obs_steps: int = 1,
     ):
+        self.n_obs_steps = n_obs_steps
+        self.requests: list[dict] = []
         self.latency_s = latency_s
         self.warmup_s = warmup_s
         self.warmed_up = False
@@ -138,6 +141,7 @@ class ScriptedPolicy:
                 "action_dim": float(DIM),
                 "state_dim": float(DIM),
                 "n_action_steps": float(CHUNK),
+                "n_obs_steps": float(self.n_obs_steps),
                 "input_features": {
                     "observation.images.top": [3.0, 224.0, 224.0],
                     "observation.state": [float(DIM)],
@@ -158,6 +162,7 @@ class ScriptedPolicy:
         if name == "infer":
             loop = asyncio.get_running_loop()
             chunk_id = len(self.obs_times)
+            self.requests.append(command)
             # The harness's controller clock is loop.time, so t_obs is the
             # controller's own observation instant.
             obs_t = float(command.get("t_obs", loop.time()))
@@ -271,7 +276,7 @@ TIMING = ("blend_s", "margin_s", "inference_timeout_s")
 
 def run_session(
     *, latency_s, duration_s=20.0, jitter=None, offsets=(0.0,), fps=FPS, row_noise=0.0, warmup_s=0.0,
-    **config,
+    n_obs_steps=1, **config,
 ) -> Session:
     """Run the real controller for `duration_s` virtual seconds and return what it did."""
 
@@ -279,7 +284,8 @@ def run_session(
         loop = asyncio.get_running_loop()
         arm = TrackingArm(jitter=jitter)
         policy = ScriptedPolicy(
-            latency_s, offsets, fps=fps, row_noise=row_noise, warmup_s=warmup_s
+            latency_s, offsets, fps=fps, row_noise=row_noise, warmup_s=warmup_s,
+            n_obs_steps=n_obs_steps,
         )
         svc = VLAController("c")
         svc._clock = loop.time

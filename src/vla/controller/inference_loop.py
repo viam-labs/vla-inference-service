@@ -62,6 +62,7 @@ class InferenceLoop:
         margin_s: float,
         timeout_s: float,
         clock: Callable[[], float],
+        capture_s: float = 0.0,
     ) -> None:
         self._infer = infer
         self._buffer = buffer
@@ -70,6 +71,13 @@ class InferenceLoop:
         self._margin_s = margin_s
         self._timeout_s = timeout_s
         self._clock = clock
+        # Time from firing to the observation instant (an observation burst):
+        # t_obs is the newest frame's, so the measured latencies miss it.
+        # `capture_s` is the initial estimate; each burst inference then
+        # measures it. 0 (single observation) is never measured.
+        self._capture_s = capture_s
+        self._burst = capture_s > 0
+        self.captures: deque[float] = deque(maxlen=50)
         # Observation-to-landing seconds, most recent 50 (status reports the mean).
         self.latencies: deque[float] = deque(maxlen=50)
         self._inflight: asyncio.Task[None] | None = None
@@ -79,7 +87,8 @@ class InferenceLoop:
     def expected_latency(self) -> float:
         if len(self.latencies) < _MIN_SAMPLES:
             return self._chunk_s
-        return max(list(self.latencies)[-_EXPECTED_WINDOW:])
+        capture = max(list(self.captures)[-_EXPECTED_WINDOW:]) if self.captures else self._capture_s
+        return max(list(self.latencies)[-_EXPECTED_WINDOW:]) + capture
 
     @property
     def regime(self) -> str:
@@ -135,7 +144,10 @@ class InferenceLoop:
 
     async def _infer_and_land(self) -> None:
         try:
+            fired = self._clock()
             chunk, t_obs = await self._infer()
+            if self._burst:
+                self.captures.append(t_obs - fired)
             self._buffer.land(chunk, t_obs)
         except asyncio.CancelledError:
             raise

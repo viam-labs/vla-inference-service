@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from asyncio import to_thread
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -59,6 +60,9 @@ DEFAULT_DURATION_WARN_S = 0.1
 # this constant should flag a camera serving a *buffered* frame, not merely
 # echo the duration warning under a different name.
 STALE_FRAME_WARN_S = 0.5
+
+# At most one burst-gap warning per this many seconds.
+_GAP_WARN_EVERY_S = 10.0
 
 
 def pose_state_from_proto(pose: Any) -> np.ndarray:
@@ -102,6 +106,11 @@ class Observation:
     # Controller-clock time the arm-state read returned. Row i of the chunk
     # inferred from this observation means "be here at t_obs + (i+1)/fps".
     t_obs: float
+    # With n_obs_steps > 1: all n observations, oldest first, the last being
+    # this one (so `images`/`state`/`t_obs` are the newest). Empty otherwise.
+    history: tuple["Observation", ...] = ()
+    # t_obs differences between consecutive history frames (seconds).
+    gaps: tuple[float, ...] = ()
 
 
 class ObservationBuilder:
@@ -125,6 +134,8 @@ class ObservationBuilder:
         duration_warn_s: float = DEFAULT_DURATION_WARN_S,
         stale_frame_warn_s: float = STALE_FRAME_WARN_S,
         clock: Callable[[], float] = time.perf_counter,
+        n_obs_steps: int = 1,
+        fps: float = 10.0,
     ) -> None:
         self._cameras = dict(cameras)
         self._arm = arm
@@ -139,8 +150,49 @@ class ObservationBuilder:
         self._duration_warn_s = duration_warn_s
         self._stale_frame_warn_s = stale_frame_warn_s
         self._clock = clock
+        self._n_obs = n_obs_steps
+        self._period = 1.0 / fps
+        self._last_gap_warn = -math.inf
 
     async def build(self) -> Observation:
+        """One observation, or a burst of `n_obs_steps` spaced 1/fps apart.
+
+        Each capture starts at least 1/fps after the previous one started, so no
+        gap is shorter than the training spacing; a slow read lengthens its gap. A failed capture fails the whole burst.
+        """
+        if self._n_obs == 1:
+            return await self._build_one()
+        started = prev_start = self._clock()
+        frames: list[Observation] = []
+        for k in range(self._n_obs):
+            if k:
+                # Chained, not anchored to `started`: after a slow read the
+                # next capture waits a full period from the previous start, so
+                # no gap is ever compressed below the training spacing.
+                prev_start = max(prev_start + self._period, self._clock())
+                delay = prev_start - self._clock()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            frames.append(await self._build_one())
+        shapes = {tuple((key, p["height"], p["width"]) for key, p in sorted(f.images.items())) for f in frames}
+        if len(shapes) > 1:
+            raise ObservationError(f"burst frames differ in image shape: {sorted(shapes)}")
+        gaps = tuple(b.t_obs - a.t_obs for a, b in zip(frames, frames[1:]))
+        now = self._clock()
+        if any(not 0.75 * self._period <= g <= 1.5 * self._period for g in gaps) and (
+            now - self._last_gap_warn >= _GAP_WARN_EVERY_S
+        ):
+            self._last_gap_warn = now
+            LOGGER.warning(
+                "observation burst gaps %s s are outside [0.75, 1.5] x the %.3fs training "
+                "period; the policy sees history at a different spacing than it was trained on",
+                [round(g, 3) for g in gaps],
+                self._period,
+            )
+        # duration_s spans the whole burst, from the first capture.
+        return replace(frames[-1], duration_s=now - started, history=tuple(frames), gaps=gaps)
+
+    async def _build_one(self) -> Observation:
         started = self._clock()
         keys = list(self._cameras)
 
