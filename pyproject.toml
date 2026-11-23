@@ -21,7 +21,7 @@ lerobot = [
     # Direct deps so [tool.uv.sources] below applies (uv ignores sources for transitive deps).
     "torch",
     "torchvision",
-    "lerobot[smolvla,evo1] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee",
+    "lerobot[smolvla,evo1,diffusion] @ git+https://github.com/huggingface/lerobot@02655292cdadd7dd2f8fc5daa31a7437b44354ee",
 ]
 
 [dependency-groups]

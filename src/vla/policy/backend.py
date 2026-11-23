@@ -19,6 +19,9 @@ class PolicySpecs:
     action_dim: int
     state_dim: int
     n_action_steps: int
+    # Observations per infer call. >1 means `images[key]` and `state` take a list
+    # of this many entries, oldest first, spaced at the training fps.
+    n_obs_steps: int
     input_features: dict[str, list[int]]
     output_features: dict[str, list[int]]
     image_feature_keys: list[str]

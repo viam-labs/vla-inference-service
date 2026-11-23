@@ -17,6 +17,12 @@ from .prefix import normalize_prefix_length
 
 LOGGER = logging.getLogger(__name__)
 
+# Policy types whose model reads `observation.state` as (B, n_obs_steps, D) and
+# whose images carry a time axis. LeRobot gives every config an `n_obs_steps`
+# field (ACT, smolvla, pi0 all have it at 1 and want a flat (B, D) state), so the
+# field alone cannot say which convention a policy uses.
+_TIME_AXIS_POLICIES = frozenset({"diffusion"})
+
 
 def _usable(device: str) -> bool:
     """Check the device can actually execute a kernel, not merely that it exists.
@@ -78,6 +84,8 @@ class LeRobotBackend:
         self._device = "cpu"
         self._execution_horizon = 10
         self._rtc_enabled = False
+        self._time_axis = False
+        self._warned_repeat = False
 
     def load(
         self,
@@ -94,6 +102,7 @@ class LeRobotBackend:
         from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 
         cfg = PreTrainedConfig.from_pretrained(checkpoint_dir)
+        self._check_history_supported(cfg)
         self._apply_num_steps(cfg, num_steps)
         policy_cls = get_policy_class(cfg.type)
         policy = policy_cls.from_pretrained(checkpoint_dir, config=cfg)
@@ -139,9 +148,21 @@ class LeRobotBackend:
         self._preprocessor = preprocessor
         self._postprocessor = postprocessor
         self._device = resolved_device
+        self._time_axis = cfg.type in _TIME_AXIS_POLICIES
+        self._warned_repeat = False
         self._specs = self._build_specs(
             cfg, policy, supports_rtc, preprocessor, resolved_device, unused_image_features
         )
+
+    @staticmethod
+    def _check_history_supported(cfg) -> None:
+        n_obs = getattr(cfg, "n_obs_steps", 1)
+        if n_obs > 1 and cfg.type not in _TIME_AXIS_POLICIES:
+            raise ConfigError(
+                f"policy type {cfg.type!r} has n_obs_steps={n_obs}, but observation history is "
+                f"only verified for {sorted(_TIME_AXIS_POLICIES)}; its state/image layout is "
+                "unchecked"
+            )
 
     @staticmethod
     def _apply_num_steps(cfg, num_steps: int | None) -> None:
@@ -248,6 +269,7 @@ class LeRobotBackend:
             action_dim=action_dim,
             state_dim=state_dim,
             n_action_steps=int(cfg.n_action_steps),
+            n_obs_steps=int(getattr(cfg, "n_obs_steps", 1)),
             input_features=input_features,
             output_features=output_features,
             image_feature_keys=image_keys,
@@ -285,16 +307,28 @@ class LeRobotBackend:
         if self._policy is None:
             raise RuntimeError("backend not loaded")
 
+        n_obs = self._specs.n_obs_steps
+        stacked = self._time_axis
         batch: dict[str, Any] = {"task": task}
         for key, img in images.items():
-            # HWC uint8 -> BCHW float in [0, 1]; the preprocessor handles the
-            # rest. `np.asarray` + `.copy()`-free `from_numpy` would alias the
-            # caller's buffer, but `.float()` always allocates a new tensor,
-            # so the caller's array is never mutated by this call.
-            t = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0)
-            batch[key] = t.unsqueeze(0).to(self._device)
-        batch["observation.state"] = (
-            torch.from_numpy(np.asarray(state, dtype=np.float32)).unsqueeze(0).to(self._device)
+            frames = self._history(img, n_obs, f"images[{key!r}]")
+            # HWC uint8 -> CHW float in [0, 1]; the preprocessor handles the
+            # rest. `.float()` always allocates, so the caller's array is
+            # never mutated by this call.
+            t = torch.stack(
+                [torch.from_numpy(f).permute(2, 0, 1).float().div_(255.0) for f in frames]
+            )  # (T, C, H, W)
+            batch[key] = t.unsqueeze(0).to(self._device) if stacked else t[0].unsqueeze(0).to(
+                self._device
+            )
+        vecs = self._history(state, n_obs, "state")
+        s = torch.from_numpy(np.stack([np.asarray(v, dtype=np.float32) for v in vecs]))  # (T, D)
+        # Where LeRobot wants the time axis: the preprocessor does not add it
+        # (AddBatchDimension only batches unbatched 1-D state / 3-D images, and its
+        # normalizer broadcasts over leading dims), and DiffusionPolicy.predict_action_chunk
+        # adds it to images only, in offline mode -- so state must arrive as (B, T, D).
+        batch["observation.state"] = (s.unsqueeze(0) if stacked else s[0].unsqueeze(0)).to(
+            self._device
         )
 
         kwargs = {}
@@ -317,6 +351,24 @@ class LeRobotBackend:
             processed[: self._specs.n_action_steps].float().cpu().numpy().astype(np.float32),
             raw.float().cpu().numpy().astype(np.float32),
         )
+
+    def _history(self, value, n_obs: int, what: str) -> list:
+        """One observation or a list of `n_obs` (oldest first) -> list of `n_obs`."""
+        if not isinstance(value, (list, tuple)):
+            if n_obs > 1:
+                if not self._warned_repeat:
+                    self._warned_repeat = True
+                    LOGGER.warning(
+                        "policy expects n_obs_steps=%d but got a single observation; repeating "
+                        "it (as LeRobot does on the first step). Send lists, oldest first, "
+                        "spaced at the training fps.",
+                        n_obs,
+                    )
+                return [value] * n_obs
+            return [value]
+        if len(value) != n_obs:
+            raise ValueError(f"{what} has {len(value)} observation(s), expected n_obs_steps={n_obs}")
+        return list(value)
 
     def reset(self) -> None:
         if self._policy is not None and hasattr(self._policy, "reset"):

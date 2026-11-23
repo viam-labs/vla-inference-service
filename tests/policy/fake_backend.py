@@ -40,7 +40,10 @@ class FakePolicyBackend:
         preprocess_image_size: tuple[int, int] | None = None,
         state_dim: int | None = None,
         camera_keys: tuple[str, ...] = _DEFAULT_CAMERA_KEYS,
+        n_obs_steps: int = 1,
     ) -> None:
+        self._n_obs_steps = n_obs_steps
+        self.last_obs: tuple[Any, Any] | None = None
         self._action_dim = action_dim
         # Defaults to action_dim only because that's a legitimate value for
         # a caller who doesn't care to distinguish them -- never assume the
@@ -84,6 +87,7 @@ class FakePolicyBackend:
             action_dim=self._action_dim,
             state_dim=self._state_dim,
             n_action_steps=self._n_action_steps,
+            n_obs_steps=self._n_obs_steps,
             input_features=input_features,
             output_features={"action": [self._action_dim]},
             image_feature_keys=image_keys,
@@ -122,6 +126,7 @@ class FakePolicyBackend:
             # Copy rather than hold the caller's reference: a caller that
             # mutates its rtc_kwargs dict after the call returns must not
             # retroactively change what this backend recorded as received.
+            self.last_obs = (images, state)
             self.last_rtc = None if rtc_kwargs is None else dict(rtc_kwargs)
 
         steps, dim = self._n_action_steps, self._action_dim
