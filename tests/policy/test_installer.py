@@ -264,7 +264,12 @@ async def test_lock_waiter_can_be_cancelled(tmp_path, env):
     d, prefix = _req_dir(tmp_path), tmp_path / "venv"
     _fake_uv(prefix, "sleep 1")
     first = asyncio.create_task(ins.ensure_installed("smolvla", req_dir=d, prefix=prefix))
-    await asyncio.sleep(0.2)
+    # Wait until the first install's uv is running (it holds the lock), not a fixed
+    # delay: under full-suite load the subprocess can take longer to start.
+    for _ in range(100):
+        if env.exists() and "smolvla.txt" in env.read_text():
+            break
+        await asyncio.sleep(0.05)
     waiter = asyncio.create_task(ins.ensure_installed("evo1", req_dir=d, prefix=prefix))
     await asyncio.sleep(0.2)
     assert "evo1.txt" not in env.read_text()  # blocked on the lock
