@@ -37,6 +37,12 @@ if [ ${#WHEELS[@]} -ne 1 ]; then
   exit 1
 fi
 WHEEL="${WHEELS[0]}"
+# Deployed hosts resolve without uv.lock, so pyproject's [tool.uv.sources] pin is
+# not enough on its own: LeRobot 02655292 no longer points torch at the cu128
+# index, and PyPI's default Linux torch is CUDA 13, which silently falls back to
+# CPU on cu12-driver hosts. UV_TORCH_BACKEND makes the plain install pick cu128.
+[ "$(uname -s)" = Linux ] && export UV_TORCH_BACKEND="${UV_TORCH_BACKEND:-cu128}"
+
 # --reinstall-package on our own distribution: the version in pyproject.toml is
 # static, so on a reload into a reused venv uv sees 0.1.0 already satisfied and
 # skips it -- silently running the PREVIOUS build's code while the log says the

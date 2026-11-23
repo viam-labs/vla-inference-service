@@ -359,7 +359,7 @@ class ObservationBuilder:
         """Resize preserving aspect ratio, padding black on the LEFT and TOP.
 
         Mirrors lerobot's `resize_with_pad`
-        (lerobot/policies/common/vla_utils.py:219) -- smolvla's own
+        (lerobot/policies/common/vla_utils.py:218) -- smolvla's own
         convention, computed by scaling by `ratio = max(cur_w/target_w,
         cur_h/target_h)` so the resized image never exceeds the target in
         either dimension, then padding whatever's left on the left/top with
