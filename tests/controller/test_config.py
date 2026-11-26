@@ -1110,3 +1110,10 @@ def test_limbs_motion_and_start_mm_rejected_outside_ee_pose():
         ControllerConfig.parse({**base, "motion": "builtin"})
     with pytest.raises(ConfigError, match="max_start_delta_mm"):
         ControllerConfig.parse({**base, "safety": {"max_start_delta_mm": 10}})
+
+
+def test_ee_pose_rejects_non_do_command_limb_gripper():
+    raw = _ee()
+    raw["limbs"][0]["gripper"]["type"] = "arm_joint"
+    with pytest.raises(ConfigError, match="do_command"):
+        ControllerConfig.parse(raw)

@@ -30,12 +30,18 @@ state layout is the kind of config an operator reasonably assumes is in
 force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `"joints"` for the same reason.
 
-`smooth_rows` (default 7, 0 under `"delta-ee"`) filters each landing chunk
+`action_space: "ee-pose"` likewise rejects top-level `arm`, `state_joint_indices`,
+`state_units`/`action_units`, a non-`none` `gripper`, `arm_write: "stream"` and the
+joints-only `safety` keys: the `limbs` carry the arms and grippers, and the row
+layout is fixed (mm, rotation rows, normalized grips). Conversely `limbs`,
+`motion` and `safety.max_start_delta_mm` are rejected outside `"ee-pose"`.
+
+`smooth_rows` (default 7, 0 under `"delta-ee"` and `"ee-pose"`) filters each landing chunk
 with a zero-phase quadratic fit over that many rows, removing tick-to-tick
 jitter in the policy's output without lag. The crossfade (`blend_s`), the
 trigger's lead (`margin_s`) are fixed by parse(), not configured;
 `inference_timeout_s` (default 30) and `rpc_timeout_s` (default `max(2, 10/fps)`,
-or `max(5, 10/fps)` under `"delta-ee"` or with a `do_command` gripper)
+or `max(5, 10/fps)` under `"delta-ee"`, `"ee-pose"` or with a `do_command` gripper)
 are the timing knobs an operator sets. See `reference_buffer.py` and `inference_loop.py`.
 The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
 `actions_per_chunk`) are refused with their replacement; see `REMOVED_KEYS`.
@@ -531,7 +537,9 @@ class LimbConfig:
 
 def _parse_limbs(raw: Any) -> tuple[LimbConfig, ...]:
     if not isinstance(raw, list) or not raw:
-        raise ConfigError(f'limbs is required under action_space="{EE_POSE}" and must be a non-empty list')
+        raise ConfigError(
+            f'limbs is required under action_space="{EE_POSE}" and must be a non-empty list'
+        )
     limbs = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
@@ -544,6 +552,11 @@ def _parse_limbs(raw: Any) -> tuple[LimbConfig, ...]:
             raise ConfigError(
                 f"limbs[{i}].gripper is required: a do_command gripper "
                 '({"name", "open_value", "closed_value"}); every limb carries a grip channel'
+            )
+        if grip.get("type", "do_command") != "do_command":
+            raise ConfigError(
+                f'limbs[{i}].gripper.type must be "do_command" '
+                f"(every limb grip is a do_command gripper), got {grip.get('type')!r}"
             )
         for key in ("name", "open_value", "closed_value"):
             if key not in grip:
@@ -716,7 +729,9 @@ class ControllerConfig:
                     f"expected {expected} (one per action dimension in degrees)"
                 )
 
-        smooth_rows = as_int(raw.get("smooth_rows", 0 if (delta_ee or ee_pose) else 7), "smooth_rows", minimum=0)
+        smooth_rows = as_int(
+            raw.get("smooth_rows", 0 if (delta_ee or ee_pose) else 7), "smooth_rows", minimum=0
+        )
         if smooth_rows and smooth_rows % 2 == 0:
             raise ConfigError(
                 f"smooth_rows={smooth_rows} must be odd (a window centred on each row) or 0 for off"
