@@ -2889,3 +2889,106 @@ async def test_start_after_reconfigure_waits_for_the_old_halt():
     # Nothing of the new run ran while the old arm.stop was in flight.
     between = events[events.index("stop_begin"):events.index("stop_end")]
     assert "move" not in between, events
+
+
+# ---------------------------------------------------------------------------
+# action_space="ee-pose"
+# ---------------------------------------------------------------------------
+
+from tests.fakes import FakeMotion  # noqa: E402
+from viam.proto.common import Pose  # noqa: E402
+
+_EE_DOWN = dict(o_x=0.0, o_y=0.0, o_z=-1.0, theta=0.0)
+
+
+def _ee_config(**overrides):
+    attrs = {
+        "action_space": "ee-pose",
+        "policy_service": "p",
+        "motion": "mo",
+        "cameras": {"observation.images.top": "cam"},
+        "limbs": [
+            {"name": "left", "arm": "la", "frame": "lg",
+             "gripper": {"name": "lgrip", "open_value": 100.0, "closed_value": 0.0}},
+            {"name": "right", "arm": "ra", "frame": "rg",
+             "gripper": {"name": "rgrip", "open_value": 100.0, "closed_value": 0.0}},
+        ],
+        "fps": 50.0,
+    }
+    attrs.update(overrides)
+    s = Struct()
+    s.update(attrs)
+    return ServiceConfig(name="c", api="rdk:service:generic", model="viam-labs:vla:controller", attributes=s)
+
+
+class _HoldPolicy(FakePolicyClient):
+    """Answers every infer with the observed state repeated: hold still, open grips."""
+
+    async def do_command(self, command, **kwargs):
+        if command.get("command") == "infer":
+            self.infer_calls += 1
+            self.last_infer = command
+            state = np.asarray(command["state"]["values"], dtype=np.float32)
+            state[18:] = 0.0
+            chunk = np.tile(state, (self.n, 1))
+            return {"actions": encode_matrix(chunk), "raw_actions": encode_matrix(chunk), "latency_s": 0.001}
+        return await super().do_command(command, **kwargs)
+
+
+def _ee_deps(policy=None, motion=None):
+    return {
+        "p": policy or _HoldPolicy(action_dim=20, state_dim=20, n=8),
+        "mo": motion or FakeMotion({"lg": Pose(x=300, y=300, z=400, **_EE_DOWN), "rg": Pose(x=300, y=-300, z=400, **_EE_DOWN)}),
+        "cam": FakeCamera(),
+        "la": FakeArm(positions=[0.0] * 6),
+        "ra": FakeArm(positions=[0.0] * 6),
+        "lgrip": FakeDoCommandGripper(position=100.0),
+        "rgrip": FakeDoCommandGripper(position=100.0),
+    }
+
+
+async def test_ee_pose_runs_and_streams_both_limbs():
+    deps = _ee_deps()
+    svc = _svc(_ee_config(), deps)
+    await svc.do_command({"command": "start", "task": "t"})
+    motion = deps["mo"]
+    await _wait_until(lambda: sum("teleop_move" in c for c in motion.commands) >= 6, "teleop moves")
+    status = await svc.do_command({"command": "status"})
+    assert status["state"] == "running", status
+    starts = [c for c in motion.commands if "teleop_start" in c]
+    assert len(starts) == 2
+    moved = {c["component_name"] for c in motion.commands if "teleop_move" in c}
+    assert moved == {"lg", "rg"}
+    assert deps["lgrip"].position == pytest.approx(100.0)  # policy says open
+    await svc.do_command({"command": "stop"})
+    assert sum("teleop_stop" in c for c in motion.commands) >= 2  # start's clear + stop
+    assert deps["la"].stopped and deps["ra"].stopped
+
+
+async def test_ee_pose_refuses_wrong_policy_width():
+    deps = _ee_deps(policy=_HoldPolicy(action_dim=6, state_dim=9, n=8))
+    svc = _svc(_ee_config(), deps)
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "20" in status["last_error"]
+    assert not [c for c in deps["mo"].commands if "teleop_move" in c]
+
+
+async def test_ee_pose_get_pose_failure_refuses_before_motion():
+    motion = FakeMotion({"lg": Pose(x=300, y=300, z=400, **_EE_DOWN), "rg": Pose(x=300, y=-300, z=400, **_EE_DOWN)})
+    motion.fail_get_pose = True
+    deps = _ee_deps(motion=motion)
+    svc = _svc(_ee_config(), deps)
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "get_pose" in status["last_error"]
+    assert not [c for c in motion.commands if "teleop_start" in c]
+
+
+async def test_ee_pose_reconfigure_while_running_stops_limbs():
+    deps = _ee_deps()
+    svc = _svc(_ee_config(), deps)
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: any("teleop_move" in c for c in deps["mo"].commands), "a teleop move")
+    svc.reconfigure(_ee_config(), deps)
+    await _wait_until(lambda: deps["la"].stopped and deps["ra"].stopped, "both arms stopped")

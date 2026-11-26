@@ -80,8 +80,9 @@ from viam.services.generic import Generic
 from viam.utils import struct_to_dict
 
 from ..wire import decode_matrix, encode_vector
-from .config import DELTA_EE, DELTA_EE_ACTION_DIM, DELTA_EE_STATE_DIM, ControllerConfig
-from .gripper import GripperAdapter, make_gripper_adapter
+from .config import DELTA_EE, DELTA_EE_ACTION_DIM, DELTA_EE_STATE_DIM, EE_POSE, POSE_DIM, ControllerConfig
+from .ee_pose import Limbs
+from .gripper import GripperAdapter, NoGripper, make_gripper_adapter
 from .inference_loop import InferenceLoop
 from .observation import ObservationBuilder, pose_state_from_proto
 from .pose import orientation_vector, state_compose, state_rotation
@@ -222,6 +223,7 @@ class VLAController(Generic, EasyResource):
         self._buffer: ReferenceBuffer | None = None
         self._inference: InferenceLoop | None = None
         self._stop_task: asyncio.Task | None = None
+        self._limbs: Limbs | None = None
         # (sample_t, value) for the gripper channel, written once the arm
         # reaches that row's time; see _write_gripper.
         self._gripper_queue: deque[tuple[float, float]] = deque()
@@ -253,9 +255,12 @@ class VLAController(Generic, EasyResource):
         # Likewise the open stream: cancelling the loop does not close it, and
         # the reset below drops the last reference to it.
         old_stream = self._stream if was_running else None
+        old_limbs = self._limbs if was_running else None
         self._stop_loop_sync()
         self._gripper_queue.clear()
-        if old_arm is not None:
+        if old_limbs is not None:
+            self._stop_task = asyncio.create_task(old_limbs.stop())
+        elif old_arm is not None:
             # reconfigure is sync, so the stop is scheduled rather than awaited.
             # Cancelling the loop alone leaves the arm executing its last
             # command. Keep a reference: CPython may otherwise garbage-collect
@@ -271,6 +276,7 @@ class VLAController(Generic, EasyResource):
         self._inference = None
         self._stream = None
         self._stream_points_sent = 0
+        self._limbs = None
         self._safety = None
         self._timings.clear()
         self._seq = 0
@@ -284,7 +290,7 @@ class VLAController(Generic, EasyResource):
         self._log_velocity_budget()
 
     def _log_velocity_budget(self) -> None:
-        if self._cfg.action_space == DELTA_EE:
+        if self._cfg.action_space in (DELTA_EE, EE_POSE):
             self._log_cartesian_budget()
             return
         s = self._cfg.safety
@@ -447,6 +453,7 @@ class VLAController(Generic, EasyResource):
         self._inference = None
         self._stream = None
         self._stream_points_sent = 0
+        self._limbs = None
         self._safety = None
         self._timings.clear()
         self._seq = 0
@@ -525,6 +532,9 @@ class VLAController(Generic, EasyResource):
     async def _safe_stop_arm(self) -> None:
         if not self._cfg:
             return
+        if self._limbs is not None:
+            await self._limbs.stop()
+            return
         await self._stop_arm(self._deps.get(self._cfg.arm), self._cfg.rpc_timeout_s)
 
     async def _await_policy(self) -> dict[str, Any]:
@@ -563,6 +573,8 @@ class VLAController(Generic, EasyResource):
         reads it back as `safe[-1]`, `arm_joint` included -- and must take the
         new value outright. Every delta-EE column is a continuous delta.
         """
+        if self._cfg.action_space == EE_POSE:
+            return POSE_DIM * len(self._cfg.limbs)
         if self._cfg.action_space == DELTA_EE:
             return DELTA_EE_ACTION_DIM
         return int(specs["action_dim"]) - (1 if gripper.in_state else 0)
@@ -583,7 +595,7 @@ class VLAController(Generic, EasyResource):
 
     def _build_safety(self, gripper: GripperAdapter) -> SafetyLayer | CartesianSafetyLayer:
         s = self._cfg.safety
-        if self._cfg.action_space == DELTA_EE:
+        if self._cfg.action_space in (DELTA_EE, EE_POSE):
             return CartesianSafetyLayer(s)
         # The delta clamp measures a target against where the arm is now, and
         # the target is sampled _sample_lead_s() ahead. max_joint_delta_degs is
@@ -595,6 +607,16 @@ class VLAController(Generic, EasyResource):
 
     def _check_action_dim(self, specs: dict[str, Any], gripper: GripperAdapter) -> None:
         cfg = self._cfg
+        if cfg.action_space == EE_POSE:
+            width = (POSE_DIM + 1) * len(cfg.limbs)
+            action_dim, state_dim = int(specs["action_dim"]), specs.get("state_dim")
+            if action_dim != width or state_dim is None or int(state_dim) != width:
+                raise RuntimeError(
+                    f'action_space="ee-pose" with {len(cfg.limbs)} limb(s) needs a policy whose state and '
+                    f"action are {width} dimensions ({POSE_DIM} pose + 1 grip per limb); the policy declares "
+                    f"action_dim={action_dim}, state_dim={state_dim!r}"
+                )
+            return
         if cfg.action_space == DELTA_EE:
             self._check_delta_ee_dims(specs)
             return
@@ -751,35 +773,63 @@ class VLAController(Generic, EasyResource):
             specs = await self._await_policy()
             self._specs = dict(specs)
 
-            gripper = make_gripper_adapter(cfg.gripper, self._deps)
-            self._check_action_dim(specs, gripper)
-            image_sizes = self._image_sizes(specs)
-
-            arm = self._resource(cfg.arm)
-            if cfg.action_space == DELTA_EE:
-                # The delta-EE equivalent of the joint-index check below:
-                # refuse before any motion if the arm cannot supply the one
-                # reading this action space is built on. A driver that does
-                # not implement `get_end_position` (or returns something that
-                # is not a Pose) must fail here, not on the first tick after
-                # the loop has already reported "running".
-                await self._check_end_position(arm)
-            else:
-                measured = list((await arm.get_joint_positions()).values)
-                self._check_joint_indices(measured, gripper)
-            await self._preflight_gripper(gripper)
-
-            if cfg.arm_write == "stream":
-                # `measured` is bound: config rejects "stream" with delta-ee. start()
-                # sends nothing; a driver without the RPC fails on tick one's check().
-                self._stream = ArmStream(
-                    arm,
-                    fps=cfg.fps,
-                    stream_hz=cfg.stream_hz,
-                    extra=dict(cfg.arm_move_extra),
-                    interp=cfg.stream_interp,
+            ee_pose = cfg.action_space == EE_POSE
+            arm = None
+            if ee_pose:
+                gripper = NoGripper()
+                self._check_action_dim(specs, gripper)
+                image_sizes = self._image_sizes(specs)
+                # The same object Limbs counts clamps on: status.clamp_counts reads self._safety.
+                self._safety = self._build_safety(gripper)
+                adapters = [make_gripper_adapter(l.gripper, self._deps) for l in cfg.limbs]
+                limbs = self._limbs = Limbs(
+                    cfg.limbs,
+                    motion=self._resource(cfg.motion),
+                    motion_name=cfg.motion,
+                    arms={l.arm: self._resource(l.arm) for l in cfg.limbs},
+                    grippers=adapters,
+                    safety=self._safety,
+                    start_limit_mm=cfg.safety.max_start_delta_mm,
+                    lead_limit_mm=cfg.safety.max_lead_mm,
+                    rpc_timeout_s=cfg.rpc_timeout_s,
                 )
-                await self._stream.start(measured)
+                try:
+                    await limbs.read_state()  # refuse before motion if a pose or grip cannot be read
+                except Exception as exc:
+                    self._limbs = None  # nothing was started; there is nothing to stop
+                    raise RuntimeError(f'action_space="ee-pose" could not read the limbs: {exc}') from exc
+                for adapter in adapters:
+                    await self._preflight_gripper(adapter)
+            else:
+                gripper = make_gripper_adapter(cfg.gripper, self._deps)
+                self._check_action_dim(specs, gripper)
+                image_sizes = self._image_sizes(specs)
+
+                arm = self._resource(cfg.arm)
+                if cfg.action_space == DELTA_EE:
+                    # The delta-EE equivalent of the joint-index check below:
+                    # refuse before any motion if the arm cannot supply the one
+                    # reading this action space is built on. A driver that does
+                    # not implement `get_end_position` (or returns something that
+                    # is not a Pose) must fail here, not on the first tick after
+                    # the loop has already reported "running".
+                    await self._check_end_position(arm)
+                else:
+                    measured = list((await arm.get_joint_positions()).values)
+                    self._check_joint_indices(measured, gripper)
+                await self._preflight_gripper(gripper)
+
+                if cfg.arm_write == "stream":
+                    # `measured` is bound: config rejects "stream" with delta-ee. start()
+                    # sends nothing; a driver without the RPC fails on tick one's check().
+                    self._stream = ArmStream(
+                        arm,
+                        fps=cfg.fps,
+                        stream_hz=cfg.stream_hz,
+                        extra=dict(cfg.arm_move_extra),
+                        interp=cfg.stream_interp,
+                    )
+                    await self._stream.start(measured)
 
             # Only cameras the policy actually asked for: a camera configured
             # but not among specs.image_feature_keys must never be read or
@@ -805,8 +855,10 @@ class VLAController(Generic, EasyResource):
                 stale_frame_warn_s=cfg.stale_frame_warn_s,
                 n_obs_steps=n_obs,
                 fps=cfg.fps,
+                state_reader=self._limbs.read_state if ee_pose else None,
             )
-            self._safety = self._build_safety(gripper)
+            if not ee_pose:
+                self._safety = self._build_safety(gripper)
             self._buffer = ReferenceBuffer(
                 cfg.fps,
                 blend_s=cfg.blend_s,
@@ -846,6 +898,8 @@ class VLAController(Generic, EasyResource):
             self._timings.clear()
 
             try:
+                if ee_pose:
+                    await limbs.start()
                 self._state = "running"
                 await self._loop(inference, self._buffer, gripper)
             finally:
@@ -910,7 +964,8 @@ class VLAController(Generic, EasyResource):
         self, inference: InferenceLoop, buffer: ReferenceBuffer, gripper: GripperAdapter
     ) -> None:
         cfg = self._cfg
-        arm = self._resource(cfg.arm)
+        ee_pose = cfg.action_space == EE_POSE
+        arm = None if ee_pose else self._resource(cfg.arm)
         schedule = self._schedule = TickSchedule(
             1.0 / cfg.fps, self._clock, catch_up=cfg.arm_write == "stream"
         )
@@ -988,7 +1043,12 @@ class VLAController(Generic, EasyResource):
                 continue
 
             try:
-                if delta_ee:
+                if ee_pose:
+                    nominal_t, send_t = schedule.nominal(), self._clock()
+                    clamped = await self._limbs.command(action, first=first)
+                    first = False
+                    self._trace.append((nominal_t, t, [float(v) for v in action], [], clamped, send_t))
+                elif delta_ee:
                     if await self._command_pose(arm, action):
                         consecutive_rejected_moves = 0
                     else:
