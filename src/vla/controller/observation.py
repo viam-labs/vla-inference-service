@@ -35,7 +35,7 @@ import math
 import time
 from asyncio import to_thread
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -136,6 +136,7 @@ class ObservationBuilder:
         clock: Callable[[], float] = time.perf_counter,
         n_obs_steps: int = 1,
         fps: float = 10.0,
+        state_reader: Callable[[], Awaitable[np.ndarray]] | None = None,
     ) -> None:
         self._cameras = dict(cameras)
         self._arm = arm
@@ -152,6 +153,7 @@ class ObservationBuilder:
         self._clock = clock
         self._n_obs = n_obs_steps
         self._period = 1.0 / fps
+        self._state_reader = state_reader
         self._last_gap_warn = -math.inf
 
     async def build(self) -> Observation:
@@ -207,12 +209,17 @@ class ObservationBuilder:
             result = await read
             return result, self._clock()
 
-        tasks.append(
-            stamped(self._arm.get_end_position() if self._delta_ee else self._arm.get_joint_positions())
-        )
-        needs_gripper_read = self._gripper.has_normalized_tail
-        if needs_gripper_read:
-            tasks.append(self._gripper.read())
+        if self._state_reader is not None:
+            # ee-pose: the limbs read every pose and grip themselves.
+            tasks.append(stamped(self._state_reader()))
+            needs_gripper_read = False
+        else:
+            tasks.append(
+                stamped(self._arm.get_end_position() if self._delta_ee else self._arm.get_joint_positions())
+            )
+            needs_gripper_read = self._gripper.has_normalized_tail
+            if needs_gripper_read:
+                tasks.append(self._gripper.read())
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -227,7 +234,11 @@ class ObservationBuilder:
             self._raise_if_failed(result, f"camera {key!r} read failed")
         self._raise_if_failed(
             arm_reading,
-            "arm end-position read failed" if self._delta_ee else "arm joint read failed",
+            "limb state read failed"
+            if self._state_reader is not None
+            else "arm end-position read failed"
+            if self._delta_ee
+            else "arm joint read failed",
         )
         arm_reading, t_obs = arm_reading
         if needs_gripper_read:
@@ -253,11 +264,12 @@ class ObservationBuilder:
                     self._stale_frame_warn_s,
                 )
 
-        state = (
-            self._build_pose_state(arm_reading)
-            if self._delta_ee
-            else self._build_state(list(arm_reading.values), gripper_value)
-        )
+        if self._state_reader is not None:
+            state = np.asarray(arm_reading, dtype=np.float32)
+        elif self._delta_ee:
+            state = self._build_pose_state(arm_reading)
+        else:
+            state = self._build_state(list(arm_reading.values), gripper_value)
 
         duration = self._clock() - started
         if duration > self._duration_warn_s:
