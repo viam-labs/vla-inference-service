@@ -292,3 +292,44 @@ class FakeDoCommandGripper:
             self.position = command["set"]
             return {self.read_key: self.position}
         raise AssertionError(f"unexpected command {command!r}")
+
+
+class FakeMotion:
+    """The builtin motion service as ee-pose uses it: GetPose and the teleop_* DoCommands.
+
+    `poses` maps component name -> world `Pose` (mm, theta in degrees). A
+    `teleop_move` snaps that component's pose to the target (an arm with no
+    lag), so a later `get_pose` reads it back. Every DoCommand is recorded.
+    """
+
+    def __init__(self, poses):
+        self.poses = dict(poses)
+        self.commands = []
+        self.fail_get_pose = False
+
+    async def get_pose(self, component_name, destination_frame, *args, **kwargs):
+        from viam.proto.common import PoseInFrame
+
+        if self.fail_get_pose:
+            raise RuntimeError("get_pose failed")
+        assert destination_frame == "world", destination_frame
+        return PoseInFrame(reference_frame="world", pose=self.poses[component_name])
+
+    async def do_command(self, command, *, timeout=None, **kwargs):
+        from google.protobuf import json_format
+        from viam.proto.common import PoseInFrame
+        from viam.proto.service.motion import MoveRequest
+
+        self.commands.append(dict(command))
+        if "teleop_start" in command:
+            req = json_format.Parse(command["teleop_start"], MoveRequest())
+            assert req.destination.reference_frame == "world"
+            return {"teleop_start": True}
+        if "teleop_move" in command:
+            pif = json_format.Parse(command["teleop_move"], PoseInFrame())
+            assert pif.reference_frame == "world"
+            self.poses[command["component_name"]] = pif.pose
+            return {"teleop_move": True}
+        if "teleop_stop" in command:
+            return {"teleop_stop": True}
+        raise AssertionError(f"unexpected command {command!r}")
