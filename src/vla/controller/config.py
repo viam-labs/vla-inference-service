@@ -34,7 +34,7 @@ force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `state_units`/`action_units`, a non-`none` `gripper`, `arm_write: "stream"` and the
 joints-only `safety` keys: the `limbs` carry the arms and grippers, and the row
 layout is fixed (mm, rotation rows, normalized grips). Conversely `limbs`,
-`motion` and `safety.max_start_delta_mm` are rejected outside `"ee-pose"`.
+`motion`, `safety.max_start_delta_mm` and `safety.max_lead_mm` are rejected outside `"ee-pose"`.
 
 `smooth_rows` (default 7, 0 under `"delta-ee"` and `"ee-pose"`) filters each landing chunk
 with a zero-phase quadratic fit over that many rows, removing tick-to-tick
@@ -215,7 +215,7 @@ _DELTA_EE_ONLY_SAFETY_KEYS = (
     "max_tcp_vel_mms_per_sec",
     "max_tcp_rot_vel_rads_per_sec",
 )
-_EE_POSE_ONLY_SAFETY_KEYS = ("max_start_delta_mm",)
+_EE_POSE_ONLY_SAFETY_KEYS = ("max_start_delta_mm", "max_lead_mm")
 # One limb's pose columns: [x, y, z (mm), r00, r01, r02, r10, r11, r12].
 POSE_DIM = 9
 
@@ -240,6 +240,8 @@ class SafetyConfig:
     max_tcp_rot_vel_rads_per_sec: float | None = None
     # ee-pose only: largest first-tick distance from the measured pose.
     max_start_delta_mm: float = 50.0
+    # ee-pose only: how far the last commanded pose may run ahead of the measured one.
+    max_lead_mm: float = 100.0
 
     @staticmethod
     def parse(raw: dict[str, Any], *, fps: float, action_space: str = JOINTS) -> "SafetyConfig":
@@ -268,6 +270,7 @@ class SafetyConfig:
                     max_start_delta_mm=as_float(
                         raw.get("max_start_delta_mm", 50.0), "safety.max_start_delta_mm", minimum=0.0
                     ),
+                    max_lead_mm=as_float(raw.get("max_lead_mm", 100.0), "safety.max_lead_mm", minimum=0.0),
                 )
             return cartesian
 

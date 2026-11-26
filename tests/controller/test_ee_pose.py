@@ -12,6 +12,7 @@ from tests.fakes import FakeArm, FakeDoCommandGripper, FakeMotion
 from vla.controller.config import LimbConfig, SafetyConfig
 from vla.controller.ee_pose import Limbs
 from vla.controller.gripper import make_gripper_adapter
+from vla.controller.pose import state_delta, state_rotation
 from vla.controller.observation import pose_state_from_proto
 from vla.controller.safety import CartesianSafetyLayer, SafetyError
 
@@ -25,7 +26,7 @@ def _limbs(safety=None, positions=(30.0, 70.0)):
         LimbConfig("left", "la", "lg", {"type": "do_command", "name": "lgrip", "open_value": 100.0, "closed_value": 0.0}),
         LimbConfig("right", "ra", "rg", {"type": "do_command", "name": "rgrip", "open_value": 100.0, "closed_value": 0.0}),
     ]
-    motion = FakeMotion({"lg": Pose(x=300, y=300, z=400, **DOWN), "rg": Pose(x=300, y=-300, z=400, **DOWN)})
+    motion = FakeMotion({"lg": Pose(x=300, y=300, z=400, o_x=0.3, o_y=-0.2, o_z=-0.93, theta=25.0), "rg": Pose(x=300, y=-300, z=400, **DOWN)})
     grips = {"lgrip": FakeDoCommandGripper(position=positions[0]), "rgrip": FakeDoCommandGripper(position=positions[1])}
     arms = {"la": FakeArm(positions=[0.0] * 6), "ra": FakeArm(positions=[0.0] * 6)}
     deps = {**grips, **arms}
@@ -37,6 +38,7 @@ def _limbs(safety=None, positions=(30.0, 70.0)):
         grippers=[make_gripper_adapter(c.gripper, deps) for c in cfgs],
         safety=CartesianSafetyLayer(safety or SafetyConfig(max_start_delta_mm=50.0)),
         start_limit_mm=(safety or SafetyConfig(max_start_delta_mm=50.0)).max_start_delta_mm,
+        lead_limit_mm=(safety or SafetyConfig(max_start_delta_mm=50.0)).max_lead_mm,
         rpc_timeout_s=1.0,
     )
     return limbs, motion, grips, arms
@@ -95,7 +97,7 @@ async def test_later_commands_clamp_against_last_commanded_not_measured():
     await limbs.start()
     target = await limbs.read_state()
     await limbs.command(target, first=True)
-    motion.poses["lg"] = Pose(x=0, y=0, z=0, **DOWN)  # a lagging arm must not move the clamp origin
+    motion.poses["lg"] = Pose(x=260, y=300, z=400, **DOWN)  # a lagging arm (within max_lead_mm) must not move the clamp origin
     target = target.copy()
     target[0] += 100.0  # 100 mm in one tick, ceiling 40
     assert await limbs.command(target, first=False) is True
@@ -116,3 +118,60 @@ async def test_command_rejects_wrong_width():
     await limbs.start()
     with pytest.raises(SafetyError, match="20"):
         await limbs.command(np.zeros(19), first=True)
+
+
+async def test_pose_round_trips_through_the_wire():
+    limbs, motion, _, _ = _limbs()
+    await limbs.start()
+    state = await limbs.read_state()
+    await limbs.command(state, first=True)
+    np.testing.assert_allclose(pose_state_from_proto(motion.poses["lg"]), state[:9], atol=1e-6)
+
+
+async def test_rotation_is_clamped_about_the_same_axis():
+    limbs, motion, _, _ = _limbs()
+    await limbs.start()
+    state = await limbs.read_state()
+    axis = np.array([1.0, 2.0, 2.0]) / 3.0
+    from scipy.spatial.transform import Rotation
+
+    target = state.copy()
+    rot = state_rotation(state[:9]) * Rotation.from_rotvec(0.5 * axis)
+    target[3:9] = rot.as_matrix()[:2, :].reshape(6)
+    assert await limbs.command(target, first=True) is True
+    delta = state_delta(state[:9], pose_state_from_proto(motion.poses["lg"]))
+    np.testing.assert_allclose(delta[3:6], 0.12 * axis, atol=1e-6)
+
+
+async def test_runaway_lead_over_a_frozen_arm_is_refused():
+    limbs, motion, _, _ = _limbs()
+    await limbs.start()
+    motion.follow = False
+    target = await limbs.read_state()
+    await limbs.command(target, first=True)
+    with pytest.raises(SafetyError, match="max_lead_mm"):
+        for _ in range(10):
+            target = target.copy()
+            target[0] += 30.0
+            await limbs.command(target, first=False)
+    assert len([c for c in motion.commands if "teleop_move" in c]) < 2 * 6
+
+
+async def test_normal_lag_does_not_trip_the_lead_bound():
+    limbs, motion, _, _ = _limbs()
+    await limbs.start()
+    target = await limbs.read_state()
+    await limbs.command(target, first=True)
+    for _ in range(10):
+        target = target.copy()
+        target[0] += 30.0
+        await limbs.command(target, first=False)
+
+
+async def test_grip_clip_is_counted_and_reported():
+    limbs, _, _, _ = _limbs()
+    await limbs.start()
+    target = await limbs.read_state()
+    target[18:] = [1.4, 0.5]
+    assert await limbs.command(target, first=True) is True
+    assert limbs._safety.clamp_counts["gripper"] == 1

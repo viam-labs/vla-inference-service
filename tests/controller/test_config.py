@@ -1047,6 +1047,7 @@ def test_ee_pose_parses_limbs_and_defaults():
     assert cfg.blend_s == pytest.approx(2.0 / 15.0)
     assert cfg.rpc_timeout_s == pytest.approx(5.0)
     assert cfg.safety.max_start_delta_mm == 50.0
+    assert cfg.safety.max_lead_mm == 100.0
     assert cfg.safety.max_tcp_delta_mm == 40.0
 
 
@@ -1110,6 +1111,8 @@ def test_limbs_motion_and_start_mm_rejected_outside_ee_pose():
         ControllerConfig.parse({**base, "motion": "builtin"})
     with pytest.raises(ConfigError, match="max_start_delta_mm"):
         ControllerConfig.parse({**base, "safety": {"max_start_delta_mm": 10}})
+    with pytest.raises(ConfigError, match="max_lead_mm"):
+        ControllerConfig.parse({**base, "safety": {"max_lead_mm": 10}})
 
 
 def test_ee_pose_rejects_non_do_command_limb_gripper():

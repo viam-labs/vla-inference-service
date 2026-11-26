@@ -306,6 +306,7 @@ class FakeMotion:
         self.poses = dict(poses)
         self.commands = []
         self.fail_get_pose = False
+        self.follow = True  # False: teleop_move is recorded but the arm never moves
 
     async def get_pose(self, component_name, destination_frame, *args, **kwargs):
         from viam.proto.common import PoseInFrame
@@ -328,7 +329,8 @@ class FakeMotion:
         if "teleop_move" in command:
             pif = json_format.Parse(command["teleop_move"], PoseInFrame())
             assert pif.reference_frame == "world"
-            self.poses[command["component_name"]] = pif.pose
+            if self.follow:
+                self.poses[command["component_name"]] = pif.pose
             return {"teleop_move": True}
         if "teleop_stop" in command:
             return {"teleop_stop": True}

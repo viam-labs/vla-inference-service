@@ -21,7 +21,16 @@ not the measured one: teleop trails the stream by a tick or two, and clamping
 against a lagging measurement would throttle every tick and let the plan run
 ahead of the arm. The first command is the exception: it is checked against
 the measured pose and refused outright past `max_start_delta_mm`, as joints
-mode refuses a first target past `max_start_delta_degs`.
+mode refuses a first target past `max_start_delta_degs`. That check bounds
+translation only; rotation is clamped per tick from the measured pose onward.
+
+Clamping against the commanded pose leaves it free to run away from the arm:
+RDK's teleop planner swallows its own errors (unreachable, IK, collision) and
+`teleop_move` still returns true, so while planning fails the commanded pose
+walks off, and once the target is reachable again teleop jumps to it in one
+unlimited move. So every later tick first compares the previous commanded pose
+with the measured one and raises `SafetyError` once it leads by more than
+`max_lead_mm`.
 """
 
 from __future__ import annotations
@@ -70,6 +79,7 @@ class Limbs:
         grippers: Sequence[GripperAdapter],
         safety: CartesianSafetyLayer,
         start_limit_mm: float,
+        lead_limit_mm: float,
         rpc_timeout_s: float,
     ) -> None:
         if len(grippers) != len(limbs):
@@ -81,6 +91,7 @@ class Limbs:
         self._grippers = list(grippers)
         self._safety = safety
         self._start_limit_mm = start_limit_mm
+        self._lead_limit_mm = lead_limit_mm
         self._rpc_s = rpc_timeout_s
         self._last: list[np.ndarray] | None = None  # last commanded pose per limb
         self._started = False
@@ -128,7 +139,11 @@ class Limbs:
             raise SafetyError(f"action must be finite (no NaN/inf); got {row}")
         n = len(self._limbs)
         targets = [row[POSE_DIM * i : POSE_DIM * (i + 1)] for i in range(n)]
-        grips = np.clip(row[POSE_DIM * n :], 0.0, 1.0)
+        raw_grips = row[POSE_DIM * n :]
+        grips = np.clip(raw_grips, 0.0, 1.0)
+        grips_clipped = bool(np.any(grips != raw_grips))
+        if grips_clipped:
+            self._safety.clamp_counts["gripper"] += 1
 
         if first or self._last is None:
             measured = await self._poses()
@@ -142,11 +157,19 @@ class Limbs:
             refs = measured
         else:
             refs = self._last
+            for limb, ref, cur in zip(self._limbs, refs, await self._poses()):
+                lead = float(np.linalg.norm(ref[:3] - cur[:3]))
+                if lead > self._lead_limit_mm:
+                    raise SafetyError(
+                        f"limb {limb.name!r}: commanded pose is {lead:.1f} mm ahead of the arm, over "
+                        f"safety.max_lead_mm={self._lead_limit_mm}; the teleop planner may be failing "
+                        "(check the motion service's teleop_status)"
+                    )
 
         counts = self._safety.clamp_counts
         before = sum(counts.values())
         commanded = [state_compose(ref, self._safety.apply(state_delta(ref, tgt))) for ref, tgt in zip(refs, targets)]
-        clamped = sum(counts.values()) != before
+        clamped = sum(counts.values()) != before or grips_clipped
         self._last = commanded
 
         await asyncio.gather(
