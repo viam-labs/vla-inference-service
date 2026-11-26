@@ -1047,7 +1047,7 @@ class VLAController(Generic, EasyResource):
                     nominal_t, send_t = schedule.nominal(), self._clock()
                     clamped = await self._limbs.command(action, first=first)
                     first = False
-                    self._trace.append((nominal_t, t, [float(v) for v in action], [], clamped, send_t))
+                    self._trace.append((nominal_t, t, [float(v) for v in self._limbs.last_sent], [], clamped, send_t))
                 elif delta_ee:
                     if await self._command_pose(arm, action):
                         consecutive_rejected_moves = 0

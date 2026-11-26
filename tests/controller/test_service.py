@@ -2972,6 +2972,7 @@ async def test_ee_pose_refuses_wrong_policy_width():
     status = await _wait_for_state(svc, "error")
     assert "20" in status["last_error"]
     assert not [c for c in deps["mo"].commands if "teleop_move" in c]
+    assert not [c for c in deps["mo"].commands if "teleop_start" in c]
 
 
 async def test_ee_pose_get_pose_failure_refuses_before_motion():
@@ -2992,3 +2993,44 @@ async def test_ee_pose_reconfigure_while_running_stops_limbs():
     await _wait_until(lambda: any("teleop_move" in c for c in deps["mo"].commands), "a teleop move")
     svc.reconfigure(_ee_config(), deps)
     await _wait_until(lambda: deps["la"].stopped and deps["ra"].stopped, "both arms stopped")
+
+
+class _WalkPolicy(_HoldPolicy):
+    """Each row steps the left pose `step_mm` further along x than the observed state."""
+
+    def __init__(self, step_mm, **kw):
+        super().__init__(**kw)
+        self.step_mm = step_mm
+
+    async def do_command(self, command, **kwargs):
+        if command.get("command") == "infer":
+            self.infer_calls += 1
+            state = np.asarray(command["state"]["values"], dtype=np.float32)
+            state[18:] = 0.0
+            chunk = np.tile(state, (self.n, 1))
+            chunk[:, 0] += self.step_mm * np.arange(1, self.n + 1)
+            return {"actions": encode_matrix(chunk), "raw_actions": encode_matrix(chunk), "latency_s": 0.001}
+        return await super().do_command(command, **kwargs)
+
+
+async def test_ee_pose_lead_error_after_motion_stops_limbs():
+    deps = _ee_deps(policy=_WalkPolicy(30.0, action_dim=20, state_dim=20, n=8))
+    deps["mo"].follow = False  # the planner never moves the arm: the commanded pose runs away
+    svc = _svc(_ee_config(safety={"max_lead_mm": 50.0}), deps)
+    await svc.do_command({"command": "start", "task": "t"})
+    status = await _wait_for_state(svc, "error")
+    assert "max_lead_mm" in status["last_error"]
+    cmds = deps["mo"].commands
+    last_move = max(i for i, c in enumerate(cmds) if "teleop_move" in c)
+    assert any("teleop_stop" in c for c in cmds[last_move + 1 :])
+    assert deps["la"].stopped and deps["ra"].stopped
+
+
+async def test_ee_pose_status_counts_clamps_made_in_limbs():
+    deps = _ee_deps(policy=_WalkPolicy(500.0, action_dim=20, state_dim=20, n=8))
+    svc = _svc(_ee_config(safety={"max_tcp_delta_mm": 10.0, "max_start_delta_mm": 1000.0}), deps)
+    await svc.do_command({"command": "start", "task": "t"})
+    await _wait_until(lambda: any("teleop_move" in c for c in deps["mo"].commands), "a teleop move")
+    status = await svc.do_command({"command": "status"})
+    await svc.do_command({"command": "stop"})
+    assert status["clamp_counts"]["translation"] >= 1, status["clamp_counts"]

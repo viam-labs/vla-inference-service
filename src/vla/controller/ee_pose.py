@@ -94,7 +94,13 @@ class Limbs:
         self._lead_limit_mm = lead_limit_mm
         self._rpc_s = rpc_timeout_s
         self._last: list[np.ndarray] | None = None  # last commanded pose per limb
+        self._sent: np.ndarray | None = None
         self._started = False
+
+    @property
+    def last_sent(self) -> np.ndarray | None:
+        """The clamped row the last `command` streamed (poses then grips)."""
+        return self._sent
 
     @property
     def width(self) -> int:
@@ -171,6 +177,7 @@ class Limbs:
         commanded = [state_compose(ref, self._safety.apply(state_delta(ref, tgt))) for ref, tgt in zip(refs, targets)]
         clamped = sum(counts.values()) != before or grips_clipped
         self._last = commanded
+        self._sent = np.concatenate([*commanded, grips])
 
         await asyncio.gather(
             *(
