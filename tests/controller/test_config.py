@@ -1014,3 +1014,109 @@ def test_rpc_timeout_s_floor_is_5_under_delta_ee_or_a_do_command_gripper():
 def test_rpc_timeout_s_must_be_a_positive_number(value):
     with pytest.raises(ConfigError, match="rpc_timeout_s"):
         ControllerConfig.parse({**BASE, "rpc_timeout_s": value})
+
+
+# --- action_space="ee-pose" -------------------------------------------------
+
+def _ee(**overrides):
+    raw = {
+        "action_space": "ee-pose",
+        "policy_service": "p",
+        "cameras": {"top": "cam"},
+        "limbs": [
+            {"name": "left", "arm": "la", "frame": "lg",
+             "gripper": {"name": "lg", "open_value": 100.0, "closed_value": 0.0}},
+            {"name": "right", "arm": "ra", "frame": "rg",
+             "gripper": {"name": "rg", "open_value": 100.0, "closed_value": 0.0}},
+        ],
+        "fps": 15.0,
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_ee_pose_parses_limbs_and_defaults():
+    cfg = ControllerConfig.parse(_ee())
+    assert cfg.action_space == "ee-pose"
+    assert [l.name for l in cfg.limbs] == ["left", "right"]
+    assert cfg.limbs[0].arm == "la" and cfg.limbs[0].frame == "lg"
+    assert cfg.limbs[0].gripper == {"type": "do_command", "name": "lg", "open_value": 100.0, "closed_value": 0.0}
+    assert cfg.motion == "builtin"
+    assert cfg.arm == ""
+    assert cfg.smooth_rows == 0
+    assert cfg.blend_s == pytest.approx(2.0 / 15.0)
+    assert cfg.rpc_timeout_s == pytest.approx(5.0)
+    assert cfg.safety.max_start_delta_mm == 50.0
+    assert cfg.safety.max_lead_mm == 100.0
+    assert cfg.safety.max_tcp_delta_mm == 40.0
+
+
+def test_ee_pose_dependencies():
+    cfg = ControllerConfig.parse(_ee(motion="mo"))
+    assert set(cfg.dependencies()) == {"p", "mo", "cam", "la", "ra", "lg", "rg"}
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"limbs": []}, "limbs"),
+        ({"limbs": None}, "limbs"),
+        ({"arm": "a"}, "arm"),
+        ({"state_joint_indices": [0]}, "state_joint_indices"),
+        ({"gripper": {"type": "do_command", "name": "g", "open_value": 1, "closed_value": 0}}, "gripper"),
+        ({"state_units": {"translation": "meters"}}, "state_units"),
+        ({"action_units": {"translation": "meters"}}, "action_units"),
+        ({"arm_write": "stream"}, "arm_write"),
+        ({"safety": {"max_joint_delta_degs": 5}}, "max_joint_delta_degs"),
+    ],
+)
+def test_ee_pose_rejects(overrides, match):
+    with pytest.raises(ConfigError, match=match):
+        ControllerConfig.parse(_ee(**overrides))
+
+
+@pytest.mark.parametrize(
+    "limb_patch, match",
+    [
+        ({"arm": None}, "arm"),
+        ({"frame": None}, "frame"),
+        ({"gripper": None}, "gripper"),
+        ({"gripper": {"name": "lg", "open_value": 1.0}}, "closed_value"),
+    ],
+)
+def test_ee_pose_rejects_bad_limb(limb_patch, match):
+    raw = _ee()
+    limb = {**raw["limbs"][0], **limb_patch}
+    raw["limbs"] = [{k: v for k, v in limb.items() if v is not None}, raw["limbs"][1]]
+    with pytest.raises(ConfigError, match=match):
+        ControllerConfig.parse(raw)
+
+
+def test_ee_pose_rejects_duplicate_names_and_frames():
+    raw = _ee()
+    raw["limbs"][1]["name"] = "left"
+    with pytest.raises(ConfigError, match="unique"):
+        ControllerConfig.parse(raw)
+    raw = _ee()
+    raw["limbs"][1]["frame"] = "lg"
+    with pytest.raises(ConfigError, match="unique"):
+        ControllerConfig.parse(raw)
+
+
+def test_limbs_motion_and_start_mm_rejected_outside_ee_pose():
+    base = {"policy_service": "p", "arm": "a", "cameras": {"top": "cam"}, "state_joint_indices": [0]}
+    with pytest.raises(ConfigError, match="limbs"):
+        ControllerConfig.parse({**base, "limbs": _ee()["limbs"]})
+    with pytest.raises(ConfigError, match="motion"):
+        ControllerConfig.parse({**base, "motion": "builtin"})
+    with pytest.raises(ConfigError, match="max_start_delta_mm"):
+        ControllerConfig.parse({**base, "safety": {"max_start_delta_mm": 10}})
+    with pytest.raises(ConfigError, match="max_lead_mm"):
+        ControllerConfig.parse({**base, "safety": {"max_lead_mm": 10}})
+
+
+def test_ee_pose_rejects_non_do_command_limb_gripper():
+    raw = _ee()
+    raw["limbs"][0]["gripper"]["type"] = "arm_joint"
+    with pytest.raises(ConfigError, match="do_command"):
+        ControllerConfig.parse(raw)

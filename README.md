@@ -353,7 +353,7 @@ backoff for up to `policy_ready_timeout_s`.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `action_space` | `joints` \| `delta-ee` | `"joints"` | What the checkpoint speaks. `joints` is absolute joint angles written with `move_to_joint_positions`. `delta-ee` is a per-tick end-effector pose delta composed onto the measured `EndPosition` and written with `move_to_position` — see [`action_space`](#action_space). |
+| `action_space` | `joints` \| `delta-ee` \| `ee-pose` | `"joints"` | What the checkpoint speaks. `joints` is absolute joint angles written with `move_to_joint_positions`. `delta-ee` is a per-tick end-effector pose delta composed onto the measured `EndPosition` and written with `move_to_position` — `ee-pose` is absolute end-effector poses for one or more limbs, streamed through the motion service's teleop — see [`action_space`](#action_space). |
 | `policy_service` | string | required | Name of the `viam-labs:vla:policy` dependency. |
 | `arm` | string | required | Name of the Viam `arm` component to drive. |
 | `cameras` | object (feature key → camera name) | required | Must cover every key the policy reports in `specs.image_feature_keys`. |
@@ -386,6 +386,10 @@ backoff for up to `policy_ready_timeout_s`.
 | `safety.max_tcp_rot_delta_rads` | number | `0.12` | `delta-ee` only. Per-tick ceiling on `norm(delta[3:])`. |
 | `safety.max_tcp_vel_mms_per_sec` | number | — | `delta-ee` only. Operator-facing tool-speed knob; the per-tick ceiling is `vel / fps`. |
 | `safety.max_tcp_rot_vel_rads_per_sec` | number | — | `delta-ee` only. Same, for rotation. |
+| `safety.max_start_delta_mm` | number | `50.0` | `ee-pose` only. `start` refuses outright if a limb's first target is farther than this (translation) from its measured pose. |
+| `safety.max_lead_mm` | number | `100.0` | `ee-pose` only. Every tick after the first, the run stops with an error if a limb's previous commanded pose is farther than this from its measured pose — a stalled teleop planner. |
+| `motion` | string | `"builtin"` | `ee-pose` only. The motion service whose `teleop_*` DoCommands stream the poses. |
+| `limbs` | array | required under `ee-pose` | `ee-pose` only. One object per limb: `name`, `arm`, `frame` (the component whose world pose is read and commanded), and a `do_command` `gripper` block. See [`action_space: "ee-pose"`](#action_space-ee-pose). |
 | `safety.stop_on_error` | boolean | `true` | Whether a failure producing the next action (camera read, observation assembly, the policy call) halts the loop, or is logged and the tick skipped. |
 
 ### `action_space`
@@ -950,6 +954,62 @@ the arm's actual current pose — a policy handed an unfamiliar initial pose can
 anything. `start` refuses outright if that first action exceeds
 `safety.max_start_delta_degs`. Refusing beats slowly moving the arm somewhere nobody
 asked for.
+
+### `action_space: "ee-pose"`
+
+`"ee-pose"` runs a checkpoint that observes and emits **absolute end-effector poses** for
+one or more limbs, in the world frame. State and action rows have the same layout, with `L`
+limbs in config order:
+
+| | dims | layout |
+|---|---|---|
+| pose, per limb | 9 | `x, y, z` in millimetres, then the first two **rows** of the 3x3 rotation matrix, row-major (the `delta-ee` state layout) |
+| grip, per limb | 1 | normalized closure, `0` = open; all grips come after all poses |
+
+So the policy's state and action are both `10 * L` dimensions; a policy that declares anything
+else is refused before any motion. Poses are read with the motion service's
+`get_pose(frame, "world")`; poses are streamed with its `teleop_start` / `teleop_move` /
+`teleop_stop` DoCommands (RDK 1.17+), so one pipeline plans all limbs jointly. Each limb's
+gripper is a `do_command` gripper, written alongside the pose.
+
+```json
+{
+  "action_space": "ee-pose",
+  "policy_service": "praxis",
+  "motion": "builtin",
+  "limbs": [
+    {"name": "left", "arm": "left-arm", "frame": "left-gripper",
+     "gripper": {"name": "left-gripper", "open_value": 100, "closed_value": 0}},
+    {"name": "right", "arm": "right-arm", "frame": "right-gripper",
+     "gripper": {"name": "right-gripper", "open_value": 100, "closed_value": 0}}
+  ],
+  "cameras": { "top": "top" },
+  "fps": 15,
+  "safety": { "max_tcp_vel_mms_per_sec": 600, "max_tcp_rot_vel_rads_per_sec": 3.0, "max_start_delta_mm": 50 }
+}
+```
+
+**Safety.** The per-tick Cartesian clamps (`max_tcp_*`) apply per limb against the pose last
+*commanded*, not the measured one: teleop trails the stream by a tick or two, and clamping
+against a lagging measurement would throttle every tick. Two checks bound what that allows:
+
+- `safety.max_start_delta_mm` — the first target is checked against the measured pose and
+  refused outright past this distance. It bounds translation only; rotation is clamped per tick.
+- `safety.max_lead_mm` — RDK's teleop planner swallows its own failures (unreachable pose, IK,
+  collision) and `teleop_move` still succeeds, so the commanded pose could walk away from the
+  arm and then be played in one unlimited jump. Every later tick compares the previous commanded
+  pose with the measured one and stops the run with an error past this distance.
+
+The clamped pose that was actually sent, not the raw policy row, is what the `trace` records.
+Every way out of a run (error, `stop`, reconfigure) sends `teleop_stop` and stops each arm.
+
+**Rejected under `ee-pose`:** top-level `arm`, `state_joint_indices`, `gripper`, `state_units`,
+`action_units`, `arm_write: "stream"`, and the joint-space `safety` keys. Defaults differ:
+`smooth_rows` is `0`, `blend_s` is `2/fps`, and `rpc_timeout_s` uses the slow floor.
+
+**Collisions are not checked by teleop today.** RDK's teleop currently ignores
+`MoveRequest.constraints`, so collisions are allowed; the frame system's own geometry must
+not self-collide.
 
 ### `action_space: "delta-ee"` — Cartesian clamps
 

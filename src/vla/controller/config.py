@@ -30,12 +30,18 @@ state layout is the kind of config an operator reasonably assumes is in
 force. Rejection is symmetric: the Cartesian `safety` keys are refused under
 `"joints"` for the same reason.
 
-`smooth_rows` (default 7, 0 under `"delta-ee"`) filters each landing chunk
+`action_space: "ee-pose"` likewise rejects top-level `arm`, `state_joint_indices`,
+`state_units`/`action_units`, a non-`none` `gripper`, `arm_write: "stream"` and the
+joints-only `safety` keys: the `limbs` carry the arms and grippers, and the row
+layout is fixed (mm, rotation rows, normalized grips). Conversely `limbs`,
+`motion`, `safety.max_start_delta_mm` and `safety.max_lead_mm` are rejected outside `"ee-pose"`.
+
+`smooth_rows` (default 7, 0 under `"delta-ee"` and `"ee-pose"`) filters each landing chunk
 with a zero-phase quadratic fit over that many rows, removing tick-to-tick
 jitter in the policy's output without lag. The crossfade (`blend_s`), the
 trigger's lead (`margin_s`) are fixed by parse(), not configured;
 `inference_timeout_s` (default 30) and `rpc_timeout_s` (default `max(2, 10/fps)`,
-or `max(5, 10/fps)` under `"delta-ee"` or with a `do_command` gripper)
+or `max(5, 10/fps)` under `"delta-ee"`, `"ee-pose"` or with a `do_command` gripper)
 are the timing knobs an operator sets. See `reference_buffer.py` and `inference_loop.py`.
 The keys they replace (`mode`, `merge`, `blend_ticks`, `queue_threshold`,
 `actions_per_chunk`) are refused with their replacement; see `REMOVED_KEYS`.
@@ -55,6 +61,7 @@ README: "Smooth servo streaming".
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -74,6 +81,7 @@ from .units import (
 __all__ = [
     "ConfigError",
     "SafetyConfig",
+    "LimbConfig",
     "ControllerConfig",
     "ENCODINGS",
     "IMAGE_FITS",
@@ -81,6 +89,7 @@ __all__ = [
     "ACTION_SPACES",
     "JOINTS",
     "DELTA_EE",
+    "EE_POSE",
     "ARM_WRITES",
     "STREAM_INTERPS",
 ]
@@ -113,7 +122,10 @@ REMOVED_KEYS = {
 # the reference buffer and the inference loop are shared.
 JOINTS = "joints"
 DELTA_EE = "delta-ee"
-ACTION_SPACES = (JOINTS, DELTA_EE)
+# `ee-pose` carries absolute end-effector poses for one or more limbs, streamed
+# through the motion service's teleop DoCommands (see `LimbConfig`).
+EE_POSE = "ee-pose"
+ACTION_SPACES = (JOINTS, DELTA_EE, EE_POSE)
 
 # "pad" mirrors smolvla's own training-time convention (resize_with_pad,
 # lerobot/policies/common/vla_utils.py:218): scale to fit inside the declared
@@ -203,6 +215,9 @@ _DELTA_EE_ONLY_SAFETY_KEYS = (
     "max_tcp_vel_mms_per_sec",
     "max_tcp_rot_vel_rads_per_sec",
 )
+_EE_POSE_ONLY_SAFETY_KEYS = ("max_start_delta_mm", "max_lead_mm")
+# One limb's pose columns: [x, y, z (mm), r00, r01, r02, r10, r11, r12].
+POSE_DIM = 9
 
 
 @dataclass(frozen=True)
@@ -223,15 +238,22 @@ class SafetyConfig:
     max_tcp_rot_delta_rads: float = 0.12
     max_tcp_vel_mms_per_sec: float | None = None
     max_tcp_rot_vel_rads_per_sec: float | None = None
+    # ee-pose only: largest first-tick distance from the measured pose.
+    max_start_delta_mm: float = 50.0
+    # ee-pose only: how far the last commanded pose may run ahead of the measured one.
+    max_lead_mm: float = 100.0
 
     @staticmethod
     def parse(raw: dict[str, Any], *, fps: float, action_space: str = JOINTS) -> "SafetyConfig":
         if not isinstance(raw, dict):
             raise ConfigError(f"safety must be an object, got {raw!r}")
 
-        wrong_space = (
-            _DELTA_EE_ONLY_SAFETY_KEYS if action_space == JOINTS else _JOINTS_ONLY_SAFETY_KEYS
-        )
+        if action_space == JOINTS:
+            wrong_space = _DELTA_EE_ONLY_SAFETY_KEYS + _EE_POSE_ONLY_SAFETY_KEYS
+        elif action_space == DELTA_EE:
+            wrong_space = _JOINTS_ONLY_SAFETY_KEYS + _EE_POSE_ONLY_SAFETY_KEYS
+        else:
+            wrong_space = _JOINTS_ONLY_SAFETY_KEYS
         for key in wrong_space:
             if raw.get(key) is not None:
                 raise ConfigError(
@@ -240,8 +262,17 @@ class SafetyConfig:
                 )
 
         stop_on_error = as_bool(raw.get("stop_on_error", True), "safety.stop_on_error")
-        if action_space == DELTA_EE:
-            return SafetyConfig._parse_cartesian(raw, fps=fps, stop_on_error=stop_on_error)
+        if action_space in (DELTA_EE, EE_POSE):
+            cartesian = SafetyConfig._parse_cartesian(raw, fps=fps, stop_on_error=stop_on_error)
+            if action_space == EE_POSE:
+                cartesian = dataclasses.replace(
+                    cartesian,
+                    max_start_delta_mm=as_float(
+                        raw.get("max_start_delta_mm", 50.0), "safety.max_start_delta_mm", minimum=0.0
+                    ),
+                    max_lead_mm=as_float(raw.get("max_lead_mm", 100.0), "safety.max_lead_mm", minimum=0.0),
+                )
+            return cartesian
 
         max_vel = None
         if raw.get("max_vel_degs_per_sec") is not None:
@@ -497,6 +528,64 @@ def _parse_segment_units(
 
 
 @dataclass(frozen=True)
+class LimbConfig:
+    """One limb under action_space="ee-pose": the arm that moves it, the frame whose world pose
+    the policy reads and commands (teleop streams this component), and its do_command gripper."""
+
+    name: str
+    arm: str
+    frame: str
+    gripper: dict[str, Any]
+
+
+def _parse_limbs(raw: Any) -> tuple[LimbConfig, ...]:
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError(
+            f'limbs is required under action_space="{EE_POSE}" and must be a non-empty list'
+        )
+    limbs = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"limbs[{i}] must be an object, got {entry!r}")
+        for key in ("name", "arm", "frame"):
+            if not entry.get(key):
+                raise ConfigError(f"limbs[{i}].{key} is required")
+        grip = entry.get("gripper")
+        if not isinstance(grip, dict):
+            raise ConfigError(
+                f"limbs[{i}].gripper is required: a do_command gripper "
+                '({"name", "open_value", "closed_value"}); every limb carries a grip channel'
+            )
+        if grip.get("type", "do_command") != "do_command":
+            raise ConfigError(
+                f'limbs[{i}].gripper.type must be "do_command" '
+                f"(every limb grip is a do_command gripper), got {grip.get('type')!r}"
+            )
+        for key in ("name", "open_value", "closed_value"):
+            if key not in grip:
+                raise ConfigError(f"limbs[{i}].gripper.{key} is required")
+        limbs.append(
+            LimbConfig(
+                name=as_str(entry["name"], f"limbs[{i}].name"),
+                arm=as_str(entry["arm"], f"limbs[{i}].arm"),
+                frame=as_str(entry["frame"], f"limbs[{i}].frame"),
+                gripper={
+                    **grip,
+                    "type": "do_command",
+                    "name": as_str(grip["name"], f"limbs[{i}].gripper.name"),
+                    "open_value": as_float(grip["open_value"], f"limbs[{i}].gripper.open_value"),
+                    "closed_value": as_float(grip["closed_value"], f"limbs[{i}].gripper.closed_value"),
+                },
+            )
+        )
+    for key in ("name", "frame"):
+        values = [getattr(lb, key) for lb in limbs]
+        if len(set(values)) != len(values):
+            raise ConfigError(f"limbs[].{key} must be unique, got {values}")
+    return tuple(limbs)
+
+
+@dataclass(frozen=True)
 class ControllerConfig:
     policy_service: str
     arm: str
@@ -553,6 +642,9 @@ class ControllerConfig:
     duration_warn_s: float = DEFAULT_DURATION_WARN_S
     stale_frame_warn_s: float = STALE_FRAME_WARN_S
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    # ee-pose only (empty/"" otherwise): the limbs and the motion service that streams them.
+    limbs: tuple[LimbConfig, ...] = ()
+    motion: str = ""
 
     @staticmethod
     def parse(raw: dict[str, Any]) -> "ControllerConfig":
@@ -567,10 +659,29 @@ class ControllerConfig:
                 "; ".join(f"{k} was removed: {REMOVED_KEYS[k]}" for k in removed)
             )
 
-        arm = raw.get("arm")
-        if not arm:
-            raise ConfigError("arm is required")
-        arm = as_str(arm, "arm")
+        action_space = as_choice(raw.get("action_space", JOINTS), "action_space", ACTION_SPACES)
+        delta_ee = action_space == DELTA_EE
+        ee_pose = action_space == EE_POSE
+
+        if ee_pose:
+            for key in ("arm", "state_joint_indices", "state_units", "action_units"):
+                if raw.get(key) is not None:
+                    raise ConfigError(
+                        f'{key} does not apply to action_space="{EE_POSE}": the limbs carry the arms '
+                        "and the row layout is fixed (mm, rotation rows, normalized grips). Remove it."
+                    )
+            arm = ""
+            limbs = _parse_limbs(raw.get("limbs"))
+            motion = as_str(raw.get("motion", "builtin"), "motion")
+        else:
+            for key in ("limbs", "motion"):
+                if raw.get(key) is not None:
+                    raise ConfigError(f'{key} only applies to action_space="{EE_POSE}". Remove it.')
+            limbs, motion = (), ""
+            arm = raw.get("arm")
+            if not arm:
+                raise ConfigError("arm is required")
+            arm = as_str(arm, "arm")
 
         cameras_raw = raw.get("cameras") or {}
         if not isinstance(cameras_raw, dict) or not cameras_raw:
@@ -580,16 +691,19 @@ class ControllerConfig:
             for k, v in cameras_raw.items()
         }
 
-        action_space = as_choice(raw.get("action_space", JOINTS), "action_space", ACTION_SPACES)
-        delta_ee = action_space == DELTA_EE
-
-        indices = _parse_state_joint_indices(raw.get("state_joint_indices"), delta_ee=delta_ee)
+        indices = _parse_state_joint_indices(
+            raw.get("state_joint_indices"), delta_ee=delta_ee or ee_pose
+        )
 
         fps = as_float(raw.get("fps", 10.0), "fps", minimum=_MIN_FPS, maximum=_MAX_FPS)
 
         gripper = dict(raw.get("gripper") or {"type": "none"})
         gripper_type = as_choice(gripper.get("type", "none"), "gripper.type", GRIPPER_TYPES)
         gripper["type"] = gripper_type
+        if ee_pose and gripper_type != "none":
+            raise ConfigError(
+                f'gripper does not apply to action_space="{EE_POSE}": each limb names its own gripper'
+            )
         if delta_ee and gripper_type != "none":
             # The recording captured EndPosition and six joint values, no
             # gripper component and no seventh joint, so the checkpoint has no
@@ -618,7 +732,9 @@ class ControllerConfig:
                     f"expected {expected} (one per action dimension in degrees)"
                 )
 
-        smooth_rows = as_int(raw.get("smooth_rows", 0 if delta_ee else 7), "smooth_rows", minimum=0)
+        smooth_rows = as_int(
+            raw.get("smooth_rows", 0 if (delta_ee or ee_pose) else 7), "smooth_rows", minimum=0
+        )
         if smooth_rows and smooth_rows % 2 == 0:
             raise ConfigError(
                 f"smooth_rows={smooth_rows} must be odd (a window centred on each row) or 0 for off"
@@ -654,6 +770,11 @@ class ControllerConfig:
                     f"stream_hz={stream_hz} is below fps={fps}: interpolation needs at "
                     "least one point per tick"
                 )
+            if ee_pose:
+                raise ConfigError(
+                    'arm_write="stream" does not apply to action_space="ee-pose": '
+                    "poses stream through the motion service"
+                )
             if delta_ee:
                 raise ConfigError(
                     f'arm_write="stream" does not apply to action_space={DELTA_EE!r}: the '
@@ -670,7 +791,7 @@ class ControllerConfig:
         # move_to_position runs the arm's motion planner and a do_command
         # gripper's "set" may block until the jaws stop; both are slow on a
         # healthy machine, so their floor is higher.
-        slow_rpcs = delta_ee or gripper_type == "do_command"
+        slow_rpcs = delta_ee or ee_pose or gripper_type == "do_command"
         rpc_timeout_s = positive("rpc_timeout_s", max(5.0 if slow_rpcs else 2.0, 10.0 / fps))
 
         return ControllerConfig(
@@ -738,9 +859,16 @@ class ControllerConfig:
                 raw.get("stale_frame_warn_s", STALE_FRAME_WARN_S), "stale_frame_warn_s", minimum=0.0
             ),
             safety=safety,
+            limbs=limbs,
+            motion=motion,
         )
 
     def dependencies(self) -> list[str]:
+        if self.action_space == EE_POSE:
+            deps = [self.policy_service, self.motion, *self.cameras.values()]
+            for limb in self.limbs:
+                deps += [limb.arm, limb.gripper["name"]]
+            return list(dict.fromkeys(deps))
         deps = [self.policy_service, self.arm, *self.cameras.values()]
         name = self.gripper.get("name")
         if self.gripper.get("type") in GRIPPER_TYPES_NEEDING_DEPENDENCY and name:

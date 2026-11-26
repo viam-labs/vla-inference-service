@@ -725,3 +725,28 @@ async def test_cameras_encode_concurrently_rather_than_in_series(monkeypatch):
         f"two 100ms encodes took {elapsed:.3f}s: they ran in series, not in "
         "parallel threads"
     )
+
+
+async def test_state_reader_replaces_arm_and_gripper_reads():
+    calls = []
+
+    async def read_state():
+        calls.append(1)
+        return np.arange(20, dtype=np.float64)
+
+    class NoArm:
+        async def get_joint_positions(self, **kwargs):
+            raise AssertionError("ee-pose must not read joints")
+
+        async def get_end_position(self, **kwargs):
+            raise AssertionError("ee-pose must not read the end position")
+
+    obs = await _builder(
+        arm=NoArm(),
+        state_joint_indices=[],
+        action_space="ee-pose",
+        state_reader=read_state,
+    ).build()
+    assert calls == [1]
+    np.testing.assert_array_equal(obs.state, np.arange(20))
+    assert obs.t_obs > 0

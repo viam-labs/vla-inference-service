@@ -34,6 +34,7 @@ async def fetch(address: str, service: str) -> dict:
 def write_csv(trace: dict, out) -> int:
     n = len(trace["nominal_t"])
     dof = len(trace["commanded"][0]) if n else 0
+    mdof = len(trace["measured"][0]) if n else 0
     has_sample = "sample_t" in trace
     has_send = "send_t" in trace
     w = csv.writer(out)
@@ -41,7 +42,7 @@ def write_csv(trace: dict, out) -> int:
         ["nominal_t"]
         + (["sample_t"] if has_sample else [])
         + [f"cmd{j}" for j in range(dof)]
-        + [f"meas{j}" for j in range(dof)]
+        + [f"meas{j}" for j in range(mdof)]
         + ["clamped"]
         + (["send_t"] if has_send else [])
     )
